@@ -1,0 +1,16 @@
+[package]
+name = "atlas-indexer"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# atlas-indexer: OCR/parse/chunking/embedding orchestration (§14, §17, §18,
+# §35, §36). Defines the DocumentRepository/ChunkRepository interfaces;
+# concrete SQLite storage is implemented by atlas-db and vector storage by
+# atlas-vector, both wired in by atlas-core.
+
+[dependencies]
+atlas-types = { path = "../atlas-types" }
+atlas-utils = { path = "../atlas-utils" }
+atlas-events = { path = "../atlas-events" }
+atlas-config = { path = "../atlas-config" }

@@ -1,0 +1,30 @@
+[package]
+name = "app-tauri"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# app-tauri: the actual Tauri binary; wires IPC commands to atlas-core (§11).
+# This is the ONLY crate in the workspace allowed to depend on `tauri`
+# (§11, §46.4). It contains no business logic -- handlers validate input,
+# call into atlas-core, map errors, and return (§26).
+#
+# NOTE: dependency versions below reflect the intended target stack (latest
+# stable Tauri 2.x) per §5. See "Known Environment Limitations" in the
+# project README for why this crate's native link step is not exercised in
+# the current sandboxed build container.
+
+[[bin]]
+name = "app-tauri"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+atlas-core = { path = "../atlas-core" }
+atlas-utils = { path = "../atlas-utils" }
+atlas-types = { path = "../atlas-types" }
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = [] }

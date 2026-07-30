@@ -1,0 +1,22 @@
+[package]
+name = "atlas-utils"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# atlas-utils holds cross-cutting, non-domain-specific concerns: the shared
+# AppError type (§24, §45) and the logging bootstrap (§41 step 2). It depends
+# only on atlas-types so any crate can use it without pulling in domain logic.
+
+[dependencies]
+atlas-types = { path = "../atlas-types" }
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# Justification for this new dependency (§5, §28.5): content hashing is
+# required by §7.1 (source document fingerprinting) and §22 (cache
+# invalidation keys). sha2 is pure Rust, has no transitive C/system
+# dependencies, and is the de facto standard hashing crate -- the minimal
+# possible addition for a capability the architecture already requires.
+sha2 = "0.10"

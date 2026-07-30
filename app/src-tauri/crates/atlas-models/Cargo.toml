@@ -1,0 +1,17 @@
+[package]
+name = "atlas-models"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# atlas-models: Engines Module (§14.1) -- Model Registry (§37), Model
+# Scheduler (§15), Resource Manager (§38), Context Builder (§39), and Prompt
+# Builder (§40). Application code (UI, IPC handlers) MUST refer to engines by
+# role name only, never by underlying Ollama model name (§14.1, §27).
+
+[dependencies]
+atlas-types = { path = "../atlas-types" }
+atlas-utils = { path = "../atlas-utils" }
+atlas-events = { path = "../atlas-events" }
+atlas-config = { path = "../atlas-config" }
+serde_json.workspace = true

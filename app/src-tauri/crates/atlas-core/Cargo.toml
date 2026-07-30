@@ -1,0 +1,26 @@
+[package]
+name = "atlas-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# atlas-core is the composition root (Dependency Injection skeleton). It is
+# the ONLY crate, besides app-tauri, allowed to see every other crate at
+# once: it wires concrete infrastructure adapters (atlas-db, atlas-vector)
+# into the interfaces domain crates depend on, and exposes a single Facade
+# to app-tauri. app-tauri depends only on atlas-core (§46.4: "Never let UI
+# call Ollama directly").
+
+[dependencies]
+atlas-types = { path = "../atlas-types" }
+atlas-utils = { path = "../atlas-utils" }
+atlas-events = { path = "../atlas-events" }
+atlas-config = { path = "../atlas-config" }
+atlas-workspace = { path = "../atlas-workspace" }
+atlas-watcher = { path = "../atlas-watcher" }
+atlas-indexer = { path = "../atlas-indexer" }
+atlas-vector = { path = "../atlas-vector" }
+atlas-models = { path = "../atlas-models" }
+atlas-memory = { path = "../atlas-memory" }
+atlas-graph = { path = "../atlas-graph" }
+atlas-db = { path = "../atlas-db" }

@@ -1,0 +1,4 @@
+# Clippy configuration for the Atlas Rust workspace (§26). No MSRV pin here:
+# the intended target toolchain is "latest stable Rust" (see "Known
+# Environment Limitations" in the project README) -- pinning to this build
+# container's older toolchain would misrepresent the intended target.

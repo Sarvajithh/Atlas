@@ -1,0 +1,13 @@
+[package]
+name = "atlas-types"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# atlas-types is the foundational crate: plain, serializable Rust types shared
+# across every other crate (§11, core-types rationale). It MUST NOT depend on
+# any other atlas-* crate, so it can sit at the bottom of the dependency graph.
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

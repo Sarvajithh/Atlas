@@ -1,0 +1,15 @@
+[package]
+name = "atlas-workspace"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# atlas-workspace: workspace + folder link lifecycle (§6, §6.1, §14). Depends
+# only on interface-level crates; it MUST NOT depend on atlas-db (Forbidden:
+# "Workspace -> SQLite", §46 amendment). The concrete SQLite-backed
+# WorkspaceRepository lives in atlas-db and implements the trait defined here.
+
+[dependencies]
+atlas-types = { path = "../atlas-types" }
+atlas-utils = { path = "../atlas-utils" }
+atlas-events = { path = "../atlas-events" }

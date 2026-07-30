@@ -1,0 +1,17 @@
+[package]
+name = "atlas-events"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# atlas-events owns the in-process Event Bus interface (§34). It depends only
+# on foundational crates; the concrete persistence adapter (writing to the
+# `events` table, §33.15) is provided by atlas-db and wired in by atlas-core,
+# keeping this crate free of any SQLite/tauri dependency.
+
+[dependencies]
+atlas-types = { path = "../atlas-types" }
+atlas-utils = { path = "../atlas-utils" }
+
+[dev-dependencies]
+serde_json.workspace = true

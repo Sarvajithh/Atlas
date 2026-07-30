@@ -1,0 +1,10 @@
+dist
+src/dist
+src-tauri/target
+node_modules
+package-lock.json
+
+# Frozen architecture contract -- not reformatted by tooling (§0: "no
+# architectural decision described here may be changed... without an
+# explicit, separate instruction").
+docs/README.md

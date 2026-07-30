@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/atlas-types",
+    "crates/atlas-utils",
+    "crates/atlas-config",
+    "crates/atlas-events",
+    "crates/atlas-db",
+    "crates/atlas-vector",
+    "crates/atlas-workspace",
+    "crates/atlas-watcher",
+    "crates/atlas-indexer",
+    "crates/atlas-models",
+    "crates/atlas-memory",
+    "crates/atlas-graph",
+    "crates/atlas-core",
+    "crates/app-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+

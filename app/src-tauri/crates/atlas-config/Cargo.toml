@@ -1,0 +1,14 @@
+[package]
+name = "atlas-config"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# atlas-config owns configuration loading (§23, §33.12, and the addendum's
+# Governing Principle: "No hardcoded configuration"). It exposes a
+# `SettingsProvider` interface; the concrete SQLite-backed store lives in
+# atlas-db and is wired in by atlas-core.
+
+[dependencies]
+atlas-types = { path = "../atlas-types" }
+atlas-utils = { path = "../atlas-utils" }

@@ -1,0 +1,28 @@
+[package]
+name = "atlas-db"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# atlas-db: SQLite schema + queries (§10.1, §11, §33). The single
+# infrastructure crate that implements every repository interface defined by
+# the domain crates (Dependency Inversion, Governing Principle). No domain
+# crate depends on atlas-db; atlas-db depends on their trait definitions only.
+#
+# NOTE (skeleton milestone): the actual `rusqlite`/`sqlx` dependency and
+# schema/migrations are intentionally deferred to the database-implementation
+# milestone. This crate currently defines adapter structs and trait impls
+# with unimplemented bodies so the workspace compiles end-to-end and the
+# dependency graph is exercised, without introducing business logic or a new
+# top-level dependency ahead of that dedicated milestone (§5, §28.5).
+
+[dependencies]
+atlas-types = { path = "../atlas-types" }
+atlas-utils = { path = "../atlas-utils" }
+atlas-events = { path = "../atlas-events" }
+atlas-config = { path = "../atlas-config" }
+atlas-workspace = { path = "../atlas-workspace" }
+atlas-indexer = { path = "../atlas-indexer" }
+atlas-memory = { path = "../atlas-memory" }
+atlas-graph = { path = "../atlas-graph" }
+atlas-models = { path = "../atlas-models" }

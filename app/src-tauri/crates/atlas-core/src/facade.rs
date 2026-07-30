@@ -4,10 +4,14 @@
 
 use std::sync::Arc;
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use atlas_config::SettingsProvider;
 use atlas_db::connection::SqliteConnection;
 use atlas_db::event_bus_adapter::SqliteEventBus;
 use atlas_db::graph_adapter::SqliteGraphRepository;
+use atlas_db::jobs_adapter::SqliteJobRepository;
 use atlas_db::memory_adapter::{
     SqliteAnalyticsRepository, SqliteAnnotationRepository, SqliteBookmarkRepository,
     SqliteChatRepository, SqliteLearningProgressRepository,
@@ -17,8 +21,12 @@ use atlas_db::settings_adapter::SqliteSettingsProvider;
 use atlas_db::workspace_adapter::SqliteWorkspaceRepository;
 use atlas_events::EventBus;
 use atlas_graph::GraphEngine;
+use atlas_indexer::job_queue::JobQueue;
 use atlas_memory::MemoryEngine;
 use atlas_models::ModelRegistryRepository;
+use atlas_types::ids::WorkspaceId;
+use atlas_utils::AppError;
+use atlas_watcher::FolderWatcher;
 use atlas_workspace::lifecycle::WorkspaceEngine;
 
 use crate::state::AppState;
@@ -33,6 +41,12 @@ pub struct AppFacade {
     model_registry: Arc<dyn ModelRegistryRepository>,
     events: Arc<dyn EventBus>,
     state: Arc<AppState>,
+    job_queue: Arc<JobQueue>,
+    /// One `FolderWatcher` per actively-watched workspace (§21). Behind a
+    /// `Mutex<HashMap<..>>` rather than per-workspace `Arc`s, since watcher
+    /// registration/deregistration is an infrequent, whole-map operation
+    /// (workspace link/unlink/archive), not a hot path.
+    watchers: Mutex<HashMap<WorkspaceId, FolderWatcher>>,
 }
 
 impl AppFacade {
@@ -67,6 +81,9 @@ impl AppFacade {
         let graph_repository = Arc::new(SqliteGraphRepository::new(connection.clone()));
         let graph_engine = Arc::new(GraphEngine::new(graph_repository, events.clone()));
 
+        let job_repository = Arc::new(SqliteJobRepository::new(connection.clone()));
+        let job_queue = Arc::new(JobQueue::new(job_repository));
+
         Self {
             workspace_engine,
             memory_engine,
@@ -75,7 +92,118 @@ impl AppFacade {
             model_registry,
             events,
             state: Arc::new(AppState::new()),
+            job_queue,
+            watchers: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn job_queue(&self) -> &Arc<JobQueue> {
+        &self.job_queue
+    }
+
+    /// Link a folder (§6) and start watching it (§21: initial scan +
+    /// incremental watch), all through the facade so `app-tauri` never
+    /// reaches past this single surface (§46.3, §46.4). This is the
+    /// concrete subscriber-shaped reaction to `WorkspaceEngine::link`'s
+    /// `WorkspaceAdded` event described in that method's doc comment --
+    /// implemented here (rather than as a registered `EventSubscriber`)
+    /// for this milestone, since `AppFacade` is already the single place
+    /// that owns both the Workspace Engine and the Folder Watcher registry
+    /// and a full async subscriber dispatch adds no behavior a direct call
+    /// doesn't already provide at this stage.
+    pub fn link_workspace(
+        &self,
+        root_path: impl Into<String>,
+        display_name: impl Into<String>,
+    ) -> Result<atlas_types::workspace::Workspace, AppError> {
+        let workspace = self.workspace_engine.link(root_path, display_name)?;
+        self.start_watching(workspace.id, &workspace.root_path)?;
+        Ok(workspace)
+    }
+
+    /// §6.1 "Archived: Watching stops." Archives the workspace and tears
+    /// down its `FolderWatcher`, if one is registered.
+    pub fn archive_workspace(
+        &self,
+        id: WorkspaceId,
+    ) -> Result<atlas_types::workspace::Workspace, AppError> {
+        let workspace = self.workspace_engine.archive(id)?;
+        self.stop_watching(id)?;
+        Ok(workspace)
+    }
+
+    /// §6.1: restoring an archived workspace resumes watching.
+    pub fn restore_workspace(
+        &self,
+        id: WorkspaceId,
+    ) -> Result<atlas_types::workspace::Workspace, AppError> {
+        let workspace = self.workspace_engine.restore(id)?;
+        self.start_watching(workspace.id, &workspace.root_path)?;
+        Ok(workspace)
+    }
+
+    /// §6.1 "Deleting a workspace link removes the workspace's row and
+    /// watcher registration".
+    pub fn unlink_workspace(&self, id: WorkspaceId) -> Result<(), AppError> {
+        self.workspace_engine.unlink(id)?;
+        self.stop_watching(id)?;
+        Ok(())
+    }
+
+    fn start_watching(&self, id: WorkspaceId, root_path: &str) -> Result<(), AppError> {
+        let mut watcher = FolderWatcher::new(self.events.clone(), self.job_queue.clone());
+        watcher.initial_scan(id, root_path)?;
+        watcher.watch(id, root_path)?;
+
+        let mut watchers = self
+            .watchers
+            .lock()
+            .map_err(|_| AppError::user("watcher registry lock poisoned"))?;
+        watchers.insert(id, watcher);
+        Ok(())
+    }
+
+    /// §41 step 6: "Start Watchers (Folder Watcher per active workspace)".
+    /// Unlike [`Self::start_watching`] (used on a fresh `link`), resuming
+    /// at startup does not repeat the initial full scan -- the workspace
+    /// was already scanned when it was first linked; only incremental
+    /// watching needs to (re)start. Any changes made while the app was
+    /// closed are picked up as the watcher observes them going forward,
+    /// consistent with §21's incremental-indexing model (a full
+    /// reconciliation scan on every restart is a possible future
+    /// enhancement, not required by this contract).
+    pub fn resume_watchers(&self) -> Result<usize, AppError> {
+        let mut resumed = 0;
+        for workspace in self.workspace_engine.list()? {
+            if workspace.status != atlas_types::workspace::WorkspaceStatus::Active {
+                continue;
+            }
+            let mut watcher = FolderWatcher::new(self.events.clone(), self.job_queue.clone());
+            watcher.watch(workspace.id, &workspace.root_path)?;
+
+            let mut watchers = self
+                .watchers
+                .lock()
+                .map_err(|_| AppError::user("watcher registry lock poisoned"))?;
+            watchers.insert(workspace.id, watcher);
+            resumed += 1;
+        }
+        Ok(resumed)
+    }
+
+    fn stop_watching(&self, id: WorkspaceId) -> Result<(), AppError> {
+        let mut watchers = self
+            .watchers
+            .lock()
+            .map_err(|_| AppError::user("watcher registry lock poisoned"))?;
+        if let Some(mut watcher) = watchers.remove(&id) {
+            watcher.stop();
+        }
+        Ok(())
+    }
+
+    pub fn watched_workspace_count(&self) -> usize {
+        self.watchers.lock().map(|w| w.len()).unwrap_or_default()
     }
 
     pub fn workspace_engine(&self) -> &Arc<WorkspaceEngine> {
@@ -119,6 +247,61 @@ mod tests {
         // Accessors return the same Arc instances constructed internally --
         // this is the whole DI contract (Governing Principle).
         assert!(Arc::strong_count(facade.events()) >= 1);
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "atlas-core-facade-test-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn link_workspace_persists_scans_and_registers_a_watcher() {
+        let facade = AppFacade::new(SqliteConnection::open(":memory:"));
+        let root = temp_dir("link");
+        std::fs::write(root.join("a.pdf"), b"x").unwrap();
+
+        let workspace = facade
+            .link_workspace(root.to_str().unwrap(), "Test Workspace")
+            .unwrap();
+
+        assert_eq!(facade.watched_workspace_count(), 1);
+        assert_eq!(
+            facade.job_queue().repository().list_by_status(
+                atlas_types::job::JobStatus::Queued
+            ).unwrap().len(),
+            1
+        );
+
+        facade.unlink_workspace(workspace.id).unwrap();
+        assert_eq!(facade.watched_workspace_count(), 0);
+        assert!(facade.workspace_engine().get(workspace.id).unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn archive_workspace_stops_watching_and_restore_resumes_it() {
+        let facade = AppFacade::new(SqliteConnection::open(":memory:"));
+        let root = temp_dir("archive-restore");
+
+        let workspace = facade
+            .link_workspace(root.to_str().unwrap(), "Archivable")
+            .unwrap();
+        assert_eq!(facade.watched_workspace_count(), 1);
+
+        facade.archive_workspace(workspace.id).unwrap();
+        assert_eq!(facade.watched_workspace_count(), 0);
+
+        facade.restore_workspace(workspace.id).unwrap();
+        assert_eq!(facade.watched_workspace_count(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Demonstrates the "Mock support for testing" requirement (§30): every

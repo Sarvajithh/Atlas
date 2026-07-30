@@ -26,3 +26,13 @@ atlas-indexer = { path = "../atlas-indexer" }
 atlas-memory = { path = "../atlas-memory" }
 atlas-graph = { path = "../atlas-graph" }
 atlas-models = { path = "../atlas-models" }
+serde.workspace = true
+serde_json.workspace = true
+
+# Phase 2 (§33, §41 step 3 "Open Database"): the SQLite Persistence Layer is
+# now implemented for real for the crates this milestone covers (workspace,
+# events, jobs). `bundled` avoids requiring a system libsqlite3, which keeps
+# the crate buildable in the same sandboxed container documented in the
+# project README's "Known Environment Limitations" section (§5: SQLite is
+# frozen tech stack, this only pins the Rust binding used to talk to it).
+rusqlite = { version = "0.31", features = ["bundled"] }

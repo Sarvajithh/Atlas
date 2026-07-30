@@ -9,6 +9,8 @@
 pub mod chunk_repository;
 pub mod document_repository;
 pub mod embedding_repository;
+pub mod job_repository;
+pub mod job_queue;
 pub mod ocr;
 pub mod parser;
 pub mod pipeline;
@@ -17,7 +19,10 @@ pub mod testing;
 pub use chunk_repository::ChunkRepository;
 pub use document_repository::DocumentRepository;
 pub use embedding_repository::EmbeddingRepository;
+pub use job_queue::JobQueue;
+pub use job_repository::JobRepository;
 pub use parser::{Parser, ParserSelector};
 pub use testing::{
     InMemoryChunkRepository, InMemoryDocumentRepository, InMemoryEmbeddingRepository,
+    InMemoryJobRepository,
 };

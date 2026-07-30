@@ -13,3 +13,4 @@ publish.workspace = true
 atlas-types = { path = "../atlas-types" }
 atlas-utils = { path = "../atlas-utils" }
 atlas-events = { path = "../atlas-events" }
+serde_json.workspace = true

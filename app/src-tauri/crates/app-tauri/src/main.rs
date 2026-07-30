@@ -18,6 +18,12 @@ fn main() {
         .manage(facade)
         .invoke_handler(tauri::generate_handler![
             commands::workspace::workspace_list,
+            commands::workspace::workspace_get,
+            commands::workspace::workspace_link,
+            commands::workspace::workspace_rename,
+            commands::workspace::workspace_archive,
+            commands::workspace::workspace_restore,
+            commands::workspace::workspace_unlink,
             commands::assistant::assistant_ask,
             commands::assistant::assistant_cancel,
             commands::memory::memory_get_weaknesses,

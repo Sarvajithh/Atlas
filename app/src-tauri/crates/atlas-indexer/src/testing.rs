@@ -8,14 +8,131 @@ use std::sync::Mutex;
 
 use atlas_types::chunk::{Chunk, EmbeddingMetadata};
 use atlas_types::document::DocumentRecord;
-use atlas_types::ids::{ChunkId, DocumentId, WorkspaceId};
+use atlas_types::ids::{ChunkId, DocumentId, JobId, WorkspaceId};
+use atlas_types::job::{Job, JobStatus};
+use atlas_utils::time::now_iso8601;
 use atlas_utils::AppError;
 
-use crate::{ChunkRepository, DocumentRepository, EmbeddingRepository};
+use crate::{ChunkRepository, DocumentRepository, EmbeddingRepository, JobRepository};
 
 fn lock_err(what: &str) -> AppError {
     AppError::user(format!("{what} lock poisoned"))
 }
+
+/// Dependency-free, in-memory [`JobRepository`] (§30). Pure storage plus
+/// the bounded-retry bookkeeping described in §33.14/§45.1 -- no actual
+/// indexing work is ever performed by this double.
+#[derive(Default)]
+pub struct InMemoryJobRepository {
+    jobs: Mutex<Vec<Job>>,
+    next_id: Mutex<i64>,
+}
+
+impl InMemoryJobRepository {
+    pub fn new() -> Self {
+        Self {
+            jobs: Mutex::new(Vec::new()),
+            next_id: Mutex::new(1),
+        }
+    }
+
+    fn with_job<F, R>(&self, id: JobId, f: F) -> Result<R, AppError>
+    where
+        F: FnOnce(&mut Job) -> R,
+    {
+        let mut jobs = self.jobs.lock().map_err(|_| lock_err("job"))?;
+        let job = jobs
+            .iter_mut()
+            .find(|j| j.id == id)
+            .ok_or_else(|| AppError::user(format!("job {id:?} not found")))?;
+        Ok(f(job))
+    }
+}
+
+impl JobRepository for InMemoryJobRepository {
+    fn enqueue(&self, job: Job) -> Result<Job, AppError> {
+        let mut next_id = self.next_id.lock().map_err(|_| lock_err("job id"))?;
+        let id = JobId(*next_id);
+        *next_id += 1;
+
+        let job = Job { id, ..job };
+        self.jobs
+            .lock()
+            .map_err(|_| lock_err("job"))?
+            .push(job.clone());
+        Ok(job)
+    }
+
+    fn next_queued(&self) -> Result<Option<Job>, AppError> {
+        let jobs = self.jobs.lock().map_err(|_| lock_err("job"))?;
+        let mut candidates: Vec<&Job> = jobs
+            .iter()
+            .filter(|j| j.status == JobStatus::Queued)
+            .collect();
+        candidates.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.id.0.cmp(&b.id.0)));
+        Ok(candidates.into_iter().next().cloned())
+    }
+
+    fn find_by_id(&self, id: JobId) -> Result<Option<Job>, AppError> {
+        let jobs = self.jobs.lock().map_err(|_| lock_err("job"))?;
+        Ok(jobs.iter().find(|j| j.id == id).cloned())
+    }
+
+    fn list_by_status(&self, status: JobStatus) -> Result<Vec<Job>, AppError> {
+        let jobs = self.jobs.lock().map_err(|_| lock_err("job"))?;
+        Ok(jobs.iter().filter(|j| j.status == status).cloned().collect())
+    }
+
+    fn mark_running(&self, id: JobId) -> Result<Job, AppError> {
+        self.with_job(id, |job| {
+            job.status = JobStatus::Running;
+            job.started_at = Some(now_iso8601());
+            job.clone()
+        })
+    }
+
+    fn mark_succeeded(&self, id: JobId) -> Result<Job, AppError> {
+        self.with_job(id, |job| {
+            job.status = JobStatus::Succeeded;
+            job.completed_at = Some(now_iso8601());
+            job.error = None;
+            job.clone()
+        })
+    }
+
+    fn mark_failed(&self, id: JobId, error: String) -> Result<Job, AppError> {
+        self.with_job(id, |job| {
+            job.retry_count += 1;
+            job.error = Some(error);
+            if job.retry_count <= job.max_retries {
+                job.status = JobStatus::Queued;
+                job.started_at = None;
+            } else {
+                job.status = JobStatus::Failed;
+                job.completed_at = Some(now_iso8601());
+            }
+            job.clone()
+        })
+    }
+
+    fn cancel(&self, id: JobId) -> Result<Job, AppError> {
+        self.with_job(id, |job| {
+            job.status = JobStatus::Cancelled;
+            job.completed_at = Some(now_iso8601());
+            job.clone()
+        })
+    }
+
+    fn list_resumable(&self) -> Result<Vec<Job>, AppError> {
+        let jobs = self.jobs.lock().map_err(|_| lock_err("job"))?;
+        Ok(jobs
+            .iter()
+            .filter(|j| matches!(j.status, JobStatus::Queued | JobStatus::Running))
+            .cloned()
+            .collect())
+    }
+}
+
 
 #[derive(Default)]
 pub struct InMemoryDocumentRepository {

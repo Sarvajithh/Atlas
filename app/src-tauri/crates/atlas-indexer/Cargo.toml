@@ -14,3 +14,4 @@ atlas-types = { path = "../atlas-types" }
 atlas-utils = { path = "../atlas-utils" }
 atlas-events = { path = "../atlas-events" }
 atlas-config = { path = "../atlas-config" }
+serde_json.workspace = true

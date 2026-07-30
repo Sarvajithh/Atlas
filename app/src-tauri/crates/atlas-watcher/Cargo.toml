@@ -12,3 +12,12 @@ publish.workspace = true
 atlas-types = { path = "../atlas-types" }
 atlas-utils = { path = "../atlas-utils" }
 atlas-events = { path = "../atlas-events" }
+atlas-indexer = { path = "../atlas-indexer" }
+serde_json.workspace = true
+
+# Phase 2 (§21): real OS-level filesystem watching needs *some* concrete
+# backend; `notify` is the de facto standard cross-platform crate for this
+# in the Rust ecosystem (inotify/FSEvents/ReadDirectoryChangesW under one
+# API), matching §5's "no additional... backend language" (it's a small,
+# single-purpose watching library, not a new architectural layer).
+notify = "6"

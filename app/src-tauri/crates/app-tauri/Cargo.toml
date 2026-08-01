@@ -23,6 +23,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 atlas-core = { path = "../atlas-core" }
+atlas-indexer = { path = "../atlas-indexer" }
 atlas-utils = { path = "../atlas-utils" }
 atlas-types = { path = "../atlas-types" }
 serde.workspace = true

@@ -17,6 +17,7 @@ pub mod ids;
 pub mod job;
 pub mod memory;
 pub mod model;
+pub mod retrieval;
 pub mod settings;
 pub mod workspace;
 

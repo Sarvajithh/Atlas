@@ -8,10 +8,13 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use atlas_config::SettingsProvider;
+use atlas_db::chunk_adapter::SqliteChunkRepository;
 use atlas_db::connection::SqliteConnection;
+use atlas_db::document_adapter::SqliteDocumentRepository;
 use atlas_db::event_bus_adapter::SqliteEventBus;
 use atlas_db::graph_adapter::SqliteGraphRepository;
 use atlas_db::jobs_adapter::SqliteJobRepository;
+use atlas_db::keyword_search_adapter::SqliteKeywordSearchRepository;
 use atlas_db::memory_adapter::{
     SqliteAnalyticsRepository, SqliteAnnotationRepository, SqliteBookmarkRepository,
     SqliteChatRepository, SqliteLearningProgressRepository,
@@ -21,11 +24,18 @@ use atlas_db::settings_adapter::SqliteSettingsProvider;
 use atlas_db::workspace_adapter::SqliteWorkspaceRepository;
 use atlas_events::EventBus;
 use atlas_graph::GraphEngine;
+use atlas_indexer::embedding::HashEmbeddingEngine;
 use atlas_indexer::job_queue::JobQueue;
+use atlas_indexer::ocr::TesseractCliOcrEngine;
+use atlas_indexer::parser::default_parser_selector;
+use atlas_indexer::pipeline::IndexingPipeline;
 use atlas_memory::MemoryEngine;
-use atlas_models::ModelRegistryRepository;
+use atlas_models::context_builder::AssembledContext;
+use atlas_models::{ContextBuilder, ModelRegistryRepository, PromptBuilder, Retriever};
 use atlas_types::ids::WorkspaceId;
+use atlas_types::retrieval::Citation;
 use atlas_utils::AppError;
+use atlas_vector::VectorDbEmbeddingRepository;
 use atlas_watcher::FolderWatcher;
 use atlas_workspace::lifecycle::WorkspaceEngine;
 
@@ -47,6 +57,13 @@ pub struct AppFacade {
     /// registration/deregistration is an infrequent, whole-map operation
     /// (workspace link/unlink/archive), not a hot path.
     watchers: Mutex<HashMap<WorkspaceId, FolderWatcher>>,
+    /// Knowledge Engine (§14, Phase 3): parse -> chunk -> embed -> index.
+    indexing_pipeline: Arc<IndexingPipeline>,
+    /// Hybrid retrieval + reranking + context/prompt assembly (§14.1, §18,
+    /// §39, §40), sitting downstream of the indexing pipeline above.
+    retriever: Arc<Retriever>,
+    context_builder: Arc<ContextBuilder>,
+    prompt_builder: Arc<PromptBuilder>,
 }
 
 impl AppFacade {
@@ -84,6 +101,36 @@ impl AppFacade {
         let job_repository = Arc::new(SqliteJobRepository::new(connection.clone()));
         let job_queue = Arc::new(JobQueue::new(job_repository));
 
+        // Knowledge Engine (Phase 3): Document Abstraction Layer + Parser
+        // Framework + Chunking + Embedding + Vector storage + Retrieval
+        // (§14, §17, §18, §35, §36).
+        let document_repository = Arc::new(SqliteDocumentRepository::new(connection.clone()));
+        let chunk_repository = Arc::new(SqliteChunkRepository::new(connection.clone()));
+        let keyword_search = Arc::new(SqliteKeywordSearchRepository::new(connection.clone()));
+        let embedder = Arc::new(HashEmbeddingEngine::default());
+        let vector_repository = Arc::new(VectorDbEmbeddingRepository::new("workspace"));
+
+        let indexing_pipeline = Arc::new(IndexingPipeline::new(
+            document_repository,
+            chunk_repository.clone(),
+            Arc::new(default_parser_selector()),
+            settings.clone(),
+            events.clone(),
+            Arc::new(TesseractCliOcrEngine::default()),
+            embedder.clone(),
+            vector_repository.clone(),
+            vector_repository.clone(),
+        ));
+
+        let retriever = Arc::new(Retriever::new(
+            keyword_search,
+            vector_repository,
+            embedder,
+            chunk_repository,
+        ));
+        let context_builder = Arc::new(ContextBuilder::new(4096));
+        let prompt_builder = Arc::new(PromptBuilder::new(settings.clone()));
+
         Self {
             workspace_engine,
             memory_engine,
@@ -94,11 +141,66 @@ impl AppFacade {
             state: Arc::new(AppState::new()),
             job_queue,
             watchers: Mutex::new(HashMap::new()),
+            indexing_pipeline,
+            retriever,
+            context_builder,
+            prompt_builder,
         }
     }
 
     pub fn job_queue(&self) -> &Arc<JobQueue> {
         &self.job_queue
+    }
+
+    pub fn indexing_pipeline(&self) -> &Arc<IndexingPipeline> {
+        &self.indexing_pipeline
+    }
+
+    pub fn retriever(&self) -> &Arc<Retriever> {
+        &self.retriever
+    }
+
+    /// Index (or re-index) a single file within a workspace right now
+    /// (§43.1 `ocr.reprocess`, or any other synchronous "index this file"
+    /// call), resolving `relative_path` against the workspace root via the
+    /// same safe-join convention the Folder Watcher uses (§21).
+    pub fn index_document_now(
+        &self,
+        workspace_id: WorkspaceId,
+        relative_path: &str,
+    ) -> Result<atlas_indexer::pipeline::IndexOutcome, AppError> {
+        let workspace = self
+            .workspace_engine
+            .get(workspace_id)?
+            .ok_or_else(|| AppError::user(format!("workspace {workspace_id:?} not found")))?;
+        let absolute_path = atlas_utils::paths::safe_join(
+            std::path::Path::new(&workspace.root_path),
+            relative_path,
+        )
+        .ok_or_else(|| AppError::user(format!("'{relative_path}' escapes the workspace root")))?;
+        self.indexing_pipeline.index_document(
+            workspace_id,
+            relative_path,
+            absolute_path.to_string_lossy().as_ref(),
+        )
+    }
+
+    /// Full Knowledge Engine read path (§18, §39, §40): hybrid retrieval ->
+    /// rerank -> assemble context -> build prompt. Returns the resolved
+    /// prompt content plus the citations it carries (§44.1), so a caller
+    /// (currently the `rag.*` IPC commands; a future Tutor Engine later)
+    /// gets both in one call.
+    pub fn search(
+        &self,
+        workspace_id: WorkspaceId,
+        query: &str,
+        limit: usize,
+    ) -> Result<(String, Vec<Citation>), AppError> {
+        let hits = self.retriever.retrieve(workspace_id, query, limit)?;
+        let context: AssembledContext = self.context_builder.assemble(query, hits)?;
+        let citations = context.citations.clone();
+        let prompt = self.prompt_builder.build(context);
+        Ok((prompt.content, citations))
     }
 
     /// Link a folder (§6) and start watching it (§21: initial scan +
@@ -346,5 +448,36 @@ mod tests {
             .list_nodes_for_workspace(atlas_types::ids::WorkspaceId(1))
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn index_document_now_and_search_work_end_to_end_through_the_facade() {
+        let facade = AppFacade::new(SqliteConnection::open(":memory:"));
+        let root = temp_dir("knowledge");
+        std::fs::write(
+            root.join("notes.md"),
+            "# Gradients\n\nGradient descent minimizes a loss function iteratively.",
+        )
+        .unwrap();
+
+        let workspace = facade
+            .link_workspace(root.to_str().unwrap(), "Knowledge Test")
+            .unwrap();
+
+        let outcome = facade
+            .index_document_now(workspace.id, "notes.md")
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            atlas_indexer::pipeline::IndexOutcome::Indexed { .. }
+        ));
+
+        let (prompt, citations) = facade
+            .search(workspace.id, "gradient descent loss", 5)
+            .unwrap();
+        assert!(prompt.to_lowercase().contains("gradient"));
+        assert!(!citations.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

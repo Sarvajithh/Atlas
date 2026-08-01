@@ -16,6 +16,7 @@ pub mod document_adapter;
 pub mod event_bus_adapter;
 pub mod graph_adapter;
 pub mod jobs_adapter;
+pub mod keyword_search_adapter;
 pub mod memory_adapter;
 pub mod migrations;
 pub mod model_registry_adapter;

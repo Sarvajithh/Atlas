@@ -30,6 +30,9 @@ fn main() {
             commands::graph::graph_get,
             commands::settings::settings_get,
             commands::settings::settings_set,
+            commands::rag::rag_search,
+            commands::rag::rag_get_context,
+            commands::ocr::ocr_reprocess,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Atlas");

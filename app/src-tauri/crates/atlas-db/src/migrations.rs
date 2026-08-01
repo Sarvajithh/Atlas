@@ -71,6 +71,58 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_jobs_job_type ON jobs(job_type);
         ",
     },
+    // §33.2 `documents`, §33.3 `chunks`, §33.4 `embeddings_metadata` -- the
+    // three tables the Knowledge Engine milestone (Phase 3: Document
+    // Abstraction Layer, Parser Framework, Chunking Engine, Embedding
+    // Engine) owns and reads/writes through `DocumentRepository`/
+    // `ChunkRepository`/`EmbeddingRepository` (atlas-indexer, §14).
+    Migration {
+        id: "0004_create_documents",
+        sql: "
+            CREATE TABLE IF NOT EXISTS documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workspace_id INTEGER NOT NULL,
+                relative_path TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                file_type TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                mtime TEXT NOT NULL,
+                parse_status TEXT NOT NULL,
+                last_indexed_hash TEXT,
+                UNIQUE(workspace_id, relative_path)
+            );
+            CREATE INDEX IF NOT EXISTS idx_documents_workspace ON documents(workspace_id);
+            CREATE INDEX IF NOT EXISTS idx_documents_parse_status ON documents(parse_status);
+        ",
+    },
+    Migration {
+        id: "0005_create_chunks",
+        sql: "
+            CREATE TABLE IF NOT EXISTS chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id INTEGER NOT NULL,
+                sequence_index INTEGER NOT NULL,
+                text_content TEXT NOT NULL,
+                page_or_location_ref TEXT NOT NULL,
+                token_count INTEGER NOT NULL,
+                parser_version TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id);
+        ",
+    },
+    Migration {
+        id: "0006_create_embeddings_metadata",
+        sql: "
+            CREATE TABLE IF NOT EXISTS embeddings_metadata (
+                chunk_id INTEGER PRIMARY KEY,
+                vector_db_collection TEXT NOT NULL,
+                vector_id TEXT NOT NULL,
+                embedding_provider_id TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_embeddings_collection ON embeddings_metadata(vector_db_collection);
+        ",
+    },
 ];
 
 pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
@@ -122,7 +174,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
 
-        for table in ["workspaces", "events", "jobs"] {
+        for table in ["workspaces", "events", "jobs", "documents", "chunks", "embeddings_metadata"] {
             let count: i64 = conn
                 .query_row(
                     "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",

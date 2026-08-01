@@ -5,5 +5,7 @@
 //! (Qdrant or LanceDB, §5). Collections are namespaced per workspace (§22).
 
 pub mod client;
+pub mod store;
 
 pub use client::VectorDbEmbeddingRepository;
+pub use store::EmbeddedVectorStore;

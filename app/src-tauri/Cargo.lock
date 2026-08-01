@@ -64,6 +64,7 @@ name = "app-tauri"
 version = "0.1.0"
 dependencies = [
  "atlas-core",
+ "atlas-indexer",
  "atlas-types",
  "atlas-utils",
  "serde",
@@ -183,6 +184,7 @@ version = "0.1.0"
 dependencies = [
  "atlas-config",
  "atlas-events",
+ "atlas-indexer",
  "atlas-types",
  "atlas-utils",
  "serde_json",
@@ -214,6 +216,8 @@ dependencies = [
  "atlas-indexer",
  "atlas-types",
  "atlas-utils",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

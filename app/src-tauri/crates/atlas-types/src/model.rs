@@ -16,7 +16,7 @@ pub enum ModelStatus {
 
 /// The Engine roles defined in §14.1. Application code refers to engines by
 /// these names, never by underlying Ollama model name (§14.1, §27).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EngineRole {
     Vision,
     Ocr,

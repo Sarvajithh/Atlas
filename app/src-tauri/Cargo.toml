@@ -1,5 +1,6 @@
 [workspace]
-resolver = "2"
+tauri = { version = "2.5", features = [] }
+tauri-build = { version = "2.2", features = [] }
 members = [
     "crates/atlas-types",
     "crates/atlas-utils",

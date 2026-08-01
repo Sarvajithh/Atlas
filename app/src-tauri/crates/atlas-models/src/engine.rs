@@ -9,8 +9,30 @@ use atlas_utils::AppError;
 /// the Prompt Builder's responsibility, not the Engine's.
 pub struct ResolvedPrompt {
     pub content: String,
+    /// Base64-encoded image data, present only when the Prompt Builder
+    /// assembled a Vision Engine request (§35.2 "Images (standalone):
+    /// single-Block document, routed through Vision Engine"). Additive
+    /// field (§46.10); text-only Engines simply never populate it.
+    pub images: Option<Vec<String>>,
 }
 
+impl ResolvedPrompt {
+    pub fn text(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            images: None,
+        }
+    }
+
+    pub fn with_images(content: impl Into<String>, images: Vec<String>) -> Self {
+        Self {
+            content: content.into(),
+            images: Some(images),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct EngineOutput {
     pub content: String,
 }

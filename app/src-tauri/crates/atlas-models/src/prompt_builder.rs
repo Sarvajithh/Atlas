@@ -37,7 +37,7 @@ impl PromptBuilder {
             .map(|(idx, hit)| format!("[{}] {}", idx + 1, hit.text_content))
             .collect::<Vec<_>>()
             .join("\n\n");
-        ResolvedPrompt { content }
+        ResolvedPrompt::text(content)
     }
 }
 

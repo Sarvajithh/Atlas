@@ -15,4 +15,12 @@ atlas-utils = { path = "../atlas-utils" }
 atlas-events = { path = "../atlas-events" }
 atlas-config = { path = "../atlas-config" }
 atlas-indexer = { path = "../atlas-indexer" }
+serde.workspace = true
 serde_json.workspace = true
+# HTTP client for the local Ollama instance (§5 "Inference: Ollama (local
+# only)"; §31 "the app detects it at runtime"). Blocking client keeps
+# core-* crates free of an async runtime dependency; app-tauri's streaming
+# IPC layer runs blocking calls on a worker thread and forwards chunks as
+# Tauri events (§12, §43).
+ureq = { version = "2", default-features = false, features = ["json"] }
+

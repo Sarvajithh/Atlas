@@ -123,6 +123,150 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_embeddings_collection ON embeddings_metadata(vector_db_collection);
         ",
     },
+    // Phase 4 (§14.1 Engines Module, §19 Student Memory): `model_registry`
+    // (§33.13, owned by atlas-models), the `chat_sessions`/`chat_messages`
+    // pair (§33.10/§33.11, Conversation Memory), and the remaining
+    // `student_memory` group tables (§33.7-§33.11, §33.16-§33.18) owned by
+    // atlas-memory. `concept_node_id` columns below intentionally carry no
+    // FOREIGN KEY constraint, matching the existing `jobs`/`events`
+    // convention (§33.14/§33.15: "loosely references... by id, not by hard
+    // foreign key") -- the Concept Graph milestone that owns `concept_nodes`
+    // is out of scope for this milestone.
+    Migration {
+        id: "0007_create_model_registry",
+        sql: "
+            CREATE TABLE IF NOT EXISTS model_registry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_identifier TEXT NOT NULL,
+                engine_role TEXT NOT NULL,
+                capabilities TEXT NOT NULL,
+                context_length INTEGER NOT NULL,
+                vram_requirement INTEGER,
+                status TEXT NOT NULL,
+                version TEXT NOT NULL,
+                supported_tasks TEXT NOT NULL,
+                is_selected_for_role INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_model_registry_role ON model_registry(engine_role);
+            CREATE INDEX IF NOT EXISTS idx_model_registry_status ON model_registry(status);
+        ",
+    },
+    Migration {
+        id: "0008_create_chat_sessions",
+        sql: "
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workspace_id INTEGER NOT NULL,
+                document_id INTEGER,
+                title TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_sessions_workspace ON chat_sessions(workspace_id);
+            CREATE INDEX IF NOT EXISTS idx_chat_sessions_document ON chat_sessions(document_id);
+        ",
+    },
+    Migration {
+        id: "0009_create_chat_messages",
+        sql: "
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                engine_pipeline_used TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id);
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_session_created ON chat_messages(session_id, created_at);
+        ",
+    },
+    Migration {
+        id: "0010_create_annotations",
+        sql: "
+            CREATE TABLE IF NOT EXISTS annotations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id INTEGER NOT NULL,
+                location_ref TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_annotations_document ON annotations(document_id);
+        ",
+    },
+    Migration {
+        id: "0011_create_bookmarks",
+        sql: "
+            CREATE TABLE IF NOT EXISTS bookmarks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id INTEGER NOT NULL,
+                location_ref TEXT NOT NULL,
+                label TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_bookmarks_document ON bookmarks(document_id);
+        ",
+    },
+    Migration {
+        id: "0012_create_learning_progress",
+        sql: "
+            CREATE TABLE IF NOT EXISTS learning_progress (
+                concept_node_id INTEGER PRIMARY KEY,
+                mastery_score REAL NOT NULL,
+                weakness_score REAL NOT NULL,
+                last_reviewed_at TEXT,
+                attempt_count INTEGER NOT NULL
+            );
+        ",
+    },
+    Migration {
+        id: "0013_create_revision_history",
+        sql: "
+            CREATE TABLE IF NOT EXISTS revision_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                concept_node_id INTEGER NOT NULL,
+                scheduled_at TEXT NOT NULL,
+                completed_at TEXT,
+                outcome TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_revision_history_concept ON revision_history(concept_node_id);
+            CREATE INDEX IF NOT EXISTS idx_revision_history_scheduled ON revision_history(scheduled_at);
+        ",
+    },
+    Migration {
+        id: "0014_create_analytics",
+        sql: "
+            CREATE TABLE IF NOT EXISTS analytics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workspace_id INTEGER NOT NULL,
+                metric_key TEXT NOT NULL,
+                metric_value REAL NOT NULL,
+                computed_at TEXT NOT NULL,
+                period TEXT NOT NULL,
+                UNIQUE(workspace_id, metric_key, period)
+            );
+            CREATE INDEX IF NOT EXISTS idx_analytics_workspace_metric_period ON analytics(workspace_id, metric_key, period);
+        ",
+    },
+    Migration {
+        id: "0015_create_settings",
+        sql: "
+            CREATE TABLE IF NOT EXISTS settings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                value_type TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                workspace_id INTEGER,
+                updated_at TEXT NOT NULL,
+                UNIQUE(key, scope, workspace_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_settings_key_scope ON settings(key, scope, workspace_id);
+        ",
+    },
 ];
 
 pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
@@ -174,7 +318,23 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
 
-        for table in ["workspaces", "events", "jobs", "documents", "chunks", "embeddings_metadata"] {
+        for table in [
+            "workspaces",
+            "events",
+            "jobs",
+            "documents",
+            "chunks",
+            "embeddings_metadata",
+            "model_registry",
+            "chat_sessions",
+            "chat_messages",
+            "annotations",
+            "bookmarks",
+            "learning_progress",
+            "revision_history",
+            "analytics",
+            "settings",
+        ] {
             let count: i64 = conn
                 .query_row(
                     "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",

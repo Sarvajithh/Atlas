@@ -9,7 +9,10 @@
 
 pub mod citation;
 pub mod context_builder;
+pub mod discovery;
 pub mod engine;
+pub mod engines;
+pub mod ollama;
 pub mod prompt_builder;
 pub mod registry;
 pub mod reranker;
@@ -19,10 +22,13 @@ pub mod scheduler;
 
 pub use citation::{citation_for_hit, citations_for_hits};
 pub use context_builder::ContextBuilder;
+pub use discovery::ModelDiscoveryService;
 pub use engine::Engine;
+pub use engines::{EnginePool, OllamaEngine};
+pub use ollama::{DiscoveredModel, GenerationChunk, ModelCapability, OllamaConnection, OllamaProvider};
 pub use prompt_builder::PromptBuilder;
 pub use registry::{InMemoryModelRegistry, ModelProvider, ModelRegistryRepository};
 pub use reranker::Reranker;
 pub use resource_manager::ResourceManager;
 pub use retriever::{HybridWeights, Retriever};
-pub use scheduler::ModelScheduler;
+pub use scheduler::{Intent, ModelScheduler, RoutingTable};

@@ -19,13 +19,14 @@ name = "app-tauri"
 path = "src/main.rs"
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2.2", features = [] }
 
 [dependencies]
 atlas-core = { path = "../atlas-core" }
 atlas-indexer = { path = "../atlas-indexer" }
+atlas-models = { path = "../atlas-models" }
 atlas-utils = { path = "../atlas-utils" }
 atlas-types = { path = "../atlas-types" }
 serde.workspace = true
 serde_json.workspace = true
-tauri = { version = "2", features = [] }
+tauri = { version = "2.2", features = [] }

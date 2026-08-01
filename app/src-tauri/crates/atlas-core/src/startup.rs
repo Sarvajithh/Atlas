@@ -20,7 +20,17 @@ pub fn startup(database_path: &str) -> AppFacade {
     //    nothing needs to be eagerly materialized into memory (§9's
     //    Workspace Engine facade queries on demand).
     let facade = AppFacade::new(connection);
-    // 5. Model Discovery -- deferred (requires an Ollama client, future milestone).
+    // 5. Model Discovery (§37.1): reconcile whatever models the local
+    //    Ollama instance currently reports into the Model Registry. Ollama
+    //    is a separate, user-installed dependency (§31) -- if it isn't
+    //    running yet, this must not abort startup (§41 closing note:
+    //    "gracefully degrade"); the app comes up with an empty registry
+    //    and IPC-triggered re-discovery (or the user starting Ollama and
+    //    retrying) fills it in later.
+    match facade.run_model_discovery() {
+        Ok(count) => atlas_utils::log_info!("model discovery found {count} model/role assignment(s)"),
+        Err(err) => log_warn!("model discovery failed (Ollama may not be running): {err}"),
+    }
     // 6/7. Start Watchers + resume in-flight Background Workers (§41 steps
     //    6-7, §21 "Active: steady state"). A watcher failing to start for
     //    one workspace must not abort startup for the rest of the app

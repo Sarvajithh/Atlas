@@ -29,10 +29,15 @@ use atlas_indexer::job_queue::JobQueue;
 use atlas_indexer::ocr::TesseractCliOcrEngine;
 use atlas_indexer::parser::default_parser_selector;
 use atlas_indexer::pipeline::IndexingPipeline;
-use atlas_memory::MemoryEngine;
+use atlas_memory::{ChatRepository, MemoryEngine};
 use atlas_models::context_builder::AssembledContext;
-use atlas_models::{ContextBuilder, ModelRegistryRepository, PromptBuilder, Retriever};
-use atlas_types::ids::WorkspaceId;
+use atlas_models::{
+    ContextBuilder, EnginePool, Intent, ModelDiscoveryService, ModelRegistryRepository, ModelScheduler,
+    OllamaConnection, OllamaEngine, OllamaProvider, PromptBuilder, Retriever, RoutingTable,
+};
+use atlas_types::chat::{ChatMessage, ChatMode, ChatRole, ChatSession};
+use atlas_types::ids::{ChatSessionId, WorkspaceId};
+use atlas_types::model::EngineRole;
 use atlas_types::retrieval::Citation;
 use atlas_utils::AppError;
 use atlas_vector::VectorDbEmbeddingRepository;
@@ -40,6 +45,33 @@ use atlas_watcher::FolderWatcher;
 use atlas_workspace::lifecycle::WorkspaceEngine;
 
 use crate::state::AppState;
+
+/// The default Intent -> Engine-role routing table (§15's illustrative
+/// pipelines). Kept as ordinary constructed data, not a `const`/hardcoded
+/// match in the Scheduler itself, so a future Settings-driven override
+/// only has to replace what's passed into `ModelScheduler::new` (§15
+/// closing note: "core-engines as data").
+fn default_routing_table() -> RoutingTable {
+    let mut table = RoutingTable::new();
+    table.insert(
+        Intent::FactualLookup,
+        vec![EngineRole::Retriever, EngineRole::Reranker, EngineRole::Tutor],
+    );
+    table.insert(
+        Intent::Tutoring,
+        vec![EngineRole::Retriever, EngineRole::Reranker, EngineRole::Tutor],
+    );
+    table.insert(
+        Intent::Quiz,
+        vec![EngineRole::Retriever, EngineRole::Reranker, EngineRole::Reasoning],
+    );
+    table.insert(
+        Intent::Research,
+        vec![EngineRole::Retriever, EngineRole::Reranker, EngineRole::Reasoning],
+    );
+    table.insert(Intent::Planning, vec![EngineRole::Memory, EngineRole::Planner]);
+    table
+}
 
 /// The composed application. Each field is a high-level engine depending
 /// only on interfaces; concrete adapters are wired in `AppFacade::new`.
@@ -64,6 +96,21 @@ pub struct AppFacade {
     retriever: Arc<Retriever>,
     context_builder: Arc<ContextBuilder>,
     prompt_builder: Arc<PromptBuilder>,
+    /// Phase 4 (§14.1 Engines Module, §15 Model Scheduler, §37 Model
+    /// Registry, §37.1 Model Discovery). `engine_pool` holds the concrete
+    /// Ollama-backed Engines for every inference-bearing role the default
+    /// routing table can terminate on (Vision, Tutor, Reasoning, Planner);
+    /// which model actually backs each is resolved per-call from
+    /// `model_registry`, never fixed at construction time.
+    ollama: Arc<OllamaProvider>,
+    engine_pool: Arc<EnginePool>,
+    scheduler: Arc<ModelScheduler>,
+    model_discovery: Arc<ModelDiscoveryService>,
+    /// Conversation Memory / Session Manager (§33.10/§33.11): the same
+    /// `ChatRepository` instance `memory_engine` was built with, exposed
+    /// here too so `chat()` can drive Session Manager behavior without a
+    /// second connection to the same table.
+    chat: Arc<SqliteChatRepository>,
 }
 
 impl AppFacade {
@@ -75,8 +122,9 @@ impl AppFacade {
         let events: Arc<dyn EventBus> = Arc::new(SqliteEventBus::new(connection.clone()));
         let settings: Arc<dyn SettingsProvider> =
             Arc::new(SqliteSettingsProvider::new(connection.clone()));
-        let model_registry: Arc<dyn ModelRegistryRepository> =
-            Arc::new(SqliteModelRegistryRepository::new(connection.clone()));
+        let model_registry_concrete = Arc::new(SqliteModelRegistryRepository::new(connection.clone()));
+        let model_registry: Arc<dyn ModelRegistryRepository> = model_registry_concrete.clone();
+        let model_provider: Arc<dyn atlas_models::ModelProvider> = model_registry_concrete;
 
         let workspace_repository = Arc::new(SqliteWorkspaceRepository::new(connection.clone()));
         let workspace_engine = Arc::new(WorkspaceEngine::new(workspace_repository, events.clone()));
@@ -89,7 +137,7 @@ impl AppFacade {
         let memory_engine = Arc::new(MemoryEngine::new(
             annotations,
             bookmarks,
-            chat,
+            chat.clone(),
             progress,
             analytics,
             events.clone(),
@@ -131,6 +179,44 @@ impl AppFacade {
         let context_builder = Arc::new(ContextBuilder::new(4096));
         let prompt_builder = Arc::new(PromptBuilder::new(settings.clone()));
 
+        // Engines Module (Phase 4, §14.1, §15, §37): Ollama connection
+        // settings come from Settings (§23), never a hardcoded host/port
+        // (Governing Principle §46.1). "ollama.port" is stored as a string
+        // setting like every other `SettingEntry` (§23); an unparsable or
+        // absent value falls back to Ollama's own documented default port
+        // rather than failing composition -- discovery itself surfaces any
+        // real connectivity problem (§41 "gracefully degrade").
+        let ollama_host = settings
+            .get_global("ollama.host")
+            .ok()
+            .flatten()
+            .map(|e| e.value)
+            .unwrap_or_else(|| "localhost".to_string());
+        let ollama_port = settings
+            .get_global("ollama.port")
+            .ok()
+            .flatten()
+            .and_then(|e| e.value.parse::<u16>().ok())
+            .unwrap_or(11434);
+        let ollama = Arc::new(OllamaProvider::new(OllamaConnection::new(ollama_host, ollama_port)));
+
+        let engine_pool = Arc::new(EnginePool::new(vec![
+            Arc::new(OllamaEngine::new(EngineRole::Vision, model_registry.clone(), ollama.clone())),
+            Arc::new(OllamaEngine::new(EngineRole::Tutor, model_registry.clone(), ollama.clone())),
+            Arc::new(OllamaEngine::new(EngineRole::Reasoning, model_registry.clone(), ollama.clone())),
+            Arc::new(OllamaEngine::new(EngineRole::Planner, model_registry.clone(), ollama.clone())),
+        ]));
+
+        let scheduler = Arc::new(ModelScheduler::new(
+            default_routing_table(),
+            model_provider,
+            Arc::new(atlas_models::ResourceManager::new(4)),
+            context_builder.clone(),
+            prompt_builder.clone(),
+        ));
+
+        let model_discovery = Arc::new(ModelDiscoveryService::new(ollama.clone(), model_registry.clone(), events.clone()));
+
         Self {
             workspace_engine,
             memory_engine,
@@ -145,6 +231,11 @@ impl AppFacade {
             retriever,
             context_builder,
             prompt_builder,
+            ollama,
+            engine_pool,
+            scheduler,
+            model_discovery,
+            chat,
         }
     }
 
@@ -335,6 +426,247 @@ impl AppFacade {
     pub fn state(&self) -> &Arc<AppState> {
         &self.state
     }
+
+    pub fn ollama(&self) -> &Arc<OllamaProvider> {
+        &self.ollama
+    }
+
+    pub fn scheduler(&self) -> &Arc<ModelScheduler> {
+        &self.scheduler
+    }
+
+    /// §41 step 5 "Model Discovery": reconcile whatever models the local
+    /// Ollama instance currently reports into the Model Registry. Errors
+    /// (most commonly: Ollama isn't installed/running, §31) are returned
+    /// to the caller rather than panicking, so the Startup Sequence can
+    /// log and continue (§41 closing note) while an IPC-triggered manual
+    /// re-discovery can surface the error to the user instead.
+    pub fn run_model_discovery(&self) -> Result<usize, AppError> {
+        Ok(self.model_discovery.run()?.len())
+    }
+
+    /// Session Manager (§33.10/§33.11) + full AI read path: get-or-create
+    /// the chat session, append the user's message, route the request
+    /// through the Model Scheduler (§15) -- retrieval + context/prompt
+    /// assembly when the intent calls for it, then whichever Engine
+    /// produces the answer -- and append the assistant's reply. Returns
+    /// the session id (so the caller can continue the conversation) and
+    /// the assistant's persisted message with its citations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn chat(
+        &self,
+        workspace_id: WorkspaceId,
+        session_id: Option<ChatSessionId>,
+        message: &str,
+        intent: Intent,
+        images: Option<Vec<String>>,
+    ) -> Result<(ChatSessionId, ChatMessage, Vec<Citation>), AppError> {
+        let now = atlas_utils::time::now_iso8601();
+
+        let session = match session_id {
+            Some(id) => id,
+            None => {
+                let title: String = message.chars().take(60).collect();
+                self.chat
+                    .create_session(ChatSession {
+                        id: ChatSessionId(0),
+                        workspace_id,
+                        document_id: None,
+                        title,
+                        mode: ChatMode::Normal,
+                        created_at: now.clone(),
+                        updated_at: now.clone(),
+                    })?
+                    .id
+            }
+        };
+
+        self.chat.append_message(ChatMessage {
+            id: atlas_types::ids::ChatMessageId(0),
+            session_id: session,
+            role: ChatRole::User,
+            content: message.to_string(),
+            engine_pipeline_used: None,
+            created_at: now.clone(),
+        })?;
+
+        let (output, citations) = self
+            .scheduler
+            .execute(&self.engine_pool, &self.retriever, workspace_id, &intent, message, 5, images)?;
+
+        let pipeline = self.scheduler.resolve_pipeline(&intent);
+        let assistant_message = self.chat.append_message(ChatMessage {
+            id: atlas_types::ids::ChatMessageId(0),
+            session_id: session,
+            role: ChatRole::Assistant,
+            content: output.content,
+            engine_pipeline_used: Some(format!("{pipeline:?}")),
+            created_at: atlas_utils::time::now_iso8601(),
+        })?;
+
+        Ok((session, assistant_message, citations))
+    }
+
+    /// Streaming counterpart to [`Self::chat`] (§12 "use Tauri's event
+    /// system to stream progress/tokens back to the frontend"; requirement
+    /// "Stream responses to the frontend"). Same Session Manager behavior
+    /// (session get-or-create, user message persisted up front, assistant
+    /// message persisted once the full text is known) -- the only
+    /// difference is that `on_chunk` is invoked as tokens arrive, before
+    /// the final assistant message is appended. Only used for pipelines
+    /// whose terminal role is inference-bearing and reachable directly
+    /// (Vision/Tutor/Reasoning/Planner); retrieval/context assembly still
+    /// happens up front, synchronously, exactly as in `chat`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn chat_stream(
+        &self,
+        workspace_id: WorkspaceId,
+        session_id: Option<ChatSessionId>,
+        message: &str,
+        intent: Intent,
+        images: Option<Vec<String>>,
+        mut on_chunk: impl FnMut(&str),
+    ) -> Result<(ChatSessionId, ChatMessage, Vec<Citation>), AppError> {
+        let now = atlas_utils::time::now_iso8601();
+
+        let session = match session_id {
+            Some(id) => id,
+            None => {
+                let title: String = message.chars().take(60).collect();
+                self.chat
+                    .create_session(ChatSession {
+                        id: ChatSessionId(0),
+                        workspace_id,
+                        document_id: None,
+                        title,
+                        mode: ChatMode::Normal,
+                        created_at: now.clone(),
+                        updated_at: now.clone(),
+                    })?
+                    .id
+            }
+        };
+
+        self.chat.append_message(ChatMessage {
+            id: atlas_types::ids::ChatMessageId(0),
+            session_id: session,
+            role: ChatRole::User,
+            content: message.to_string(),
+            engine_pipeline_used: None,
+            created_at: now.clone(),
+        })?;
+
+        let pipeline = self.scheduler.resolve_pipeline(&intent);
+        let terminal_role = pipeline
+            .iter()
+            .copied()
+            .rev()
+            .find(|role| !matches!(role, EngineRole::Retriever | EngineRole::Reranker))
+            .ok_or_else(|| AppError::model(format!("routing table has no answer-producing role for {intent:?}")))?;
+
+        let (prompt_content, prompt_images, citations) = if pipeline.contains(&EngineRole::Retriever) {
+            let hits = self.retriever.retrieve(workspace_id, message, 5)?;
+            let context = self.context_builder.assemble(message, hits)?;
+            let citations = context.citations.clone();
+            let resolved = self.prompt_builder.build(context);
+            (resolved.content, images, citations)
+        } else {
+            (message.to_string(), images, Vec::new())
+        };
+
+        let model = self
+            .model_registry
+            .find_for_role(terminal_role)?
+            .ok_or_else(|| AppError::model(format!("no model currently assigned to {terminal_role:?}")))?;
+
+        let mut full_content = String::new();
+        for chunk in self.ollama.generate_stream(&model.model_identifier, &prompt_content, prompt_images)? {
+            let chunk = chunk?;
+            if !chunk.content.is_empty() {
+                on_chunk(&chunk.content);
+                full_content.push_str(&chunk.content);
+            }
+        }
+
+        let assistant_message = self.chat.append_message(ChatMessage {
+            id: atlas_types::ids::ChatMessageId(0),
+            session_id: session,
+            role: ChatRole::Assistant,
+            content: full_content,
+            engine_pipeline_used: Some(format!("{pipeline:?}")),
+            created_at: atlas_utils::time::now_iso8601(),
+        })?;
+
+        Ok((session, assistant_message, citations))
+    }
+
+    /// Quiz Generator feature (§14.1 Reasoning Engine composition; see
+    /// `atlas_models::engines` module doc for why this is not a new Engine
+    /// role). `topic` is folded into the retrieval query and the
+    /// instruction sent to the Reasoning Engine in one pass -- the Model
+    /// Scheduler pipeline for `Intent::Quiz` already routes through
+    /// Retriever -> Reranker -> Reasoning (§15).
+    pub fn quiz(&self, workspace_id: WorkspaceId, topic: &str, question_count: u8) -> Result<(String, Vec<Citation>), AppError> {
+        let instruction = format!(
+            "Generate {question_count} quiz questions (with answers) about: {topic}. Base every question strictly on the provided context."
+        );
+        let (output, citations) = self
+            .scheduler
+            .execute(&self.engine_pool, &self.retriever, workspace_id, &Intent::Quiz, &instruction, 8, None)?;
+        Ok((output.content, citations))
+    }
+
+    /// Flashcard Generator feature, composed on the Tutor Engine (via
+    /// `Intent::Tutoring`'s existing routing) rather than a new role.
+    pub fn flashcards(&self, workspace_id: WorkspaceId, topic: &str, card_count: u8) -> Result<(String, Vec<Citation>), AppError> {
+        let instruction = format!(
+            "Create {card_count} flashcards (front/back pairs) covering the key facts about: {topic}. Base every card strictly on the provided context."
+        );
+        let (output, citations) = self.scheduler.execute(
+            &self.engine_pool,
+            &self.retriever,
+            workspace_id,
+            &Intent::Tutoring,
+            &instruction,
+            8,
+            None,
+        )?;
+        Ok((output.content, citations))
+    }
+
+    /// Revision Planner feature, composed on the Planner Engine
+    /// (`Intent::Planning`, which -- per §15 -- skips retrieval and instead
+    /// consumes Student Memory's weakness data directly, assembled here
+    /// into the instruction the Planner Engine receives).
+    pub fn revision_plan(&self, workspace_id: WorkspaceId, concept_node_ids: &[atlas_types::ids::ConceptNodeId]) -> Result<String, AppError> {
+        let mut weaknesses = Vec::new();
+        for &id in concept_node_ids {
+            if let Some(progress) = self.memory_engine.progress().get_progress(id)? {
+                weaknesses.push(format!(
+                    "concept {}: mastery {:.2}, weakness {:.2}, attempts {}",
+                    id.0, progress.mastery_score, progress.weakness_score, progress.attempt_count
+                ));
+            }
+        }
+        let instruction = if weaknesses.is_empty() {
+            "Produce a general study revision schedule for the next 7 days.".to_string()
+        } else {
+            format!(
+                "Produce a prioritized revision schedule for the next 7 days, focusing more time on weaker concepts. Student progress:\n{}",
+                weaknesses.join("\n")
+            )
+        };
+        let (output, _citations) = self.scheduler.execute(
+            &self.engine_pool,
+            &self.retriever,
+            workspace_id,
+            &Intent::Planning,
+            &instruction,
+            0,
+            None,
+        )?;
+        Ok(output.content)
+    }
 }
 
 #[cfg(test)]
@@ -479,5 +811,82 @@ mod tests {
         assert!(!citations.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn run_model_discovery_fails_gracefully_when_ollama_is_not_running() {
+        // Deliberately point at an unroutable port (1 is reserved) rather
+        // than relying on "nothing happens to be listening on Ollama's
+        // default port in this environment" -- that assumption is false on
+        // any dev machine that actually has Ollama installed and running,
+        // which is exactly the real target environment (§45.1 Model
+        // Errors; same pattern already used in atlas-models' own
+        // OllamaProvider tests).
+        let connection = SqliteConnection::open(":memory:");
+        let settings = atlas_db::settings_adapter::SqliteSettingsProvider::new(connection.clone());
+        settings
+            .set(atlas_types::settings::SettingEntry {
+                key: "ollama.port".to_string(),
+                value: "1".to_string(),
+                value_type: "string".to_string(),
+                scope: atlas_types::settings::SettingsScope::Global,
+                workspace_id: None,
+                updated_at: "t0".to_string(),
+            })
+            .unwrap();
+
+        let facade = AppFacade::new(connection);
+        assert!(facade.run_model_discovery().is_err());
+    }
+
+    #[test]
+    fn chat_creates_a_session_and_persists_the_user_message_even_when_the_engine_call_fails() {
+        // No live Ollama/model in this test environment, so the engine
+        // call itself fails -- but the Session Manager side (session
+        // creation + user message persistence) must already have
+        // happened, and the failure must be a clean AppError.
+        let facade = AppFacade::new(SqliteConnection::open(":memory:"));
+        let err = facade
+            .chat(WorkspaceId(1), None, "explain gradient descent", Intent::Tutoring, None)
+            .unwrap_err();
+        assert_eq!(err.category, atlas_utils::ErrorCategory::ModelError);
+
+        let sessions = facade.memory_engine().chat().list_sessions_for_workspace(WorkspaceId(1)).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let messages = facade.memory_engine().chat().list_messages(sessions[0].id).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, atlas_types::chat::ChatRole::User);
+    }
+
+    #[test]
+    fn quiz_flashcards_and_revision_plan_fail_cleanly_without_a_live_model() {
+        let facade = AppFacade::new(SqliteConnection::open(":memory:"));
+
+        assert_eq!(
+            facade.quiz(WorkspaceId(1), "gradient descent", 3).unwrap_err().category,
+            atlas_utils::ErrorCategory::ModelError
+        );
+        assert_eq!(
+            facade.flashcards(WorkspaceId(1), "gradient descent", 5).unwrap_err().category,
+            atlas_utils::ErrorCategory::ModelError
+        );
+        assert_eq!(
+            facade.revision_plan(WorkspaceId(1), &[]).unwrap_err().category,
+            atlas_utils::ErrorCategory::ModelError
+        );
+    }
+
+    #[test]
+    fn chat_stream_persists_the_user_message_before_the_streaming_call_fails() {
+        let facade = AppFacade::new(SqliteConnection::open(":memory:"));
+        let mut chunks = Vec::new();
+        let err = facade
+            .chat_stream(WorkspaceId(1), None, "explain X", Intent::Tutoring, None, |c| chunks.push(c.to_string()))
+            .unwrap_err();
+        assert_eq!(err.category, atlas_utils::ErrorCategory::ModelError);
+        assert!(chunks.is_empty());
+
+        let sessions = facade.memory_engine().chat().list_sessions_for_workspace(WorkspaceId(1)).unwrap();
+        assert_eq!(sessions.len(), 1);
     }
 }

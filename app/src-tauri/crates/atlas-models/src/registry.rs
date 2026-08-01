@@ -7,6 +7,7 @@
 
 use std::sync::Mutex;
 
+use atlas_types::ids::ModelRegistryId;
 use atlas_types::model::{EngineRole, ModelRegistryEntry};
 use atlas_utils::AppError;
 
@@ -36,12 +37,14 @@ pub trait ModelProvider: Send + Sync {
 /// one registry the architecture already defines.
 pub struct InMemoryModelRegistry {
     entries: Mutex<Vec<ModelRegistryEntry>>,
+    next_id: Mutex<i64>,
 }
 
 impl InMemoryModelRegistry {
     pub fn new() -> Self {
         Self {
             entries: Mutex::new(Vec::new()),
+            next_id: Mutex::new(1),
         }
     }
 }
@@ -72,11 +75,24 @@ impl ModelRegistryRepository for InMemoryModelRegistry {
             .cloned())
     }
 
-    fn upsert(&self, entry: ModelRegistryEntry) -> Result<ModelRegistryEntry, AppError> {
+    fn upsert(&self, mut entry: ModelRegistryEntry) -> Result<ModelRegistryEntry, AppError> {
         let mut entries = self
             .entries
             .lock()
             .map_err(|_| AppError::user("model registry lock poisoned"))?;
+
+        // id 0 is the "not yet persisted" sentinel (matches the SQLite
+        // adapter's AUTOINCREMENT convention) -- assign a fresh id rather
+        // than colliding every new entry on id 0.
+        if entry.id.0 == 0 {
+            let mut next_id = self
+                .next_id
+                .lock()
+                .map_err(|_| AppError::user("model registry id counter lock poisoned"))?;
+            entry.id = ModelRegistryId(*next_id);
+            *next_id += 1;
+        }
+
         if let Some(existing) = entries.iter_mut().find(|e| e.id == entry.id) {
             *existing = entry.clone();
         } else {

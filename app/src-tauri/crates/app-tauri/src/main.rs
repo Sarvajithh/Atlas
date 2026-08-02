@@ -6,7 +6,10 @@
 
 mod commands;
 
+use atlas_core::shutdown::shutdown;
 use atlas_core::startup::startup;
+use atlas_core::AppFacade;
+use tauri::Manager;
 
 fn main() {
     // §41: Startup Sequence. Database path is a placeholder here; the real
@@ -24,6 +27,7 @@ fn main() {
             commands::workspace::workspace_archive,
             commands::workspace::workspace_restore,
             commands::workspace::workspace_unlink,
+            commands::workspace::workspace_indexing_status,
             commands::assistant::assistant_ask,
             commands::assistant::assistant_ask_stream,
             commands::assistant::assistant_cancel,
@@ -44,6 +48,18 @@ fn main() {
             commands::bookmark::bookmark_create,
             commands::bookmark::bookmark_delete,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Atlas");
+        .build(tauri::generate_context!())
+        .expect("error while building Atlas")
+        .run(|app_handle, event| {
+            // §42: Shutdown Sequence, triggered on window close / app exit
+            // (step 1: "Signal Shutdown Intent"). Runs the same `shutdown`
+            // this crate already defined the ordered shape for -- this was
+            // previously never invoked anywhere; wiring it in is this
+            // task's "stop cleanly during shutdown" requirement for the
+            // Background Indexing Worker.
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                let facade = app_handle.state::<AppFacade>();
+                shutdown(&facade);
+            }
+        });
 }

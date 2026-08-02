@@ -29,6 +29,7 @@ use atlas_indexer::job_queue::JobQueue;
 use atlas_indexer::ocr::TesseractCliOcrEngine;
 use atlas_indexer::parser::default_parser_selector;
 use atlas_indexer::pipeline::IndexingPipeline;
+use atlas_types::job::IndexingStatus;
 use atlas_memory::{ChatRepository, MemoryEngine};
 use atlas_models::context_builder::AssembledContext;
 use atlas_models::{
@@ -45,6 +46,7 @@ use atlas_watcher::FolderWatcher;
 use atlas_workspace::lifecycle::WorkspaceEngine;
 
 use crate::state::AppState;
+use crate::worker::IndexingWorker;
 
 /// The default Intent -> Engine-role routing table (§15's illustrative
 /// pipelines). Kept as ordinary constructed data, not a `const`/hardcoded
@@ -91,6 +93,11 @@ pub struct AppFacade {
     watchers: Mutex<HashMap<WorkspaceId, FolderWatcher>>,
     /// Knowledge Engine (§14, Phase 3): parse -> chunk -> embed -> index.
     indexing_pipeline: Arc<IndexingPipeline>,
+    /// Background Indexing Worker (§21): the single consumer of the
+    /// `jobs` table `job_queue` above produces. Behind a `Mutex<Option<_>>`
+    /// like `watchers`, since start/stop is an infrequent whole-worker
+    /// operation (app startup/shutdown), not a hot path.
+    indexing_worker: Mutex<Option<IndexingWorker>>,
     /// Hybrid retrieval + reranking + context/prompt assembly (§14.1, §18,
     /// §39, §40), sitting downstream of the indexing pipeline above.
     retriever: Arc<Retriever>,
@@ -228,6 +235,7 @@ impl AppFacade {
             job_queue,
             watchers: Mutex::new(HashMap::new()),
             indexing_pipeline,
+            indexing_worker: Mutex::new(None),
             retriever,
             context_builder,
             prompt_builder,
@@ -247,6 +255,58 @@ impl AppFacade {
         &self.indexing_pipeline
     }
 
+    /// Start the Background Indexing Worker (§41 step 7, §21). Called once
+    /// from `startup::startup`, after watchers are resumed, so any jobs
+    /// left over from a prior session (or enqueued by `resume_watchers`'
+    /// watch registration racing with a live file change) have a consumer
+    /// as soon as the app is ready. Idempotent via
+    /// `IndexingWorker::start`'s own idempotence.
+    pub fn start_indexing_worker(&self) -> Result<(), AppError> {
+        let mut guard = self
+            .indexing_worker
+            .lock()
+            .map_err(|_| AppError::user("indexing worker lock poisoned"))?;
+        let worker = guard.get_or_insert_with(|| {
+            IndexingWorker::new(
+                self.workspace_engine.clone(),
+                self.indexing_pipeline.clone(),
+                self.job_queue.clone(),
+                self.events.clone(),
+            )
+        });
+        worker.start();
+        Ok(())
+    }
+
+    /// Stop the Background Indexing Worker (§42 steps 2-4: stop accepting
+    /// new jobs, let any in-flight job finish, stop the worker).
+    pub fn stop_indexing_worker(&self) -> Result<(), AppError> {
+        let mut guard = self
+            .indexing_worker
+            .lock()
+            .map_err(|_| AppError::user("indexing worker lock poisoned"))?;
+        if let Some(worker) = guard.as_mut() {
+            worker.stop();
+        }
+        Ok(())
+    }
+
+    pub fn indexing_worker_running(&self) -> bool {
+        self.indexing_worker
+            .lock()
+            .map(|guard| guard.as_ref().map(IndexingWorker::is_running).unwrap_or(false))
+            .unwrap_or(false)
+    }
+
+    /// Minimal backend state for a future Learning Progress UI (task
+    /// scope: queued/running/completed/failed jobs, current document,
+    /// processed/total counts, timestamps, progress percentage),
+    /// aggregated live from the existing `jobs` table -- see
+    /// `worker::compute_indexing_status` for the read itself.
+    pub fn indexing_status(&self, workspace_id: WorkspaceId) -> Result<IndexingStatus, AppError> {
+        crate::worker::compute_indexing_status(&self.job_queue, workspace_id)
+    }
+
     pub fn retriever(&self) -> &Arc<Retriever> {
         &self.retriever
     }
@@ -260,20 +320,8 @@ impl AppFacade {
         workspace_id: WorkspaceId,
         relative_path: &str,
     ) -> Result<atlas_indexer::pipeline::IndexOutcome, AppError> {
-        let workspace = self
-            .workspace_engine
-            .get(workspace_id)?
-            .ok_or_else(|| AppError::user(format!("workspace {workspace_id:?} not found")))?;
-        let absolute_path = atlas_utils::paths::safe_join(
-            std::path::Path::new(&workspace.root_path),
-            relative_path,
-        )
-        .ok_or_else(|| AppError::user(format!("'{relative_path}' escapes the workspace root")))?;
-        self.indexing_pipeline.index_document(
-            workspace_id,
-            relative_path,
-            absolute_path.to_string_lossy().as_ref(),
-        )
+        let absolute_path = crate::paths::resolve_absolute_path(&self.workspace_engine, workspace_id, relative_path)?;
+        self.indexing_pipeline.index_document(workspace_id, relative_path, &absolute_path)
     }
 
     /// Full Knowledge Engine read path (§18, §39, §40): hybrid retrieval ->

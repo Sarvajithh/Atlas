@@ -39,6 +39,14 @@ pub fn startup(database_path: &str) -> AppFacade {
     if let Err(err) = facade.resume_watchers() {
         log_warn!("failed to resume one or more folder watchers on startup: {err}");
     }
+    // 7 (cont'd). Start the Background Indexing Worker -- the consumer for
+    // both jobs left over from a prior session (resumable, §21 "resume
+    // rather than restart") and any new jobs the watchers above enqueue
+    // going forward. A worker failing to start must not abort startup for
+    // the rest of the app (§41 closing note: "gracefully degrade").
+    if let Err(err) = facade.start_indexing_worker() {
+        log_warn!("failed to start the background indexing worker on startup: {err}");
+    }
     // 8. Initialize IPC -- performed by app-tauri after this call returns.
     // 9. Launch UI -- performed by app-tauri.
     // 10. Ready State -- signaled by app-tauri once IPC + UI are up.

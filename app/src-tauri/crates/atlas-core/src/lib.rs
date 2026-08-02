@@ -26,9 +26,12 @@
 //! skeletons, and the transient Application State (§13, see [`state`]).
 
 pub mod facade;
+mod paths;
 pub mod shutdown;
 pub mod startup;
 pub mod state;
+pub mod worker;
 
 pub use facade::AppFacade;
 pub use state::AppState;
+pub use worker::IndexingWorker;

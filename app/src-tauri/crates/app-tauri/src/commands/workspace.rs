@@ -8,6 +8,7 @@ use tauri::State;
 
 use atlas_core::AppFacade;
 use atlas_types::ids::WorkspaceId;
+use atlas_types::job::IndexingStatus;
 use atlas_types::workspace::Workspace;
 use atlas_utils::AppError;
 
@@ -73,4 +74,18 @@ pub fn workspace_unlink(
     workspace_id: i64,
 ) -> Result<(), AppError> {
     facade.unlink_workspace(WorkspaceId(workspace_id))
+}
+
+/// Minimal backend state for a future Learning Progress UI (task scope):
+/// queued/running/completed/failed job counts, the currently running
+/// job's document, and a progress percentage, all read live from the
+/// `jobs` table the Background Indexing Worker drives (`atlas-core`'s
+/// `worker::compute_indexing_status`). No frontend is built against this
+/// in this milestone.
+#[tauri::command]
+pub fn workspace_indexing_status(
+    facade: State<'_, AppFacade>,
+    workspace_id: i64,
+) -> Result<IndexingStatus, AppError> {
+    facade.indexing_status(WorkspaceId(workspace_id))
 }

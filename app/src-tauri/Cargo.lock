@@ -122,6 +122,7 @@ dependencies = [
  "atlas-vector",
  "atlas-watcher",
  "atlas-workspace",
+ "serde_json",
 ]
 
 [[package]]

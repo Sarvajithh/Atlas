@@ -24,3 +24,4 @@ atlas-models = { path = "../atlas-models" }
 atlas-memory = { path = "../atlas-memory" }
 atlas-graph = { path = "../atlas-graph" }
 atlas-db = { path = "../atlas-db" }
+serde_json.workspace = true

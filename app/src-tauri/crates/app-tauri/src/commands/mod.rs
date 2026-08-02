@@ -9,3 +9,5 @@ pub mod graph;
 pub mod settings;
 pub mod rag;
 pub mod ocr;
+pub mod document;
+pub mod bookmark;

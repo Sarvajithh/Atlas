@@ -27,6 +27,7 @@ atlas-indexer = { path = "../atlas-indexer" }
 atlas-models = { path = "../atlas-models" }
 atlas-utils = { path = "../atlas-utils" }
 atlas-types = { path = "../atlas-types" }
+base64 = "0.22"
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2.2", features = [] }

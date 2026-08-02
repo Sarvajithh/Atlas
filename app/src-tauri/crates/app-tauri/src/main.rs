@@ -37,6 +37,12 @@ fn main() {
             commands::rag::rag_search,
             commands::rag::rag_get_context,
             commands::ocr::ocr_reprocess,
+            commands::document::document_list,
+            commands::document::document_get,
+            commands::document::document_read,
+            commands::bookmark::bookmark_list,
+            commands::bookmark::bookmark_create,
+            commands::bookmark::bookmark_delete,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Atlas");

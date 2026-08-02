@@ -4,16 +4,7 @@
   "version": "0.1.0",
   "identifier": "com.atlas.learningos",
   "build": {
-    "frontendDist": "../../../src/dist",
-    "devUrl": "http://localhost:1420",
-    "beforeDevCommand": {
-      "script": "npm run dev",
-      "cwd": "../../.."
-    },
-    "beforeBuildCommand": {
-      "script": "npm run build",
-      "cwd": "../../.."
-    }
+    "frontendDist": "../../../src/dist"
   },
   "app": {
     "windows": [

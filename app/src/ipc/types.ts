@@ -33,6 +33,39 @@ export interface ConceptNode {
   created_at: string;
 }
 
+export type ParseStatus = "Pending" | "Parsing" | "Parsed" | "Failed";
+
+/** Mirrors backend `DocumentRecord` (§33.2), returned by `document.list`/`document.get`. */
+export interface DocumentRecord {
+  id: number;
+  workspace_id: number;
+  relative_path: string;
+  content_hash: string;
+  file_type: "md" | "pdf" | "docx" | "image" | string;
+  size: number;
+  mtime: string;
+  parse_status: ParseStatus;
+  last_indexed_hash: string | null;
+}
+
+/** Mirrors backend `DocumentContent` DTO, returned by `document.read`. */
+export interface DocumentContent {
+  relative_path: string;
+  file_type: string;
+  mime: string;
+  is_base64: boolean;
+  content: string;
+}
+
+/** Mirrors backend `Bookmark` (§33.9). */
+export interface Bookmark {
+  id: number;
+  document_id: number;
+  location_ref: string;
+  label: string;
+  created_at: string;
+}
+
 export type SettingsScope = "Global" | "Workspace";
 
 export interface SettingEntry {

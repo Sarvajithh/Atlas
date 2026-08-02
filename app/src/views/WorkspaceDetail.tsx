@@ -1,17 +1,21 @@
 import { useState } from "react";
 
 import { workspaceArchive, workspaceRename, workspaceRestore, workspaceUnlink } from "@/ipc/workspace";
+import type { DocumentRecord } from "@/ipc/types";
 import { useAppStore } from "@/state/store";
+import { useDocumentStore } from "@/state/documents";
 import { EmptyState } from "@/components/states/StateViews";
+import { DocumentExplorer } from "@/components/document/DocumentExplorer";
+import { DocumentTabs } from "@/components/document/DocumentTabs";
+import { DocumentViewer } from "@/components/document/DocumentViewer";
 
 /**
- * Workspace Manager + Workspace Explorer (§8.2.1/§8.2). Lifecycle actions
- * (rename/archive/restore/unlink) are wired to the real backend commands
- * (§43.1, §6.1). The document/folder tree inside a workspace is
- * intentionally NOT rendered here: no `document.*` IPC command exists yet
- * to list files under a workspace, so there is nothing real to show
- * without inventing data -- an explicit empty state explains this instead
- * of a fake tree.
+ * Workspace Manager + Workspace Explorer + Document Experience (§8.2.1/
+ * §8.2). Lifecycle actions (rename/archive/restore/unlink) use the
+ * existing real backend commands (§43.1, §6.1). The document/folder tree
+ * and viewers use the new `document.*`/`bookmark.*` IPC (thin passthroughs
+ * to the pre-existing DocumentRepository/BookmarkRepository -- see
+ * `app-tauri/src/commands/document.rs`/`bookmark.rs`).
  */
 export function WorkspaceDetail({ workspaceId }: { workspaceId: number }) {
   const workspace = useAppStore((s) => s.workspaces.find((w) => w.id === workspaceId));
@@ -25,8 +29,18 @@ export function WorkspaceDetail({ workspaceId }: { workspaceId: number }) {
   const [busy, setBusy] = useState(false);
   const [confirmUnlink, setConfirmUnlink] = useState(false);
 
+  const openDocument = useDocumentStore((s) => s.openDocument);
+  const openTabs = useDocumentStore((s) => s.openTabs);
+  const activeDocTabId = useDocumentStore((s) => s.activeTabId);
+
   if (!workspace) {
     return <EmptyState title="Workspace not found" description="It may have been unlinked." />;
+  }
+
+  const activeDocTab = openTabs.find((t) => t.tabId === activeDocTabId);
+
+  function handleOpenDocument(doc: DocumentRecord) {
+    openDocument(workspaceId, doc);
   }
 
   async function runAction<T>(action: () => Promise<T>, onSuccess: (result: T) => void, successMsg: string) {
@@ -43,8 +57,8 @@ export function WorkspaceDetail({ workspaceId }: { workspaceId: number }) {
   }
 
   return (
-    <section aria-label={`Workspace: ${workspace.display_name}`} className="flex h-full flex-col overflow-auto p-6">
-      <div className="mb-4 flex items-start justify-between">
+    <section aria-label={`Workspace: ${workspace.display_name}`} className="flex h-full flex-col overflow-hidden">
+      <div className="flex shrink-0 items-start justify-between border-b p-4">
         <div>
           {isRenaming ? (
             <div className="flex items-center gap-2">
@@ -130,10 +144,23 @@ export function WorkspaceDetail({ workspaceId }: { workspaceId: number }) {
         </div>
       </div>
 
-      <EmptyState
-        title="Document explorer not available yet"
-        description="Listing files inside this workspace needs a document.* IPC command that hasn't been added to the backend yet. This is disclosed rather than shown as a fake file tree."
-      />
+      <div className="flex flex-1 overflow-hidden">
+        <aside aria-label="Document Explorer" className="w-64 shrink-0 overflow-hidden border-r">
+          <DocumentExplorer workspaceId={workspaceId} onOpenDocument={handleOpenDocument} />
+        </aside>
+
+        <div className="flex flex-1 flex-col overflow-hidden">
+          <DocumentTabs />
+          {activeDocTab ? (
+            <DocumentViewer key={activeDocTab.tabId} tab={activeDocTab} />
+          ) : (
+            <EmptyState
+              title="No document open"
+              description="Select a file from the Document Explorer on the left to open it."
+            />
+          )}
+        </div>
+      </div>
 
       {confirmUnlink ? (
         <div role="dialog" aria-modal="true" className="fixed inset-0 z-40 flex items-center justify-center bg-black/40">

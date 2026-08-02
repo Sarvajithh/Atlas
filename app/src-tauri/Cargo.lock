@@ -68,6 +68,7 @@ dependencies = [
  "atlas-models",
  "atlas-types",
  "atlas-utils",
+ "base64 0.22.1",
  "serde",
  "serde_json",
  "tauri",

@@ -30,6 +30,8 @@ impl PromptBuilder {
     /// `[n]` and the UI can resolve that back to a `Citation` (§44.1) for
     /// click-through to the source document.
     pub fn build(&self, context: AssembledContext) -> ResolvedPrompt {
+        // TEMPORARY TRACE LOGGING (remove once the pipeline is confirmed working).
+        atlas_utils::log_info!("[PromptBuilder] entered with {} context hits", context.hits.len());
         let content = context
             .hits
             .iter()
@@ -37,6 +39,7 @@ impl PromptBuilder {
             .map(|(idx, hit)| format!("[{}] {}", idx + 1, hit.text_content))
             .collect::<Vec<_>>()
             .join("\n\n");
+        atlas_utils::log_info!("[PromptBuilder] exited, prompt size = {} chars", content.len());
         ResolvedPrompt::text(content)
     }
 }

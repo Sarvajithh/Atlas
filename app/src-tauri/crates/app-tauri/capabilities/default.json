@@ -1,0 +1,12 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "identifier": "default",
+  "description": "Default capability for the main window. Adds core:event permissions on top of Tauri's auto-generated core:default, which already covers invoking the app's own #[tauri::command] handlers but does not include permission for the frontend to call listen() (§12 'use Tauri's event system to stream progress/tokens back to the frontend'). Without this, event.listen() throws synchronously and assistant_ask_stream is never invoked at all.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

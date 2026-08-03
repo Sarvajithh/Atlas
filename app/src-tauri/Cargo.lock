@@ -190,6 +190,7 @@ dependencies = [
  "atlas-indexer",
  "atlas-types",
  "atlas-utils",
+ "base64 0.22.1",
  "serde",
  "serde_json",
  "ureq",

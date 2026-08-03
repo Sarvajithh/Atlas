@@ -1,5 +1,5 @@
 import { ipcInvoke } from "@/ipc/client";
-import type { Workspace } from "@/ipc/types";
+import type { IndexingStatus, Workspace } from "@/ipc/types";
 
 /**
  * `workspace.*` namespace (§43.1). Thin typed wrappers over the backend
@@ -37,4 +37,25 @@ export function workspaceRestore(workspaceId: number): Promise<Workspace> {
 /** §6.1: removes the workspace row + watcher registration only; does not delete derived knowledge. */
 export function workspaceUnlink(workspaceId: number): Promise<void> {
   return ipcInvoke<void>("workspace_unlink", { workspaceId });
+}
+
+/**
+ * Live indexing progress for a workspace, read from the `jobs` table
+ * (queued/running/succeeded/failed counts + progress percentage). Backend
+ * command already existed; this is the first frontend wrapper for it.
+ */
+export function workspaceIndexingStatus(workspaceId: number): Promise<IndexingStatus> {
+  return ipcInvoke<IndexingStatus>("workspace_indexing_status", { workspaceId });
+}
+
+/**
+ * "Rebuild Workspace Index": re-walks the workspace root and re-enqueues
+ * every file for indexing (not fine-tuning/retraining a model -- the
+ * architecture contract explicitly rules that out; this rebuilds the
+ * existing Parsing -> OCR -> Chunking -> Embeddings -> Vector DB
+ * pipeline's output for every file). Returns the number of files
+ * enqueued; poll `workspaceIndexingStatus` afterward for progress.
+ */
+export function workspaceReindex(workspaceId: number): Promise<number> {
+  return ipcInvoke<number>("workspace_reindex", { workspaceId });
 }

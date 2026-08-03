@@ -113,6 +113,31 @@ struct GenerateRequest<'a> {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     images: Option<Vec<String>>,
+    options: GenerateOptions,
+}
+
+/// Bug fix (traced live): without an explicit `num_ctx`, Ollama falls
+/// back to the model's default context window, and a prompt larger than
+/// what comfortably fits in VRAM forces layers/context to spill to system
+/// RAM -- on an 8GB card that turned a request into a 120s prefill stall
+/// that never emitted a single token (§45.1: fail clearly, don't hang).
+/// `num_ctx` is kept in step with `ContextBuilder::max_context_tokens`
+/// (§39) so the token budget actually enforced by context assembly
+/// matches what's requested from the model, rather than the two numbers
+/// silently disagreeing.
+#[derive(Debug, Serialize, Clone, Copy)]
+struct GenerateOptions {
+    num_ctx: u32,
+    num_predict: i32,
+}
+
+impl Default for GenerateOptions {
+    fn default() -> Self {
+        Self {
+            num_ctx: 4096,
+            num_predict: 1024,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -193,20 +218,42 @@ impl OllamaProvider {
     /// answer before proceeding (e.g. quiz/flashcard generation composing
     /// structured output from the Reasoning Engine).
     pub fn generate(&self, model: &str, prompt: &str, images: Option<Vec<String>>) -> Result<String, AppError> {
+        // TEMPORARY TRACE LOGGING (remove once the pipeline is confirmed working).
         let url = format!("{}/api/generate", self.connection.base_url());
+        atlas_utils::log_info!("[OllamaProvider] generate() entered url={url} model={model}");
+        let __t0 = std::time::Instant::now();
         let body = GenerateRequest {
             model,
             prompt,
             stream: false,
             images,
+            options: GenerateOptions::default(),
         };
-        let line: GenerateStreamLine = self
+        let response = self
             .agent
             .post(&url)
             .send_json(serde_json::to_value(&body).map_err(|e| AppError::model(e.to_string()))?)
-            .map_err(|e| AppError::model(format!("ollama generate failed: {e}")))?
+            .map_err(|e| {
+                // BUG FIX (observability gap that blocked diagnosing the
+                // vision-OCR 400s): `ureq::Error`'s Display impl for a
+                // non-2xx response is just "status code 400", discarding
+                // the response body -- which for Ollama's API is a JSON
+                // object with the actual reason (e.g. "model does not
+                // support images", "invalid image data"). Extract it.
+                let detail = match e {
+                    ureq::Error::Status(code, resp) => {
+                        let body_text = resp.into_string().unwrap_or_else(|_| "<unreadable body>".to_string());
+                        format!("status {code}: {body_text}")
+                    }
+                    ureq::Error::Transport(t) => t.to_string(),
+                };
+                atlas_utils::log_error!("[OllamaProvider] generate() HTTP call failed: {detail} elapsed={:?}", __t0.elapsed());
+                AppError::model(format!("ollama generate failed: {detail}"))
+            })?;
+        let line: GenerateStreamLine = response
             .into_json()
             .map_err(|e| AppError::model(format!("malformed /api/generate response: {e}")))?;
+        atlas_utils::log_info!("[OllamaProvider] generate() exited elapsed={:?} response_chars={}", __t0.elapsed(), line.response.len());
         Ok(line.response)
     }
 
@@ -221,18 +268,33 @@ impl OllamaProvider {
         prompt: &str,
         images: Option<Vec<String>>,
     ) -> Result<impl Iterator<Item = Result<GenerationChunk, AppError>>, AppError> {
+        // TEMPORARY TRACE LOGGING (remove once the pipeline is confirmed working).
         let url = format!("{}/api/generate", self.connection.base_url());
+        atlas_utils::log_info!("[OllamaProvider] generate_stream() entered url={url} model={model} prompt_chars={}", prompt.len());
+        let __t0 = std::time::Instant::now();
         let body = GenerateRequest {
             model,
             prompt,
             stream: true,
             images,
+            options: GenerateOptions::default(),
         };
         let response = self
             .agent
             .post(&url)
             .send_json(serde_json::to_value(&body).map_err(|e| AppError::model(e.to_string()))?)
-            .map_err(|e| AppError::model(format!("ollama generate (stream) failed: {e}")))?;
+            .map_err(|e| {
+                let detail = match e {
+                    ureq::Error::Status(code, resp) => {
+                        let body_text = resp.into_string().unwrap_or_else(|_| "<unreadable body>".to_string());
+                        format!("status {code}: {body_text}")
+                    }
+                    ureq::Error::Transport(t) => t.to_string(),
+                };
+                atlas_utils::log_error!("[OllamaProvider] generate_stream() HTTP call failed: {detail} elapsed={:?}", __t0.elapsed());
+                AppError::model(format!("ollama generate (stream) failed: {detail}"))
+            })?;
+        atlas_utils::log_info!("[OllamaProvider] generate_stream() HTTP connection established, streaming body elapsed={:?}", __t0.elapsed());
 
         let reader = BufReader::new(response.into_reader());
         Ok(reader.lines().filter_map(|line| {

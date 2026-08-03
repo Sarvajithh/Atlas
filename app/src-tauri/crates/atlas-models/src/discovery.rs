@@ -18,9 +18,11 @@ use crate::registry::ModelRegistryRepository;
 /// discovered model can back several roles at once (e.g. one general
 /// text-generation model serving Tutor, Reasoning, and Planner) --
 /// Retriever/Reranker/Analytics are algorithmic (not Ollama-backed) and
-/// intentionally absent here; OCR continues to run through the existing
-/// Tesseract pipeline (§14.1 Ocr row) rather than an Ollama model in this
-/// milestone.
+/// intentionally absent here. OCR (`EngineRole::Ocr`) is also absent:
+/// `atlas_models::OllamaVisionOcrEngine` reads whichever model is
+/// assigned to `EngineRole::Vision` instead of a separate Ocr-role
+/// assignment, since a general vision-capable model is exactly what OCR
+/// needs and Vision already gets auto-selected here.
 fn roles_for_capability(capability: ModelCapability) -> &'static [EngineRole] {
     match capability {
         ModelCapability::Vision => &[EngineRole::Vision],
@@ -49,9 +51,15 @@ impl ModelDiscoveryService {
     /// §41) are expected to log and continue rather than abort (§41
     /// closing note: "gracefully degrade").
     pub fn run(&self) -> Result<Vec<ModelRegistryEntry>, AppError> {
+        // TEMPORARY TRACE LOGGING (remove once the pipeline is confirmed working).
+        atlas_utils::log_info!("[ModelDiscovery] run() entered");
         let discovered = match self.ollama.discover_models() {
-            Ok(models) => models,
+            Ok(models) => {
+                atlas_utils::log_info!("[ModelDiscovery] ollama reported {} installed model(s): {:?}", models.len(), models.iter().map(|m| &m.model_identifier).collect::<Vec<_>>());
+                models
+            }
             Err(err) => {
+                atlas_utils::log_error!("[ModelDiscovery] discover_models() FAILED: {} (registry will stay empty until discovery is re-run)", err.message);
                 let _ = self.events.publish(AppEvent {
                     id: None,
                     event_type: EventType::ModelUnavailable,
@@ -96,6 +104,8 @@ impl ModelDiscoveryService {
             occurred_at: atlas_utils::time::now_iso8601(),
         });
 
+        // TEMPORARY TRACE LOGGING
+        atlas_utils::log_info!("[ModelDiscovery] run() exited, wrote {} registry entries", written.len());
         Ok(written)
     }
 }

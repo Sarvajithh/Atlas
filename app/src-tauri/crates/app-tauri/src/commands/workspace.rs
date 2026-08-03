@@ -89,3 +89,12 @@ pub fn workspace_indexing_status(
 ) -> Result<IndexingStatus, AppError> {
     facade.indexing_status(WorkspaceId(workspace_id))
 }
+
+/// "Rebuild Workspace Index" (re-walks the workspace and re-enqueues
+/// every file for indexing). Returns the number of files enqueued; the
+/// caller polls `workspace_indexing_status` for progress the same way it
+/// already does for the initial scan -- no separate progress channel.
+#[tauri::command]
+pub fn workspace_reindex(facade: State<'_, AppFacade>, workspace_id: i64) -> Result<usize, AppError> {
+    facade.reindex_workspace(WorkspaceId(workspace_id))
+}

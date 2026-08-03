@@ -25,7 +25,15 @@ describe("useDocumentStore", () => {
       activeTabId: null,
       recentByWorkspace: {},
       bookmarksByDocument: {},
+      pendingNavigation: null,
     });
+  });
+
+  it("navigateToLocation sets pendingNavigation, clearPendingNavigation resets it", () => {
+    useDocumentStore.getState().navigateToLocation(1, "page:4");
+    expect(useDocumentStore.getState().pendingNavigation).toEqual({ documentId: 1, locationRef: "page:4" });
+    useDocumentStore.getState().clearPendingNavigation();
+    expect(useDocumentStore.getState().pendingNavigation).toBeNull();
   });
 
   it("opens a document as a new tab and makes it active", () => {

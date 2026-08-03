@@ -83,15 +83,24 @@ impl Retriever {
         query: &str,
         limit: usize,
     ) -> Result<Vec<SearchHit>, AppError> {
+        // TEMPORARY TRACE LOGGING (remove once the pipeline is confirmed working).
+        let __t0 = std::time::Instant::now();
+        atlas_utils::log_info!("[Retriever] entered workspace_id={} query={query:?} limit={limit}", workspace_id.0);
+
         let keyword_hits = self.keyword_search.search(workspace_id, query, limit * 2)?;
+        atlas_utils::log_info!("[Retriever] keyword_search returned {} hits", keyword_hits.len());
 
         let query_vector = self.embedder.embed(query)?;
         let raw_vector_hits = self
             .vector_search
             .search(workspace_id, &query_vector, limit * 2)?;
+        atlas_utils::log_info!("[Retriever] vector_search returned {} raw hits", raw_vector_hits.len());
         let vector_hits = self.hydrate_vector_hits(raw_vector_hits)?;
+        atlas_utils::log_info!("[Retriever] vector hits hydrated to {} (chunk lookups that missed are dropped)", vector_hits.len());
 
-        Ok(self.merge(keyword_hits, vector_hits, limit))
+        let merged = self.merge(keyword_hits, vector_hits, limit);
+        atlas_utils::log_info!("[Retriever] exited, returned {} merged chunks elapsed={:?}", merged.len(), __t0.elapsed());
+        Ok(merged)
     }
 
     /// Fill in `document_id`/`text_content`/`page_or_location_ref` on

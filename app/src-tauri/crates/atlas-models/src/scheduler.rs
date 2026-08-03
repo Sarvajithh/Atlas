@@ -107,7 +107,12 @@ impl ModelScheduler {
         retrieval_limit: usize,
         images: Option<Vec<String>>,
     ) -> Result<(EngineOutput, Vec<Citation>), AppError> {
+        // TEMPORARY TRACE LOGGING (remove once the pipeline is confirmed working).
+        let __t0 = std::time::Instant::now();
+        atlas_utils::log_info!("[Scheduler] execute entered workspace_id={} intent={intent:?}", workspace_id.0);
+
         let pipeline = self.resolve_pipeline(intent);
+        atlas_utils::log_info!("[Scheduler] resolved pipeline = {pipeline:?}");
 
         // The terminal role is whichever role in the pipeline actually
         // produces the answer -- the first non-retrieval role. Retriever/
@@ -119,6 +124,7 @@ impl ModelScheduler {
             .rev()
             .find(|role| !matches!(role, EngineRole::Retriever | EngineRole::Reranker))
             .ok_or_else(|| AppError::model(format!("routing table has no answer-producing role for {intent:?}")))?;
+        atlas_utils::log_info!("[Scheduler] terminal role = {terminal_role:?}");
 
         let prompt = if pipeline.contains(&EngineRole::Retriever) {
             let hits = retriever.retrieve(workspace_id, query, retrieval_limit)?;
@@ -126,7 +132,9 @@ impl ModelScheduler {
             let citations = context.citations.clone();
             let mut resolved = self.prompt_builder.build(context);
             resolved.images = images;
+            atlas_utils::log_info!("[Scheduler] handing prompt to EnginePool.run_role({terminal_role:?})");
             let output = engines.run_role(terminal_role, resolved)?;
+            atlas_utils::log_info!("[Scheduler] execute exited OK elapsed={:?}", __t0.elapsed());
             return Ok((output, citations));
         } else if let Some(images) = images {
             ResolvedPrompt::with_images(query, images)
@@ -134,7 +142,9 @@ impl ModelScheduler {
             ResolvedPrompt::text(query)
         };
 
+        atlas_utils::log_info!("[Scheduler] handing prompt to EnginePool.run_role({terminal_role:?}) (no retrieval)");
         let output = engines.run_role(terminal_role, prompt)?;
+        atlas_utils::log_info!("[Scheduler] execute exited OK (no retrieval) elapsed={:?}", __t0.elapsed());
         Ok((output, Vec::new()))
     }
 }

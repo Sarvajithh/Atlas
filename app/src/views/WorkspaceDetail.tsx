@@ -8,6 +8,7 @@ import { EmptyState } from "@/components/states/StateViews";
 import { DocumentExplorer } from "@/components/document/DocumentExplorer";
 import { DocumentTabs } from "@/components/document/DocumentTabs";
 import { DocumentViewer } from "@/components/document/DocumentViewer";
+import { IndexingStatusBar } from "@/components/workspace/IndexingStatusBar";
 
 /**
  * Workspace Manager + Workspace Explorer + Document Experience (§8.2.1/
@@ -97,6 +98,9 @@ export function WorkspaceDetail({ workspaceId }: { workspaceId: number }) {
             Status: {workspace.status}
             {workspace.last_indexed_at ? ` · Last indexed ${workspace.last_indexed_at}` : ""}
           </p>
+          <div className="mt-2">
+            <IndexingStatusBar workspaceId={workspaceId} />
+          </div>
         </div>
 
         <div className="flex shrink-0 gap-2">

@@ -132,6 +132,8 @@ impl ModelRegistryRepository for SqliteModelRegistryRepository {
     }
 
     fn find_for_role(&self, role: EngineRole) -> Result<Option<ModelRegistryEntry>, AppError> {
+        // TEMPORARY TRACE LOGGING (remove once the pipeline is confirmed working).
+        atlas_utils::log_info!("[ModelRegistry/SQLite] find_for_role querying role={}", role_to_str(role));
         let conn = self.connection.lock()?;
         let result = conn
             .query_row(
@@ -141,6 +143,7 @@ impl ModelRegistryRepository for SqliteModelRegistryRepository {
             )
             .optional()
             .map_err(|e| AppError::storage(format!("model_registry find_for_role failed: {e}")))?;
+        atlas_utils::log_info!("[ModelRegistry/SQLite] find_for_role role={} found_row={}", role_to_str(role), result.is_some());
         result.map(tuple_to_entry).transpose()
     }
 

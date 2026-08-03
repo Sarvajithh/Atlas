@@ -22,13 +22,28 @@ export interface DocumentTab {
   title: string;
 }
 
+/**
+ * A citation's `location_ref` (§44.1 Shared Location Reference) the
+ * Assistant Panel wants the Viewer to jump to and highlight (§44.2
+ * "Assistant -> Viewer (AI Overlay)"). Consumed by `DocumentViewer` and
+ * cleared once handled, following the same one-shot "pending" pattern
+ * used elsewhere for cross-component signals in this codebase.
+ */
+export interface PendingNavigation {
+  documentId: number;
+  locationRef: string;
+}
+
 export interface DocumentState {
   openTabs: DocumentTab[];
   activeTabId: string | null;
   recentByWorkspace: Record<number, number[]>;
   bookmarksByDocument: Record<number, Bookmark[]>;
+  pendingNavigation: PendingNavigation | null;
 
   openDocument: (workspaceId: number, doc: DocumentRecord) => void;
+  navigateToLocation: (documentId: number, locationRef: string) => void;
+  clearPendingNavigation: () => void;
   closeDocumentTab: (tabId: string) => void;
   setActiveDocumentTab: (tabId: string) => void;
   reorderTabs: (fromIndex: number, toIndex: number) => void;
@@ -48,6 +63,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   activeTabId: null,
   recentByWorkspace: {},
   bookmarksByDocument: {},
+  pendingNavigation: null,
 
   openDocument: (workspaceId, doc) => {
     const tabId = `doc:${doc.id}`;
@@ -76,6 +92,11 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
       },
     }));
   },
+
+  navigateToLocation: (documentId, locationRef) =>
+    set({ pendingNavigation: { documentId, locationRef } }),
+
+  clearPendingNavigation: () => set({ pendingNavigation: null }),
 
   closeDocumentTab: (tabId) =>
     set((state) => {

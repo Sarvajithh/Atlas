@@ -136,6 +136,29 @@ impl AppFacade {
         let workspace_repository = Arc::new(SqliteWorkspaceRepository::new(connection.clone()));
         let workspace_engine = Arc::new(WorkspaceEngine::new(workspace_repository, events.clone()));
 
+        // Engines Module (Phase 4, §14.1, §15, §37): Ollama connection
+        // settings come from Settings (§23), never a hardcoded host/port
+        // (Governing Principle §46.1). "ollama.port" is stored as a string
+        // setting like every other `SettingEntry` (§23); an unparsable or
+        // absent value falls back to Ollama's own documented default port
+        // rather than failing composition -- discovery itself surfaces any
+        // real connectivity problem (§41 "gracefully degrade"). Built here
+        // (earlier than previously) because the OCR engine below now also
+        // needs it.
+        let ollama_host = settings
+            .get_global("ollama.host")
+            .ok()
+            .flatten()
+            .map(|e| e.value)
+            .unwrap_or_else(|| "localhost".to_string());
+        let ollama_port = settings
+            .get_global("ollama.port")
+            .ok()
+            .flatten()
+            .and_then(|e| e.value.parse::<u16>().ok())
+            .unwrap_or(11434);
+        let ollama = Arc::new(OllamaProvider::new(OllamaConnection::new(ollama_host, ollama_port)));
+
         let annotations = Arc::new(SqliteAnnotationRepository::new(connection.clone()));
         let bookmarks = Arc::new(SqliteBookmarkRepository::new(connection.clone()));
         let chat = Arc::new(SqliteChatRepository::new(connection.clone()));
@@ -165,13 +188,24 @@ impl AppFacade {
         let embedder = Arc::new(HashEmbeddingEngine::default());
         let vector_repository = Arc::new(VectorDbEmbeddingRepository::new("workspace"));
 
+        // OCR (§14.1, §17): prefer whichever model the Model Registry has
+        // selected for EngineRole::Vision -- handwriting-capable, unlike
+        // Tesseract -- falling back to the Tesseract CLI (kept as
+        // `fallback` below) if no Vision-role model is assigned or the
+        // Ollama call itself fails (§45.1 Recoverable).
+        let ocr_engine: Arc<dyn atlas_indexer::OcrEngine> = Arc::new(atlas_models::OllamaVisionOcrEngine::new(
+            ollama.clone(),
+            model_registry.clone(),
+            Arc::new(TesseractCliOcrEngine::default()),
+        ));
+
         let indexing_pipeline = Arc::new(IndexingPipeline::new(
             document_repository,
             chunk_repository.clone(),
             Arc::new(default_parser_selector()),
             settings.clone(),
             events.clone(),
-            Arc::new(TesseractCliOcrEngine::default()),
+            ocr_engine,
             embedder.clone(),
             vector_repository.clone(),
             vector_repository.clone(),
@@ -185,27 +219,6 @@ impl AppFacade {
         ));
         let context_builder = Arc::new(ContextBuilder::new(4096));
         let prompt_builder = Arc::new(PromptBuilder::new(settings.clone()));
-
-        // Engines Module (Phase 4, §14.1, §15, §37): Ollama connection
-        // settings come from Settings (§23), never a hardcoded host/port
-        // (Governing Principle §46.1). "ollama.port" is stored as a string
-        // setting like every other `SettingEntry` (§23); an unparsable or
-        // absent value falls back to Ollama's own documented default port
-        // rather than failing composition -- discovery itself surfaces any
-        // real connectivity problem (§41 "gracefully degrade").
-        let ollama_host = settings
-            .get_global("ollama.host")
-            .ok()
-            .flatten()
-            .map(|e| e.value)
-            .unwrap_or_else(|| "localhost".to_string());
-        let ollama_port = settings
-            .get_global("ollama.port")
-            .ok()
-            .flatten()
-            .and_then(|e| e.value.parse::<u16>().ok())
-            .unwrap_or(11434);
-        let ollama = Arc::new(OllamaProvider::new(OllamaConnection::new(ollama_host, ollama_port)));
 
         let engine_pool = Arc::new(EnginePool::new(vec![
             Arc::new(OllamaEngine::new(EngineRole::Vision, model_registry.clone(), ollama.clone())),
@@ -391,6 +404,26 @@ impl AppFacade {
         Ok(())
     }
 
+    /// Rebuild a workspace's index from scratch (Assistant Panel "Rebuild
+    /// Workspace Index" action): re-walks the workspace root and
+    /// re-enqueues an indexing job for every file, the same as the
+    /// initial scan `link_workspace` runs when a folder is first linked
+    /// (§6.1). Safe to call on an already-indexed workspace --
+    /// `IndexingPipeline::index_document` always fully deletes and
+    /// rewrites a document's chunk/embedding rows rather than appending
+    /// (§22), so this reprocesses every file's chunks/embeddings with
+    /// whatever the current chunker/embedder logic is, without leaving
+    /// stale rows behind. Does not touch watcher registration -- if the
+    /// workspace is Active, its `FolderWatcher` keeps running as-is.
+    pub fn reindex_workspace(&self, id: WorkspaceId) -> Result<usize, AppError> {
+        let workspace = self
+            .workspace_engine
+            .get(id)?
+            .ok_or_else(|| AppError::workspace(format!("workspace {} not found", id.0)))?;
+        let scanner = FolderWatcher::new(self.events.clone(), self.job_queue.clone());
+        scanner.initial_scan(id, &workspace.root_path)
+    }
+
     fn start_watching(&self, id: WorkspaceId, root_path: &str) -> Result<(), AppError> {
         let mut watcher = FolderWatcher::new(self.events.clone(), self.job_queue.clone());
         watcher.initial_scan(id, root_path)?;
@@ -454,6 +487,26 @@ impl AppFacade {
     pub fn memory_engine(&self) -> &Arc<MemoryEngine> {
         &self.memory_engine
     }
+
+    /// Conversation Memory read path (§33.10, "Resume previous chats"):
+    /// list a workspace's chat sessions, most-recently-updated first, so
+    /// the Assistant Panel can offer a session picker. Thin passthrough to
+    /// the same `ChatRepository` `chat()`/`chat_stream()` write through
+    /// (§46.4: handlers/facade methods don't duplicate `core-memory`'s
+    /// ownership of this table, they only read through its interface).
+    pub fn list_chat_sessions(&self, workspace_id: WorkspaceId) -> Result<Vec<ChatSession>, AppError> {
+        let mut sessions = self.chat.list_sessions_for_workspace(workspace_id)?;
+        sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(sessions)
+    }
+
+    /// Resume a previous chat: full message history for one session
+    /// (oldest first), so the UI can replay a conversation exactly as
+    /// `chat_messages` (§33.11) recorded it.
+    pub fn list_chat_messages(&self, session_id: ChatSessionId) -> Result<Vec<ChatMessage>, AppError> {
+        self.chat.list_messages(session_id)
+    }
+
 
     pub fn graph_engine(&self) -> &Arc<GraphEngine> {
         &self.graph_engine
@@ -575,6 +628,10 @@ impl AppFacade {
         images: Option<Vec<String>>,
         mut on_chunk: impl FnMut(&str),
     ) -> Result<(ChatSessionId, ChatMessage, Vec<Citation>), AppError> {
+        // TEMPORARY TRACE LOGGING (remove once the pipeline is confirmed working).
+        let __t0 = std::time::Instant::now();
+        atlas_utils::log_info!("[Facade] chat_stream entered workspace_id={} intent={intent:?}", workspace_id.0);
+
         let now = atlas_utils::time::now_iso8601();
 
         let session = match session_id {
@@ -594,6 +651,7 @@ impl AppFacade {
                     .id
             }
         };
+        atlas_utils::log_info!("[Facade] session resolved id={} elapsed={:?}", session.0, __t0.elapsed());
 
         self.chat.append_message(ChatMessage {
             id: atlas_types::ids::ChatMessageId(0),
@@ -603,38 +661,96 @@ impl AppFacade {
             engine_pipeline_used: None,
             created_at: now.clone(),
         })?;
+        atlas_utils::log_info!("[Facade] user message persisted elapsed={:?}", __t0.elapsed());
 
         let pipeline = self.scheduler.resolve_pipeline(&intent);
+        atlas_utils::log_info!("[Scheduler] resolved pipeline = {pipeline:?}");
         let terminal_role = pipeline
             .iter()
             .copied()
             .rev()
             .find(|role| !matches!(role, EngineRole::Retriever | EngineRole::Reranker))
             .ok_or_else(|| AppError::model(format!("routing table has no answer-producing role for {intent:?}")))?;
+        atlas_utils::log_info!("[Scheduler] terminal role = {terminal_role:?}");
 
         let (prompt_content, prompt_images, citations) = if pipeline.contains(&EngineRole::Retriever) {
+            atlas_utils::log_info!("[Retriever] searching... workspace_id={} query_len={}", workspace_id.0, message.len());
+            let __t_retr = std::time::Instant::now();
             let hits = self.retriever.retrieve(workspace_id, message, 5)?;
+            atlas_utils::log_info!("[Retriever] returned {} chunks elapsed={:?}", hits.len(), __t_retr.elapsed());
+
+            atlas_utils::log_info!("[ContextBuilder] entered with {} hits", hits.len());
+            let __t_ctx = std::time::Instant::now();
             let context = self.context_builder.assemble(message, hits)?;
+            atlas_utils::log_info!(
+                "[ContextBuilder] exited hits_kept={} citations={} total_tokens={} elapsed={:?}",
+                context.hits.len(),
+                context.citations.len(),
+                context.total_tokens,
+                __t_ctx.elapsed()
+            );
+
             let citations = context.citations.clone();
+            atlas_utils::log_info!("[PromptBuilder] entered");
+            let __t_pb = std::time::Instant::now();
             let resolved = self.prompt_builder.build(context);
+            atlas_utils::log_info!(
+                "[PromptBuilder] prompt size = {} chars elapsed={:?}",
+                resolved.content.len(),
+                __t_pb.elapsed()
+            );
             (resolved.content, images, citations)
         } else {
+            atlas_utils::log_info!("[Scheduler] pipeline has no Retriever step -- skipping retrieval/context/prompt build");
             (message.to_string(), images, Vec::new())
         };
 
+        atlas_utils::log_info!("[ModelRegistry] resolving model for role {terminal_role:?}");
+        let __t_mr = std::time::Instant::now();
         let model = self
             .model_registry
             .find_for_role(terminal_role)?
-            .ok_or_else(|| AppError::model(format!("no model currently assigned to {terminal_role:?}")))?;
+            .ok_or_else(|| {
+                atlas_utils::log_error!(
+                    "[ModelRegistry] no model assigned to role {terminal_role:?} (registry empty or nothing selected for this role) elapsed={:?}",
+                    __t_mr.elapsed()
+                );
+                AppError::model(format!("no model currently assigned to {terminal_role:?}"))
+            })?;
+        atlas_utils::log_info!(
+            "[ModelRegistry] selected model {} for role {terminal_role:?} elapsed={:?}",
+            model.model_identifier,
+            __t_mr.elapsed()
+        );
+
+        atlas_utils::log_info!(
+            "[OllamaProvider] sending request model={} prompt_chars={}",
+            model.model_identifier,
+            prompt_content.len()
+        );
+        let __t_ollama = std::time::Instant::now();
+        let stream = self.ollama.generate_stream(&model.model_identifier, &prompt_content, prompt_images)?;
+        atlas_utils::log_info!("[OllamaProvider] request accepted, awaiting stream elapsed={:?}", __t_ollama.elapsed());
 
         let mut full_content = String::new();
-        for chunk in self.ollama.generate_stream(&model.model_identifier, &prompt_content, prompt_images)? {
+        let mut chunk_count = 0usize;
+        for chunk in stream {
             let chunk = chunk?;
+            if chunk_count == 0 {
+                atlas_utils::log_info!("[OllamaProvider] first response chunk received elapsed={:?}", __t_ollama.elapsed());
+            }
             if !chunk.content.is_empty() {
                 on_chunk(&chunk.content);
                 full_content.push_str(&chunk.content);
+                chunk_count += 1;
             }
         }
+        atlas_utils::log_info!(
+            "[OllamaProvider] stream complete chunks={} total_chars={} elapsed={:?}",
+            chunk_count,
+            full_content.len(),
+            __t_ollama.elapsed()
+        );
 
         let assistant_message = self.chat.append_message(ChatMessage {
             id: atlas_types::ids::ChatMessageId(0),
@@ -645,6 +761,7 @@ impl AppFacade {
             created_at: atlas_utils::time::now_iso8601(),
         })?;
 
+        atlas_utils::log_info!("[Facade] chat_stream exited OK elapsed={:?}", __t0.elapsed());
         Ok((session, assistant_message, citations))
     }
 

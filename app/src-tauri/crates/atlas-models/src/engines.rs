@@ -50,8 +50,23 @@ impl OllamaEngine {
     }
 
     fn try_generate(&self, model_identifier: &str, prompt: &ResolvedPrompt) -> Result<String, AppError> {
-        self.ollama
-            .generate(model_identifier, &prompt.content, prompt.images.clone())
+        atlas_utils::log_info!(
+            "[OllamaProvider] sending request model={model_identifier} prompt_chars={}",
+            prompt.content.len()
+        );
+        let __t0 = std::time::Instant::now();
+        let result = self
+            .ollama
+            .generate(model_identifier, &prompt.content, prompt.images.clone());
+        match &result {
+            Ok(text) => atlas_utils::log_info!(
+                "[OllamaProvider] response received {} chars elapsed={:?}",
+                text.len(),
+                __t0.elapsed()
+            ),
+            Err(err) => atlas_utils::log_error!("[OllamaProvider] request failed: {} elapsed={:?}", err.message, __t0.elapsed()),
+        }
+        result
     }
 }
 
@@ -61,10 +76,19 @@ impl Engine for OllamaEngine {
     }
 
     fn run(&self, prompt: ResolvedPrompt) -> Result<EngineOutput, AppError> {
+        // TEMPORARY TRACE LOGGING (remove once the pipeline is confirmed working).
+        atlas_utils::log_info!("[ModelRegistry] resolving model for role {:?}", self.role);
         let primary = self
             .model_registry
             .find_for_role(self.role)?
-            .ok_or_else(|| AppError::model(format!("no model currently assigned to {:?}", self.role)))?;
+            .ok_or_else(|| {
+                atlas_utils::log_error!(
+                    "[ModelRegistry] no model assigned to role {:?} (registry empty or nothing selected for this role)",
+                    self.role
+                );
+                AppError::model(format!("no model currently assigned to {:?}", self.role))
+            })?;
+        atlas_utils::log_info!("[ModelRegistry] selected model {} for role {:?}", primary.model_identifier, self.role);
 
         match self.try_generate(&primary.model_identifier, &prompt) {
             Ok(content) => Ok(EngineOutput { content }),
@@ -123,7 +147,11 @@ impl EnginePool {
     /// requirement: "Handle model failures gracefully by selecting
     /// alternative capable models").
     pub fn run_role(&self, role: EngineRole, prompt: ResolvedPrompt) -> Result<EngineOutput, AppError> {
-        self.get(role)?.run(prompt)
+        // TEMPORARY TRACE LOGGING (remove once the pipeline is confirmed working).
+        atlas_utils::log_info!("[EnginePool] run_role entered role={role:?} registered_roles={:?}", self.engines.keys().collect::<Vec<_>>());
+        let result = self.get(role)?.run(prompt);
+        atlas_utils::log_info!("[EnginePool] run_role exited role={role:?} ok={}", result.is_ok());
+        result
     }
 }
 

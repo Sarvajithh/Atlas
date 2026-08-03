@@ -66,6 +66,73 @@ export interface Bookmark {
   created_at: string;
 }
 
+/** Mirrors backend `ChatMode` (§33.10). */
+export type ChatMode = "Normal" | "Research" | "ExamRestricted";
+
+/** Mirrors backend `ChatSession` (§33.10). */
+export interface ChatSession {
+  id: number;
+  workspace_id: number;
+  document_id: number | null;
+  title: string;
+  mode: ChatMode;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Mirrors backend `ChatRole` (§33.11). */
+export type ChatRole = "User" | "Assistant";
+
+/** Mirrors backend `ChatMessage` (§33.11). */
+export interface ChatMessage {
+  id: number;
+  session_id: number;
+  role: ChatRole;
+  content: string;
+  engine_pipeline_used: string | null;
+  created_at: string;
+}
+
+/** Mirrors backend `Citation` (§39.1, §44.1). */
+export interface Citation {
+  document_id: number;
+  chunk_id: number;
+  location_ref: string;
+  snippet: string;
+}
+
+/** Mirrors backend `AssistantAnswer` (`assistant.ask` response). */
+export interface AssistantAnswer {
+  session_id: number;
+  message: ChatMessage;
+  citations: Citation[];
+}
+
+/** Mirrors backend `GeneratedContent` (quiz/flashcards responses). */
+export interface GeneratedContent {
+  content: string;
+  citations: Citation[];
+}
+
+/** Mirrors backend `RunningIndexingJob` (§21, `atlas_types::job`). */
+export interface RunningIndexingJob {
+  job_id: number;
+  relative_path: string;
+  started_at: string | null;
+  retry_count: number;
+}
+
+/** Mirrors backend `IndexingStatus` (§21, §4 "progress percentage"). */
+export interface IndexingStatus {
+  queued: number;
+  running: RunningIndexingJob | null;
+  succeeded: number;
+  failed: number;
+  total: number;
+  progress_percent: number | null;
+  last_indexed_at: string | null;
+}
+
 export type SettingsScope = "Global" | "Workspace";
 
 export interface SettingEntry {

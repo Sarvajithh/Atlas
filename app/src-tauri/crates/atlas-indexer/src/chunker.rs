@@ -17,6 +17,17 @@ use atlas_types::ids::{ChunkId, DocumentId};
 pub struct ChunkingConfig {
     pub max_tokens: u32,
     pub overlap_tokens: u32,
+    /// Hard character-length cap per chunk (bug fix, see module docs
+    /// below `chunk_document`). `max_tokens` alone assumes whitespace-
+    /// delimited "words" are a few characters each (true for normal
+    /// prose); it silently breaks down for garbled/OCR'd text where a
+    /// single whitespace-delimited token can run to thousands of
+    /// characters with no internal spaces -- a "256-word" chunk built
+    /// from such tokens can still be tens of thousands of characters,
+    /// which is exactly what produced a 163K-character prompt from only
+    /// 5 chunks (traced live: `total_tokens=1280` word-count but
+    /// `prompt size = 163493 chars`, i.e. ~128 chars/"word" average).
+    pub max_chars: u32,
 }
 
 impl ChunkingConfig {
@@ -24,7 +35,13 @@ impl ChunkingConfig {
         Self {
             max_tokens,
             overlap_tokens,
+            max_chars: 4000,
         }
+    }
+
+    pub fn with_max_chars(mut self, max_chars: u32) -> Self {
+        self.max_chars = max_chars;
+        self
     }
 }
 
@@ -37,6 +54,7 @@ impl Default for ChunkingConfig {
         Self {
             max_tokens: 256,
             overlap_tokens: 32,
+            max_chars: 4000,
         }
     }
 }
@@ -58,7 +76,30 @@ pub fn chunk_document(document_id: DocumentId, parsed: &ParsedDocument, config: 
         if block.text_content.trim().is_empty() {
             continue;
         }
-        let words: Vec<&str> = block.text_content.split_whitespace().collect();
+        // Bug fix (traced live: a 163K-char prompt from 5 "256-token"
+        // chunks): `split_whitespace()` assumes a "word" is a handful of
+        // characters. Garbled/OCR'd text can produce whitespace-delimited
+        // tokens that run to thousands of characters with no internal
+        // spaces, so normalize any such token into fixed-size pieces
+        // *before* the sliding window runs, otherwise a single
+        // pathological "word" alone can blow the chunk size out by
+        // orders of magnitude regardless of `max_tokens`.
+        const MAX_TOKEN_CHARS: usize = 64;
+        let words: Vec<&str> = block
+            .text_content
+            .split_whitespace()
+            .flat_map(|word| {
+                if word.len() <= MAX_TOKEN_CHARS {
+                    vec![word]
+                } else {
+                    word.as_bytes()
+                        .chunks(MAX_TOKEN_CHARS)
+                        .map(|b| std::str::from_utf8(b).unwrap_or(""))
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                }
+            })
+            .collect();
         if words.is_empty() {
             continue;
         }
@@ -68,11 +109,23 @@ pub fn chunk_document(document_id: DocumentId, parsed: &ParsedDocument, config: 
             .saturating_sub(config.overlap_tokens)
             .max(1) as usize;
         let window = config.max_tokens.max(1) as usize;
+        let max_chars = config.max_chars.max(1) as usize;
 
         let mut start = 0usize;
         loop {
             let end = (start + window).min(words.len());
-            let text_content = words[start..end].join(" ");
+            let mut text_content = words[start..end].join(" ");
+            // Hard cap as defense-in-depth: even after normalizing
+            // individual tokens above, `window` words at `MAX_TOKEN_CHARS`
+            // each could still exceed a sane chunk size, so truncate to
+            // `max_chars` rather than relying solely on word count.
+            if text_content.len() > max_chars {
+                let mut cut = max_chars;
+                while cut > 0 && !text_content.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                text_content.truncate(cut);
+            }
             chunks.push(Chunk {
                 id: ChunkId(0),
                 document_id,

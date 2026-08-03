@@ -12,6 +12,19 @@ use atlas_utils::AppError;
 pub trait Parser: Send + Sync {
     fn file_type(&self) -> &str;
     fn parse(&self, path: &str) -> Result<ParsedDocument, AppError>;
+
+    /// Best-effort extraction of the actual image bytes for one
+    /// `BlockType::Image` block (identified by its index in
+    /// `ParsedDocument::blocks`), for handing to OCR (§17). Default: not
+    /// supported -- the caller (`pipeline.rs`) falls back to reading the
+    /// whole file, which is only actually correct for a format where the
+    /// whole file already IS a single image (`ImageParser`). Formats that
+    /// can contain a real embedded image per block (e.g. `PdfParser`)
+    /// override this so OCR receives an actual image rather than an
+    /// unrelated raw container file it can't decode.
+    fn extract_ocr_image(&self, _path: &str, _block_index: usize) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// Registry-based selector (§36.1): file type -> registered `Parser`.
@@ -246,6 +259,11 @@ pub mod pdf {
                 .map_err(|e| AppError::indexing(format!("failed to read '{path}': {e}")))?;
             Ok(parse_pdf_bytes(path, &bytes))
         }
+
+        fn extract_ocr_image(&self, path: &str, block_index: usize) -> Option<Vec<u8>> {
+            let bytes = std::fs::read(path).ok()?;
+            extract_nth_embedded_jpeg(&bytes, block_index)
+        }
     }
 
     /// Extract `Tj`/`TJ` string-literal contents from a single content
@@ -326,21 +344,128 @@ pub mod pdf {
 
     fn push_page_block(blocks: &mut Vec<Block>, page_slice: &str, page_number: usize) {
         let text = extract_text_from_stream(page_slice);
-        let block_type = if text.trim().is_empty() {
+        // BUG FIX: this minimal reader can't distinguish a real
+        // uncompressed PDF text stream from binary/compressed page data
+        // that merely happens to contain "(" ... ")" byte sequences by
+        // coincidence -- extremely likely in any nontrivial compressed
+        // image stream. Accepting non-empty extraction as "this page has
+        // real text" without checking whether it actually looks like text
+        // caused image-only (e.g. scanned handwriting) pages to be
+        // misclassified as `Paragraph`, skipping OCR entirely and storing
+        // raw binary noise (reinterpreted byte-by-byte as characters,
+        // §254 `as char`) as the chunk's real content -- the
+        // "ï¿½ï¿½ï¿½..." pattern. `looks_like_real_text` rejects that.
+        let block_type = if looks_like_real_text(&text) {
+            BlockType::Paragraph
+        } else {
             // §17/§36.2: image-only page, flagged for OCR rather than
             // assumed absent. The OCR pipeline step (pipeline.rs) is
             // responsible for rasterizing and filling this block's text.
             BlockType::Image
+        };
+        let text_content = if block_type == BlockType::Paragraph {
+            text.trim().to_string()
         } else {
-            BlockType::Paragraph
+            // Discard whatever was "extracted" -- it's binary noise, not
+            // partial real text, so leaving it in would make
+            // `requires_ocr` skip this block (it only fires when
+            // `text_content` is empty).
+            String::new()
         };
         blocks.push(Block {
             block_type,
             location_ref: LocationRef {
                 page_or_location: page_number.to_string(),
             },
-            text_content: text.trim().to_string(),
+            text_content,
         });
+    }
+
+    /// Sanity-check that `extract_text_from_stream`'s output plausibly IS
+    /// text, not binary/compressed data reinterpreted byte-by-byte as
+    /// characters. Real PDF text-showing operators contain ordinary
+    /// printable/whitespace characters; raw compressed or image data
+    /// reinterpreted the same way produces a high proportion of control
+    /// characters and high (0x80-0xFF range, cast directly to Unicode
+    /// codepoints U+0080-U+00FF by `as char`) bytes instead.
+    fn looks_like_real_text(text: &str) -> bool {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let total = trimmed.chars().count();
+        let plausible = trimmed
+            .chars()
+            .filter(|c| c.is_ascii_graphic() || c.is_whitespace())
+            .count();
+        // Require at least 90% ordinary printable ASCII/whitespace.
+        // Real extracted PDF text is effectively always this; binary
+        // noise reliably is not.
+        plausible * 10 >= total * 9
+    }
+
+    /// Best-effort extraction of the Nth embedded JPEG (`/Filter
+    /// /DCTDecode`) image object's raw stream bytes, in file order. A
+    /// `/DCTDecode` stream's raw bytes already ARE a standalone valid
+    /// JPEG file -- that filter name means "this stream is JPEG-encoded
+    /// data" -- so no re-encoding is needed, just slicing out the
+    /// `stream ... endstream` payload.
+    ///
+    /// This is a heuristic, not a real PDF object-graph resolver (this
+    /// parser's documented "minimal reader" scope, §36.2): it assumes one
+    /// embedded image per page, appearing in the same order as the pages
+    /// themselves. True for the overwhelming majority of scan-to-PDF
+    /// output (this app's primary handwritten-notes use case) -- not
+    /// guaranteed for an arbitrary PDF with multiple/zero images on a
+    /// page, or non-JPEG-encoded embedded images (`/FlateDecode`,
+    /// `/CCITTFaxDecode`, `/JPXDecode`), which this does not extract.
+    fn extract_nth_embedded_jpeg(bytes: &[u8], n: usize) -> Option<Vec<u8>> {
+        let mut found = 0usize;
+        let mut cursor = 0usize;
+        while let Some(rel) = find_subslice(&bytes[cursor..], b"/DCTDecode") {
+            let filter_idx = cursor + rel;
+            let Some(stream_rel) = find_subslice(&bytes[filter_idx..], b"stream") else {
+                cursor = filter_idx + 1;
+                continue;
+            };
+            let mut stream_start = filter_idx + stream_rel + b"stream".len();
+            // PDF spec: the `stream` keyword is followed by CRLF or LF
+            // before the binary data begins.
+            if bytes.get(stream_start) == Some(&b'\r') {
+                stream_start += 1;
+            }
+            if bytes.get(stream_start) == Some(&b'\n') {
+                stream_start += 1;
+            }
+            let Some(end_rel) = find_subslice(&bytes[stream_start..], b"endstream") else {
+                cursor = filter_idx + 1;
+                continue;
+            };
+            let mut stream_end = stream_start + end_rel;
+            // PDF spec: an EOL marker immediately precedes `endstream`
+            // and is not part of the stream's actual data -- without
+            // stripping it, every extracted "JPEG" would have one
+            // trailing byte that doesn't belong to the image.
+            if stream_end > stream_start && bytes.get(stream_end - 1) == Some(&b'\n') {
+                stream_end -= 1;
+                if stream_end > stream_start && bytes.get(stream_end - 1) == Some(&b'\r') {
+                    stream_end -= 1;
+                }
+            }
+            if found == n {
+                return Some(bytes[stream_start..stream_end].to_vec());
+            }
+            found += 1;
+            cursor = stream_end;
+        }
+        None
+    }
+
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() || haystack.len() < needle.len() {
+            return None;
+        }
+        haystack.windows(needle.len()).position(|w| w == needle)
     }
 
     #[cfg(test)]
@@ -382,6 +507,45 @@ pub mod pdf {
             assert_eq!(doc.blocks.len(), 2);
             assert_eq!(doc.blocks[0].location_ref.page_or_location, "1");
             assert_eq!(doc.blocks[1].location_ref.page_or_location, "2");
+        }
+
+        /// Regression test for the bug traced live: a scanned/image-only
+        /// page whose compressed binary stream happens to contain "("/")"
+        /// byte sequences was previously misclassified as `Paragraph`
+        /// with that binary noise (reinterpreted byte-by-byte as
+        /// characters) as its "text", skipping OCR entirely.
+        #[test]
+        fn binary_noise_with_coincidental_parens_is_still_flagged_as_image() {
+            let mut fake_pdf = b"/Type /Page /Contents 5 0 R stream\n".to_vec();
+            // High (>0x7F), non-ASCII bytes with a stray '(' and ')' among
+            // them -- exactly what `extract_text_from_stream` would
+            // scoop up as "text" from real compressed/binary stream data.
+            fake_pdf.extend_from_slice(&[0xE2, 0x28, 0x9C, 0xFF, 0xD1, 0x29, 0x00, 0x8A, 0xB4]);
+            fake_pdf.extend_from_slice(b"\nendstream");
+            let doc = parse_pdf_bytes("scanned-binary.pdf", &fake_pdf);
+            assert_eq!(doc.blocks[0].block_type, BlockType::Image);
+            assert!(doc.blocks[0].text_content.is_empty());
+        }
+
+        #[test]
+        fn extracts_the_nth_embedded_jpeg_stream_by_dctdecode_filter() {
+            let mut fake_pdf = Vec::new();
+            fake_pdf.extend_from_slice(b"1 0 obj <</Filter /DCTDecode>> stream\n");
+            fake_pdf.extend_from_slice(&[0xFF, 0xD8, 0xFF, 0xE0, 0x01]); // fake JPEG bytes #1
+            fake_pdf.extend_from_slice(b"\nendstream endobj\n");
+            fake_pdf.extend_from_slice(b"2 0 obj <</Filter /DCTDecode>> stream\n");
+            fake_pdf.extend_from_slice(&[0xFF, 0xD8, 0xFF, 0xE0, 0x02]); // fake JPEG bytes #2
+            fake_pdf.extend_from_slice(b"\nendstream endobj\n");
+
+            assert_eq!(
+                extract_nth_embedded_jpeg(&fake_pdf, 0),
+                Some(vec![0xFF, 0xD8, 0xFF, 0xE0, 0x01])
+            );
+            assert_eq!(
+                extract_nth_embedded_jpeg(&fake_pdf, 1),
+                Some(vec![0xFF, 0xD8, 0xFF, 0xE0, 0x02])
+            );
+            assert_eq!(extract_nth_embedded_jpeg(&fake_pdf, 2), None);
         }
     }
 }

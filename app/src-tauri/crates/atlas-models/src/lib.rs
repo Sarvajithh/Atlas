@@ -19,6 +19,7 @@ pub mod reranker;
 pub mod resource_manager;
 pub mod retriever;
 pub mod scheduler;
+pub mod vision_ocr;
 
 pub use citation::{citation_for_hit, citations_for_hits};
 pub use context_builder::ContextBuilder;
@@ -28,6 +29,7 @@ pub use engines::{EnginePool, OllamaEngine};
 pub use ollama::{DiscoveredModel, GenerationChunk, ModelCapability, OllamaConnection, OllamaProvider};
 pub use prompt_builder::PromptBuilder;
 pub use registry::{InMemoryModelRegistry, ModelProvider, ModelRegistryRepository};
+pub use vision_ocr::OllamaVisionOcrEngine;
 pub use reranker::Reranker;
 pub use resource_manager::ResourceManager;
 pub use retriever::{HybridWeights, Retriever};

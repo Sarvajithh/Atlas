@@ -9,7 +9,7 @@ use tauri::{Emitter, State, Window};
 
 use atlas_core::AppFacade;
 use atlas_models::Intent;
-use atlas_types::chat::ChatMessage;
+use atlas_types::chat::{ChatMessage, ChatSession};
 use atlas_types::ids::{ChatSessionId, ConceptNodeId, WorkspaceId};
 use atlas_types::retrieval::Citation;
 use atlas_utils::error::{ErrorCategory, ErrorCode};
@@ -99,8 +99,16 @@ pub fn assistant_ask_stream(
     intent: Option<String>,
     images: Option<Vec<String>>,
 ) -> Result<(), AppError> {
-    let resolved_intent = intent.as_deref().map(parse_intent).unwrap_or(Intent::Tutoring);
+    // TEMPORARY TRACE LOGGING (remove once the pipeline is confirmed working).
+    let __t0 = std::time::Instant::now();
+    atlas_utils::log_info!(
+        "[IPC] assistant_ask_stream entered workspace_id={workspace_id} session_id={session_id:?} intent={intent:?}"
+    );
 
+    let resolved_intent = intent.as_deref().map(parse_intent).unwrap_or(Intent::Tutoring);
+    atlas_utils::log_info!("[IPC] resolved intent = {resolved_intent:?}");
+
+    atlas_utils::log_info!("[IPC] calling facade.chat_stream");
     let result = facade.chat_stream(
         WorkspaceId(workspace_id),
         session_id.map(ChatSessionId),
@@ -108,6 +116,8 @@ pub fn assistant_ask_stream(
         resolved_intent,
         images,
         |chunk: &str| {
+            // TEMPORARY TRACE LOGGING
+            atlas_utils::log_info!("[IPC] chunk from facade, len={}", chunk.len());
             // A stream chunk failing to emit is a UI/transport concern, not
             // a reason to abort generation (§45.2: don't let a
             // non-critical failure silently break the whole operation) --
@@ -124,8 +134,21 @@ pub fn assistant_ask_stream(
         },
     );
 
+    // TEMPORARY TRACE LOGGING
+    atlas_utils::log_info!(
+        "[IPC] facade.chat_stream returned ok={} elapsed={:?}",
+        result.is_ok(),
+        __t0.elapsed()
+    );
+
     match result {
         Ok((session, message, citations)) => {
+            atlas_utils::log_info!(
+                "[IPC] assistant_ask_stream exited OK session_id={} citations={} elapsed={:?}",
+                session.0,
+                citations.len(),
+                __t0.elapsed()
+            );
             let _ = window.emit(
                 "assistant://done",
                 StreamDonePayload { session_id: session.0, message, citations },
@@ -133,6 +156,11 @@ pub fn assistant_ask_stream(
             Ok(())
         }
         Err(err) => {
+            atlas_utils::log_error!(
+                "[IPC] assistant_ask_stream exited ERROR: {} elapsed={:?}",
+                err.message,
+                __t0.elapsed()
+            );
             let _ = window.emit("assistant://error", StreamErrorPayload { message: err.message.clone() });
             Err(err)
         }
@@ -152,6 +180,28 @@ pub fn assistant_cancel(_request_id: String) -> Result<(), AppError> {
         ErrorCategory::Recoverable,
         "assistant.cancel: in-flight request cancellation is not implemented in this milestone",
     ))
+}
+
+/// §43.1 Conversation Memory ("Previous conversations", "Resume previous
+/// chats", "Workspace-specific conversations"): list a workspace's chat
+/// sessions, most-recent first, for a session picker in the Assistant
+/// Panel. Additive extension of `assistant.*` (§43.2).
+#[tauri::command]
+pub fn assistant_list_sessions(
+    facade: State<'_, AppFacade>,
+    workspace_id: i64,
+) -> Result<Vec<ChatSession>, AppError> {
+    facade.list_chat_sessions(WorkspaceId(workspace_id))
+}
+
+/// Full message history for one session (oldest first), so the UI can
+/// resume a previous chat exactly as `chat_messages` (§33.11) recorded it.
+#[tauri::command]
+pub fn assistant_get_session_messages(
+    facade: State<'_, AppFacade>,
+    session_id: i64,
+) -> Result<Vec<ChatMessage>, AppError> {
+    facade.list_chat_messages(ChatSessionId(session_id))
 }
 
 #[derive(Debug, Deserialize)]

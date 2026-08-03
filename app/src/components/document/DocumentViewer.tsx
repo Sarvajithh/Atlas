@@ -38,6 +38,8 @@ export function DocumentViewer({ tab }: { tab: DocumentTab }) {
   const setBookmarksForDocument = useDocumentStore((s) => s.setBookmarksForDocument);
   const addBookmark = useDocumentStore((s) => s.addBookmark);
   const removeBookmark = useDocumentStore((s) => s.removeBookmark);
+  const pendingNavigation = useDocumentStore((s) => s.pendingNavigation);
+  const clearPendingNavigation = useDocumentStore((s) => s.clearPendingNavigation);
 
   useEffect(() => {
     let cancelled = false;
@@ -62,6 +64,23 @@ export function DocumentViewer({ tab }: { tab: DocumentTab }) {
       cancelled = true;
     };
   }, [tab.documentId, setBookmarksForDocument]);
+
+  // §44.2 "Assistant -> Viewer (AI Overlay)": a citation's location_ref
+  // (§44.1) arrives here as `pendingNavigation`. `location_ref` is the
+  // simple opaque string format already used by bookmarks (`page:N` for
+  // PDFs, `start` otherwise) -- for PDFs this jumps to the cited page via
+  // the same `pdfGoToPage` ref the outline/search-hit navigation already
+  // uses; other formats are consumed (cleared) without a scroll target
+  // since no richer Block-based LocationRef (§35.1) is exposed over IPC
+  // yet, rather than silently doing nothing forever.
+  useEffect(() => {
+    if (!pendingNavigation || pendingNavigation.documentId !== tab.documentId || !content) return;
+    if (content.file_type === "pdf") {
+      const match = /^page:(\d+)$/.exec(pendingNavigation.locationRef);
+      if (match) pdfGoToPage.current?.(Number(match[1]));
+    }
+    clearPendingNavigation();
+  }, [pendingNavigation, tab.documentId, content, clearPendingNavigation]);
 
   const headings: HeadingOutlineItem[] | null = useMemo(() => {
     if (!content || content.file_type !== "md") return null;

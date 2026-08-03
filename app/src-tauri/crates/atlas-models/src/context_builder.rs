@@ -55,6 +55,10 @@ impl ContextBuilder {
     /// 5. Citation preparation -- every surviving hit gets a `Citation`
     ///    (§39.1, §44.1).
     pub fn assemble(&self, query: &str, hits: Vec<SearchHit>) -> Result<AssembledContext, AppError> {
+        // TEMPORARY TRACE LOGGING (remove once the pipeline is confirmed working).
+        let __t0 = std::time::Instant::now();
+        atlas_utils::log_info!("[ContextBuilder] entered with {} hits, max_context_tokens={}", hits.len(), self.max_context_tokens);
+
         let ranked = self.reranker.rerank(query, hits);
         let deduplicated = Self::deduplicate(ranked);
         let (budgeted, total_tokens) = self.apply_token_budget(deduplicated);
@@ -63,6 +67,13 @@ impl ContextBuilder {
         ordered.sort_by_key(|h| h.chunk_id.0);
 
         let citations = citations_for_hits(&ordered);
+        atlas_utils::log_info!(
+            "[ContextBuilder] exited hits_kept={} citations={} total_tokens={} elapsed={:?}",
+            ordered.len(),
+            citations.len(),
+            total_tokens,
+            __t0.elapsed()
+        );
         Ok(AssembledContext {
             hits: ordered,
             citations,

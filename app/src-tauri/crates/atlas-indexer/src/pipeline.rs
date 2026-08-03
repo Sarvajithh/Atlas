@@ -167,7 +167,7 @@ impl IndexingPipeline {
         };
         let record = self.documents.upsert(record)?;
 
-        match self.run_pipeline(record.id, absolute_path, parser) {
+        match self.run_pipeline(workspace_id, record.id, absolute_path, parser) {
             Ok(chunk_count) => {
                 let mut done = record.clone();
                 done.parse_status = ParseStatus::Parsed;
@@ -221,6 +221,7 @@ impl IndexingPipeline {
     /// number of chunks written.
     fn run_pipeline(
         &self,
+        workspace_id: WorkspaceId,
         document_id: DocumentId,
         absolute_path: &str,
         parser: &dyn crate::parser::Parser,
@@ -231,9 +232,23 @@ impl IndexingPipeline {
         // assumed. Failure to OCR one block is recorded on the block's
         // text (left empty) rather than aborting the whole document
         // (§45.1 Recoverable) -- the rest of the document still indexes.
-        for block in parsed.blocks.iter_mut() {
+        for (block_index, block) in parsed.blocks.iter_mut().enumerate() {
             if requires_ocr(block) {
-                let image_bytes = std::fs::read(absolute_path).unwrap_or_default();
+                // BUG FIX: this used to unconditionally read the whole
+                // source file and hand it to the OCR engine as "the
+                // image" -- for a multi-page PDF that's the entire raw
+                // PDF binary, not a real image, which no OCR engine
+                // (Tesseract or a vision model) can meaningfully read.
+                // Prefer the parser's real per-block image when it can
+                // provide one (`PdfParser` now extracts the actual
+                // embedded page image); only fall back to whole-file
+                // bytes when the parser can't do better -- correct for
+                // `ImageParser`, where the whole file already IS the
+                // image.
+                let image_bytes = parser
+                    .extract_ocr_image(absolute_path, block_index)
+                    .or_else(|| std::fs::read(absolute_path).ok())
+                    .unwrap_or_default();
                 if let Ok(text) = self.ocr.extract_text(&image_bytes) {
                     block.text_content = text;
                 }
@@ -252,7 +267,7 @@ impl IndexingPipeline {
         let mut count = 0usize;
         for chunk in chunks {
             let inserted = self.chunks.insert(chunk)?;
-            self.embed_and_store(inserted.document_id, inserted.id, &inserted.text_content)?;
+            self.embed_and_store(workspace_id, inserted.document_id, inserted.id, &inserted.text_content)?;
             count += 1;
         }
 
@@ -261,21 +276,28 @@ impl IndexingPipeline {
 
     fn embed_and_store(
         &self,
+        workspace_id: WorkspaceId,
         _document_id: DocumentId,
         chunk_id: ChunkId,
         text: &str,
     ) -> Result<(), AppError> {
+        // TEMPORARY TRACE LOGGING (remove once the pipeline is confirmed working).
         if text.trim().is_empty() {
+            atlas_utils::log_info!("[IndexingPipeline] embed_and_store skipped chunk_id={} (empty text)", chunk_id.0);
             return Ok(());
         }
         let vector = self.embedder.embed(text)?;
-        // Workspace-level namespacing (§22) for the vector store is
-        // resolved by the concrete `VectorStore` implementation based on
-        // the chunk's owning document; parsing/chunking/embedding stay
-        // decoupled from workspace bookkeeping at this layer (§36.3).
+        atlas_utils::log_info!("[IndexingPipeline] embedded chunk_id={} ({} chars -> {} dims)", chunk_id.0, text.len(), vector.len());
+        // BUG FIX (was hardcoded WorkspaceId(0), traced live: chat's
+        // Retriever queried the real workspace id and got
+        // "vector_search returned 0 raw hits" every time, because every
+        // embedding had been namespaced under workspace 0 regardless of
+        // which workspace it actually belonged to -- see §22 "workspace
+        // namespacing" and the `VectorStore` trait doc on `upsert_vector`.
         let vector_id = self
             .vector_store
-            .upsert_vector(WorkspaceId(0), chunk_id, vector)?;
+            .upsert_vector(workspace_id, chunk_id, vector)?;
+        atlas_utils::log_info!("[IndexingPipeline] vector_store.upsert_vector workspace_id={} chunk_id={} vector_id={:?}", workspace_id.0, chunk_id.0, vector_id);
         self.embeddings.upsert(atlas_types::chunk::EmbeddingMetadata {
             chunk_id,
             vector_db_collection: "default".to_string(),

@@ -10,6 +10,7 @@
 pub mod citation;
 pub mod context_builder;
 pub mod discovery;
+pub mod embedding;
 pub mod engine;
 pub mod engines;
 pub mod ollama;
@@ -24,6 +25,7 @@ pub mod vision_ocr;
 pub use citation::{citation_for_hit, citations_for_hits};
 pub use context_builder::ContextBuilder;
 pub use discovery::ModelDiscoveryService;
+pub use embedding::OllamaEmbeddingEngine;
 pub use engine::Engine;
 pub use engines::{EnginePool, OllamaEngine};
 pub use ollama::{DiscoveredModel, GenerationChunk, ModelCapability, OllamaConnection, OllamaProvider};

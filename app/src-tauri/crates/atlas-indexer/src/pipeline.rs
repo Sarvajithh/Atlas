@@ -302,7 +302,7 @@ impl IndexingPipeline {
             chunk_id,
             vector_db_collection: "default".to_string(),
             vector_id,
-            embedding_provider_id: "hash-embedding-engine".to_string(),
+            embedding_provider_id: self.embedder.provider_id(),
             created_at: now_iso8601(),
         })?;
         Ok(())
@@ -316,6 +316,7 @@ impl IndexingPipeline {
 fn normalize_file_type(extension: &str) -> String {
     match extension {
         "jpg" | "jpeg" | "png" | "gif" | "bmp" | "tiff" | "webp" => "image".to_string(),
+        "htm" => "html".to_string(),
         other => other.to_string(),
     }
 }

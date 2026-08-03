@@ -148,6 +148,25 @@ struct GenerateStreamLine {
     done: bool,
 }
 
+/// Request body for `POST /api/embed` (Ollama's batch embedding endpoint --
+/// accepts either a single string or an array of strings as `input`, and
+/// always returns an array of vectors in `embeddings`, one per input, in
+/// the same order). Using the batch-capable endpoint for both single- and
+/// multi-text calls means `embed()` and `embed_batch()` share one code path
+/// (§37.1 -- one Embedding Engine, one model, same call shape for queries
+/// and chunks).
+#[derive(Debug, Serialize)]
+struct EmbedRequest<'a> {
+    model: &'a str,
+    input: Vec<&'a str>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbedResponse {
+    #[serde(default)]
+    embeddings: Vec<Vec<f32>>,
+}
+
 /// The Ollama Provider itself. Owns the one HTTP client in the system that
 /// is allowed to reach Ollama (§46.4). Every method is a thin, defensive
 /// wrapper: network/parse failures become `AppError::model` (§45.1 "Model
@@ -311,6 +330,65 @@ impl OllamaProvider {
                 Err(e) => Some(Err(AppError::model(format!("malformed stream line: {e}")))),
             }
         }))
+    }
+
+    /// Real embeddings (Part 1 "Replace HashEmbeddingEngine ... Implement a
+    /// real embedding engine using Ollama"; §18, §37.1). Batches every text
+    /// into a single `POST /api/embed` call so indexing a whole document's
+    /// chunks costs one round-trip, not one per chunk. `model` is always
+    /// resolved by the caller from the Model Registry
+    /// (`EngineRole::Embedding`) -- this method never assumes a model name
+    /// (§46.1, §46.4: no hardcoding, no direct-to-Ollama call from outside
+    /// this module).
+    pub fn embed_batch(&self, model: &str, texts: &[&str]) -> Result<Vec<Vec<f32>>, AppError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let url = format!("{}/api/embed", self.connection.base_url());
+        let body = EmbedRequest {
+            model,
+            input: texts.to_vec(),
+        };
+        let __t0 = std::time::Instant::now();
+        let response = self
+            .agent
+            .post(&url)
+            .send_json(serde_json::to_value(&body).map_err(|e| AppError::model(e.to_string()))?)
+            .map_err(|e| {
+                let detail = match e {
+                    ureq::Error::Status(code, resp) => {
+                        let body_text = resp.into_string().unwrap_or_else(|_| "<unreadable body>".to_string());
+                        format!("status {code}: {body_text}")
+                    }
+                    ureq::Error::Transport(t) => t.to_string(),
+                };
+                AppError::model(format!("ollama embed failed: {detail}"))
+            })?;
+        let parsed: EmbedResponse = response
+            .into_json()
+            .map_err(|e| AppError::model(format!("malformed /api/embed response: {e}")))?;
+        atlas_utils::log_info!(
+            "[OllamaProvider] embed_batch() model={model} inputs={} elapsed={:?}",
+            texts.len(),
+            __t0.elapsed()
+        );
+        if parsed.embeddings.len() != texts.len() {
+            return Err(AppError::model(format!(
+                "ollama /api/embed returned {} vectors for {} inputs",
+                parsed.embeddings.len(),
+                texts.len()
+            )));
+        }
+        Ok(parsed.embeddings)
+    }
+
+    /// Single-text convenience wrapper over [`Self::embed_batch`], used for
+    /// query-time embedding (one query per call, §18 "Vector search").
+    pub fn embed(&self, model: &str, text: &str) -> Result<Vec<f32>, AppError> {
+        let mut vectors = self.embed_batch(model, &[text])?;
+        vectors
+            .pop()
+            .ok_or_else(|| AppError::model("ollama /api/embed returned no vectors"))
     }
 }
 
@@ -480,5 +558,60 @@ mod tests {
         )]);
         let text = server.provider().generate("llama3.1", "hi", None).unwrap();
         assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn embed_batch_returns_a_vector_per_input_in_order() {
+        let server = MockServer::start(vec![(
+            "POST",
+            "/api/embed",
+            serde_json::json!({ "embeddings": [[0.1, 0.2], [0.3, 0.4]] }),
+        )]);
+        let vectors = server
+            .provider()
+            .embed_batch("qwen3-embedding", &["first", "second"])
+            .unwrap();
+        assert_eq!(vectors, vec![vec![0.1, 0.2], vec![0.3, 0.4]]);
+    }
+
+    #[test]
+    fn embed_returns_the_single_vector() {
+        let server = MockServer::start(vec![(
+            "POST",
+            "/api/embed",
+            serde_json::json!({ "embeddings": [[1.0, 2.0, 3.0]] }),
+        )]);
+        let vector = server.provider().embed("qwen3-embedding", "hello").unwrap();
+        assert_eq!(vector, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn embed_batch_of_empty_input_makes_no_request_and_returns_empty() {
+        // No mock routes registered: if this made an HTTP call it would
+        // hang waiting for a connection that never comes, so an immediate
+        // empty `Ok` proves the short-circuit.
+        let provider = OllamaProvider::new(OllamaConnection::new("127.0.0.1", 1));
+        assert_eq!(provider.embed_batch("qwen3-embedding", &[]).unwrap(), Vec::<Vec<f32>>::new());
+    }
+
+    #[test]
+    fn embed_batch_is_a_model_error_when_ollama_unreachable() {
+        let provider = OllamaProvider::new(OllamaConnection::new("127.0.0.1", 1));
+        let err = provider.embed_batch("qwen3-embedding", &["x"]).unwrap_err();
+        assert_eq!(err.category, atlas_utils::ErrorCategory::ModelError);
+    }
+
+    #[test]
+    fn embed_batch_is_a_model_error_when_vector_count_mismatches_input_count() {
+        let server = MockServer::start(vec![(
+            "POST",
+            "/api/embed",
+            serde_json::json!({ "embeddings": [[0.1, 0.2]] }),
+        )]);
+        let err = server
+            .provider()
+            .embed_batch("qwen3-embedding", &["first", "second"])
+            .unwrap_err();
+        assert_eq!(err.category, atlas_utils::ErrorCategory::ModelError);
     }
 }

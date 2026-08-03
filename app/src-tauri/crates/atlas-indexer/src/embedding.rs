@@ -22,6 +22,19 @@ pub trait EmbeddingEngine: Send + Sync {
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Embedding>, AppError> {
         texts.iter().map(|t| self.embed(t)).collect()
     }
+
+    /// Identifies which engine/model actually produced a vector, recorded
+    /// per-chunk as `EmbeddingMetadata::embedding_provider_id` (§33). This
+    /// is the cache-invalidation key §22 relies on ("source file content
+    /// hash + parser/engine version tag ... if either changes, the cached
+    /// artifact is stale"): if the assigned embedding model changes, this
+    /// value changes with it, so a stale vector from a different model is
+    /// identifiable instead of silently indistinguishable from a current
+    /// one. Never hardcoded by a caller (§46.1) -- each engine reports its
+    /// own identity.
+    fn provider_id(&self) -> String {
+        "unknown-embedding-engine".to_string()
+    }
 }
 
 /// A dependency-free, deterministic `EmbeddingEngine` default (§28: Ollama
@@ -62,6 +75,10 @@ impl Default for HashEmbeddingEngine {
 impl EmbeddingEngine for HashEmbeddingEngine {
     fn dimensions(&self) -> usize {
         self.dimensions
+    }
+
+    fn provider_id(&self) -> String {
+        "hash-embedding-engine".to_string()
     }
 
     fn embed(&self, text: &str) -> Result<Embedding, AppError> {

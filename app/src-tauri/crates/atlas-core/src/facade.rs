@@ -24,7 +24,6 @@ use atlas_db::settings_adapter::SqliteSettingsProvider;
 use atlas_db::workspace_adapter::SqliteWorkspaceRepository;
 use atlas_events::EventBus;
 use atlas_graph::GraphEngine;
-use atlas_indexer::embedding::HashEmbeddingEngine;
 use atlas_indexer::job_queue::JobQueue;
 use atlas_indexer::ocr::TesseractCliOcrEngine;
 use atlas_indexer::parser::default_parser_selector;
@@ -34,7 +33,7 @@ use atlas_memory::{ChatRepository, MemoryEngine};
 use atlas_models::context_builder::AssembledContext;
 use atlas_models::{
     ContextBuilder, EnginePool, Intent, ModelDiscoveryService, ModelRegistryRepository, ModelScheduler,
-    OllamaConnection, OllamaEngine, OllamaProvider, PromptBuilder, Retriever, RoutingTable,
+    OllamaConnection, OllamaEmbeddingEngine, OllamaEngine, OllamaProvider, PromptBuilder, Retriever, RoutingTable,
 };
 use atlas_types::chat::{ChatMessage, ChatMode, ChatRole, ChatSession};
 use atlas_types::ids::{ChatSessionId, WorkspaceId};
@@ -185,7 +184,25 @@ impl AppFacade {
         let document_repository = Arc::new(SqliteDocumentRepository::new(connection.clone()));
         let chunk_repository = Arc::new(SqliteChunkRepository::new(connection.clone()));
         let keyword_search = Arc::new(SqliteKeywordSearchRepository::new(connection.clone()));
-        let embedder = Arc::new(HashEmbeddingEngine::default());
+        // Embedding (Part 1 "Replace HashEmbeddingEngine ... real
+        // embedding engine using Ollama", §18, §37.1): resolved per-call
+        // from whichever model the Model Registry currently has selected
+        // for `EngineRole::Embedding` (e.g. qwen3-embedding), never a
+        // hardcoded model name. `embedding.dimensions` is a Settings value
+        // (§23) like `ollama.host`/`ollama.port` above -- it only sizes
+        // storage up front (`VectorDbEmbeddingRepository`); the real
+        // per-call vector length always comes from Ollama's response.
+        let embedding_dimensions = settings
+            .get_global("embedding.dimensions")
+            .ok()
+            .flatten()
+            .and_then(|e| e.value.parse::<usize>().ok())
+            .unwrap_or(1024);
+        let embedder = Arc::new(OllamaEmbeddingEngine::new(
+            ollama.clone(),
+            model_registry.clone(),
+            embedding_dimensions,
+        ));
         let vector_repository = Arc::new(VectorDbEmbeddingRepository::new("workspace"));
 
         // OCR (§14.1, §17): prefer whichever model the Model Registry has
@@ -947,9 +964,161 @@ mod tests {
             .is_empty());
     }
 
+    /// A minimal, persistent, multi-request mock Ollama HTTP server used
+    /// only by this test to give `OllamaEmbeddingEngine` (now the real
+    /// production embedder, per Part 1) something to call. It serves the
+    /// same three endpoints the real Ollama server exposes for discovery +
+    /// embedding (`/api/tags`, `/api/show`, `/api/embed`), so the test
+    /// still exercises the real `ModelDiscoveryService` -> Model Registry
+    /// -> `OllamaEmbeddingEngine` path end-to-end, not a bypassed one.
+    /// `/api/embed` computes a deterministic feature-hashed vector per
+    /// input text (same technique the now-removed `HashEmbeddingEngine`
+    /// used) purely so cosine similarity between related texts is
+    /// meaningfully higher than between unrelated ones -- enough to prove
+    /// the pipeline wires real embeddings through end-to-end, without this
+    /// test depending on a real model being installed.
+    fn mock_ollama_embedding_server(model_name: &'static str) -> u16 {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        fn hashed_vector(text: &str, dims: usize) -> Vec<f32> {
+            let mut vector = vec![0f32; dims];
+            for token in text.split_whitespace().map(|w| w.to_lowercase()) {
+                let hash = atlas_utils::hashing::hash_str(&token);
+                let bucket_seed = u32::from_str_radix(&hash[0..8], 16).unwrap_or(0);
+                let sign_seed = u32::from_str_radix(&hash[8..16], 16).unwrap_or(0);
+                let bucket = (bucket_seed as usize) % dims;
+                let sign = if sign_seed % 2 == 0 { 1.0 } else { -1.0 };
+                vector[bucket] += sign;
+            }
+            let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                for v in vector.iter_mut() {
+                    *v /= norm;
+                }
+            }
+            vector
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || loop {
+            let (mut stream, _) = match listener.accept() {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            // Requests can exceed one 8KB read (a chunk-batch embed body),
+            // so read until the client closes its write side rather than
+            // assuming a single recv covers the whole request.
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 8192];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        // A bare HTTP/1.1 request from `ureq` here always
+                        // ends headers with this sequence; once we have at
+                        // least the headers, a body-bearing request also
+                        // carries Content-Length, which we don't bother
+                        // parsing precisely -- reading until the socket
+                        // would block is unreliable, so instead: stop once
+                        // we can see the JSON body looks complete (starts
+                        // with `{` and brace-balances), which every request
+                        // this mock receives satisfies.
+                        if let Some(body_start) = find_subslice(&buf, b"\r\n\r\n") {
+                            let body = &buf[body_start + 4..];
+                            if !body.is_empty() && braces_balanced(body) {
+                                break;
+                            }
+                            if buf.windows(4).any(|w| w == b"GET " || w == b"GET\r") {
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let request = String::from_utf8_lossy(&buf).to_string();
+            let body_json: serde_json::Value = find_subslice(&buf, b"\r\n\r\n")
+                .and_then(|i| serde_json::from_slice(&buf[i + 4..]).ok())
+                .unwrap_or(serde_json::json!({}));
+
+            let response_body = if request.starts_with("GET /api/tags") {
+                serde_json::json!({ "models": [{ "name": model_name }] })
+            } else if request.starts_with("POST /api/show") {
+                serde_json::json!({
+                    "capabilities": ["embedding"],
+                    "model_info": { "generic.context_length": 4096 },
+                })
+            } else if request.starts_with("POST /api/embed") {
+                let inputs: Vec<String> = body_json
+                    .get("input")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
+                let embeddings: Vec<Vec<f32>> = inputs.iter().map(|t| hashed_vector(t, 64)).collect();
+                serde_json::json!({ "embeddings": embeddings })
+            } else {
+                serde_json::json!({})
+            };
+
+            let payload = response_body.to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        port
+    }
+
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    fn braces_balanced(body: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(body);
+        let trimmed = text.trim_end_matches(char::from(0));
+        let opens = trimmed.matches('{').count();
+        let closes = trimmed.matches('}').count();
+        opens > 0 && opens == closes
+    }
+
     #[test]
     fn index_document_now_and_search_work_end_to_end_through_the_facade() {
-        let facade = AppFacade::new(SqliteConnection::open(":memory:"));
+        let connection = SqliteConnection::open(":memory:");
+        let settings = atlas_db::settings_adapter::SqliteSettingsProvider::new(connection.clone());
+        let mock_port = mock_ollama_embedding_server("mock-embedding");
+        settings
+            .set(atlas_types::settings::SettingEntry {
+                key: "ollama.port".to_string(),
+                value: mock_port.to_string(),
+                value_type: "string".to_string(),
+                scope: atlas_types::settings::SettingsScope::Global,
+                workspace_id: None,
+                updated_at: "t0".to_string(),
+            })
+            .unwrap();
+        settings
+            .set(atlas_types::settings::SettingEntry {
+                key: "ollama.host".to_string(),
+                value: "127.0.0.1".to_string(),
+                value_type: "string".to_string(),
+                scope: atlas_types::settings::SettingsScope::Global,
+                workspace_id: None,
+                updated_at: "t0".to_string(),
+            })
+            .unwrap();
+
+        let facade = AppFacade::new(connection);
+        // Real Model Discovery (§37.1) against the mock server, exactly as
+        // the Startup Sequence (§41) would run it against a real Ollama
+        // instance -- this is what populates `EngineRole::Embedding` in
+        // the Model Registry that `OllamaEmbeddingEngine` reads from.
+        facade.run_model_discovery().unwrap();
+
         let root = temp_dir("knowledge");
         std::fs::write(
             root.join("notes.md"),

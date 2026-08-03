@@ -69,6 +69,8 @@ pub fn default_parser_selector() -> ParserSelector {
     selector.register(Box::new(pdf::PdfParser));
     selector.register(Box::new(docx::DocxParser));
     selector.register(Box::new(image::ImageParser));
+    selector.register(Box::new(html::HtmlParser));
+    selector.register(Box::new(txt::TxtParser));
     selector
 }
 
@@ -790,6 +792,356 @@ pub mod image {
             assert_eq!(doc.blocks[0].block_type, BlockType::Image);
 
             let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Plain Text Parser (Part 2 "Support ... TXT"). Not called out with its
+/// own subsection in §36.2, but covered by §36.2's closing rule ("Future
+/// Parsers MUST implement the same `Parser` interface ... and register
+/// with the Parser Selector; no other layer needs to change") -- text
+/// files have no headings/lists/tables to structurally parse (unlike
+/// Markdown), so this only needs blank-line paragraph splitting, no OCR
+/// (§36.2, same "no OCR" contract as the Markdown Parser).
+pub mod txt {
+    use atlas_types::document::{Block, BlockType, DocumentMetadata, LocationRef, ParsedDocument};
+    use atlas_utils::AppError;
+
+    use super::Parser;
+
+    pub struct TxtParser;
+
+    impl Parser for TxtParser {
+        fn file_type(&self) -> &str {
+            "txt"
+        }
+
+        fn parse(&self, path: &str) -> Result<ParsedDocument, AppError> {
+            let bytes = std::fs::read(path)
+                .map_err(|e| AppError::indexing(format!("failed to read '{path}': {e}")))?;
+            let text = String::from_utf8_lossy(&bytes).to_string();
+            Ok(parse_txt_text(path, &text))
+        }
+    }
+
+    /// Pure parsing logic, split out from file IO for direct unit testing
+    /// (same convention as `markdown::parse_markdown_text`). Paragraphs are
+    /// separated by one or more blank lines; lines within a paragraph are
+    /// joined with a space (matching how the Markdown Parser treats a
+    /// wrapped paragraph), since plain text has no other structural
+    /// signal to split on.
+    pub fn parse_txt_text(path: &str, text: &str) -> ParsedDocument {
+        let mut blocks = Vec::new();
+        let mut paragraph_buffer: Vec<&str> = Vec::new();
+        let mut paragraph_start_line = 0usize;
+
+        let flush = |buffer: &mut Vec<&str>, start_line: usize, blocks: &mut Vec<Block>| {
+            if buffer.is_empty() {
+                return;
+            }
+            blocks.push(Block {
+                block_type: BlockType::Paragraph,
+                location_ref: LocationRef {
+                    page_or_location: start_line.to_string(),
+                },
+                text_content: buffer.join(" "),
+            });
+            buffer.clear();
+        };
+
+        for (idx, raw_line) in text.lines().enumerate() {
+            let line_no = idx + 1;
+            let trimmed = raw_line.trim();
+            if trimmed.is_empty() {
+                flush(&mut paragraph_buffer, paragraph_start_line, &mut blocks);
+                continue;
+            }
+            if paragraph_buffer.is_empty() {
+                paragraph_start_line = line_no;
+            }
+            paragraph_buffer.push(trimmed);
+        }
+        flush(&mut paragraph_buffer, paragraph_start_line, &mut blocks);
+
+        ParsedDocument {
+            metadata: DocumentMetadata {
+                title: path.to_string(),
+                file_type: "txt".to_string(),
+                content_hash: atlas_utils::hashing::hash_str(text),
+            },
+            blocks,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use atlas_types::document::BlockType;
+
+        #[test]
+        fn blank_lines_separate_paragraphs() {
+            let doc = parse_txt_text("notes.txt", "First paragraph,\nstill first.\n\nSecond paragraph.");
+            assert_eq!(doc.blocks.len(), 2);
+            assert_eq!(doc.blocks[0].block_type, BlockType::Paragraph);
+            assert_eq!(doc.blocks[0].text_content, "First paragraph, still first.");
+            assert_eq!(doc.blocks[1].text_content, "Second paragraph.");
+        }
+
+        #[test]
+        fn empty_document_produces_no_blocks() {
+            let doc = parse_txt_text("empty.txt", "");
+            assert!(doc.blocks.is_empty());
+        }
+
+        #[test]
+        fn repeated_blank_lines_do_not_produce_empty_blocks() {
+            let doc = parse_txt_text("notes.txt", "One.\n\n\n\nTwo.");
+            assert_eq!(doc.blocks.len(), 2);
+        }
+    }
+}
+
+/// HTML Parser (§36.2 category; Part 2 "Support ... HTML"). Dependency-free
+/// (no third-party HTML parser crate, consistent with `pdf`/`docx` above):
+/// walks the byte stream once, tracking the current tag name, and buffers
+/// visible text per block-level element. `<script>`/`<style>` contents are
+/// dropped entirely (never visible text, never meant to be indexed).
+/// Structural parse only (§36.2/§36.3: no OCR, no chunking here) --
+/// `<h1>`-`<h6>` become Heading blocks, everything else block-level
+/// (`<p>`, `<li>`, `<div>`, `<td>`, `<blockquote>`, `<br>`-flushed runs)
+/// becomes a Paragraph block, `<pre>`/`<code>` becomes a Code block.
+pub mod html {
+    use atlas_types::document::{Block, BlockType, DocumentMetadata, LocationRef, ParsedDocument};
+    use atlas_utils::AppError;
+
+    use super::Parser;
+
+    pub struct HtmlParser;
+
+    impl Parser for HtmlParser {
+        fn file_type(&self) -> &str {
+            "html"
+        }
+
+        fn parse(&self, path: &str) -> Result<ParsedDocument, AppError> {
+            let bytes = std::fs::read(path)
+                .map_err(|e| AppError::indexing(format!("failed to read '{path}': {e}")))?;
+            let text = String::from_utf8_lossy(&bytes).to_string();
+            Ok(parse_html_text(path, &text))
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum BlockKind {
+        Paragraph,
+        Heading,
+        Code,
+    }
+
+    /// Tags whose content is never visible/indexable text.
+    fn is_skipped_content_tag(name: &str) -> bool {
+        matches!(name, "script" | "style" | "head" | "noscript")
+    }
+
+    fn heading_kind(name: &str) -> bool {
+        matches!(name, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
+    }
+
+    fn code_kind(name: &str) -> bool {
+        matches!(name, "pre" | "code")
+    }
+
+    /// Tags that start a new block-level element -- encountering one
+    /// flushes whatever text was accumulating for the previous block.
+    fn is_block_boundary_tag(name: &str) -> bool {
+        matches!(
+            name,
+            "p" | "div"
+                | "li"
+                | "td"
+                | "th"
+                | "tr"
+                | "blockquote"
+                | "section"
+                | "article"
+                | "br"
+                | "h1"
+                | "h2"
+                | "h3"
+                | "h4"
+                | "h5"
+                | "h6"
+                | "pre"
+                | "code"
+        )
+    }
+
+    fn decode_entities(s: &str) -> String {
+        s.replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&apos;", "'")
+    }
+
+    /// Pure parsing logic, split out from file IO for direct unit testing
+    /// (same convention as the other structural parsers in this module).
+    pub fn parse_html_text(path: &str, html: &str) -> ParsedDocument {
+        let mut blocks = Vec::new();
+        let mut buffer = String::new();
+        let mut current_kind = BlockKind::Paragraph;
+        let mut skip_depth = 0usize;
+        let mut skip_tag_stack: Vec<String> = Vec::new();
+        let mut block_index = 0usize;
+
+        let flush = |buffer: &mut String, kind: BlockKind, block_index: &mut usize, blocks: &mut Vec<Block>| {
+            let trimmed = buffer.trim();
+            if trimmed.is_empty() {
+                buffer.clear();
+                return;
+            }
+            *block_index += 1;
+            blocks.push(Block {
+                block_type: match kind {
+                    BlockKind::Paragraph => BlockType::Paragraph,
+                    BlockKind::Heading => BlockType::Heading,
+                    BlockKind::Code => BlockType::Code,
+                },
+                location_ref: LocationRef {
+                    page_or_location: block_index.to_string(),
+                },
+                text_content: decode_entities(trimmed),
+            });
+            buffer.clear();
+        };
+
+        let chars: Vec<char> = html.chars().collect();
+        let mut i = 0usize;
+        while i < chars.len() {
+            if chars[i] == '<' {
+                // Find the matching '>' for this tag (or bail to end of
+                // input on a malformed/unterminated tag rather than
+                // looping forever).
+                let start = i;
+                let mut j = i + 1;
+                while j < chars.len() && chars[j] != '>' {
+                    j += 1;
+                }
+                let tag_content: String = chars[start + 1..j].iter().collect();
+                i = if j < chars.len() { j + 1 } else { chars.len() };
+
+                let is_closing = tag_content.starts_with('/');
+                let name_part = tag_content.trim_start_matches('/');
+                let tag_name: String = name_part
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect::<String>()
+                    .to_lowercase();
+                if tag_name.is_empty() {
+                    continue; // e.g. a comment `<!-- ... -->` or malformed tag
+                }
+
+                if is_skipped_content_tag(&tag_name) {
+                    if is_closing {
+                        if let Some(pos) = skip_tag_stack.iter().rposition(|t| t == &tag_name) {
+                            skip_tag_stack.remove(pos);
+                            skip_depth = skip_depth.saturating_sub(1);
+                        }
+                    } else {
+                        skip_tag_stack.push(tag_name.clone());
+                        skip_depth += 1;
+                    }
+                    continue;
+                }
+                if skip_depth > 0 {
+                    continue;
+                }
+
+                if is_block_boundary_tag(&tag_name) {
+                    flush(&mut buffer, current_kind, &mut block_index, &mut blocks);
+                    current_kind = if heading_kind(&tag_name) {
+                        BlockKind::Heading
+                    } else if code_kind(&tag_name) {
+                        BlockKind::Code
+                    } else {
+                        BlockKind::Paragraph
+                    };
+                }
+                continue;
+            }
+
+            if skip_depth == 0 {
+                buffer.push(chars[i]);
+            }
+            i += 1;
+        }
+        flush(&mut buffer, current_kind, &mut block_index, &mut blocks);
+
+        ParsedDocument {
+            metadata: DocumentMetadata {
+                title: path.to_string(),
+                file_type: "html".to_string(),
+                content_hash: atlas_utils::hashing::hash_str(html),
+            },
+            blocks,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use atlas_types::document::BlockType;
+
+        #[test]
+        fn headings_and_paragraphs_become_distinct_blocks() {
+            let doc = parse_html_text(
+                "page.html",
+                "<html><body><h1>Title</h1><p>Some intro text.</p></body></html>",
+            );
+            assert_eq!(doc.blocks.len(), 2);
+            assert_eq!(doc.blocks[0].block_type, BlockType::Heading);
+            assert_eq!(doc.blocks[0].text_content, "Title");
+            assert_eq!(doc.blocks[1].block_type, BlockType::Paragraph);
+            assert_eq!(doc.blocks[1].text_content, "Some intro text.");
+        }
+
+        #[test]
+        fn script_and_style_content_is_never_indexed() {
+            let doc = parse_html_text(
+                "page.html",
+                "<html><head><style>.x{color:red}</style></head><body><script>alert('hi')</script><p>Real content.</p></body></html>",
+            );
+            assert_eq!(doc.blocks.len(), 1);
+            assert_eq!(doc.blocks[0].text_content, "Real content.");
+        }
+
+        #[test]
+        fn html_entities_are_decoded() {
+            let doc = parse_html_text("page.html", "<p>Fish &amp; Chips &mdash; caf&#39;e</p>");
+            assert!(doc.blocks[0].text_content.starts_with("Fish & Chips"));
+            assert!(doc.blocks[0].text_content.contains("caf'e"));
+        }
+
+        #[test]
+        fn code_blocks_are_tagged_distinctly() {
+            let doc = parse_html_text("page.html", "<pre><code>fn main() {}</code></pre>");
+            assert!(doc.blocks.iter().any(|b| b.block_type == BlockType::Code));
+        }
+
+        #[test]
+        fn empty_document_produces_no_blocks() {
+            let doc = parse_html_text("empty.html", "<html><body></body></html>");
+            assert!(doc.blocks.is_empty());
+        }
+
+        #[test]
+        fn br_tags_split_lines_into_separate_paragraph_blocks() {
+            let doc = parse_html_text("page.html", "<p>Line one<br>Line two</p>");
+            assert_eq!(doc.blocks.len(), 2);
+            assert_eq!(doc.blocks[0].text_content, "Line one");
+            assert_eq!(doc.blocks[1].text_content, "Line two");
         }
     }
 }

@@ -15,3 +15,22 @@ atlas-utils = { path = "../atlas-utils" }
 atlas-events = { path = "../atlas-events" }
 atlas-config = { path = "../atlas-config" }
 serde_json.workspace = true
+
+# Fix 2/3 (P0 audit): the previous hand-rolled PDF byte-scanner had no
+# `/FlateDecode` support (the overwhelming majority of real-world PDF
+# producers compress content streams), so almost no real PDF extracted any
+# text, and its embedded-image extraction only recognized `/DCTDecode`
+# (JPEG), so scanned/handwritten exports (GoodNotes, Notability, Apple
+# Notes, Samsung Notes) never OCR'd correctly either. `lopdf` is a
+# well-maintained, pure-Rust, offline-capable PDF object-graph parser (no
+# network calls, consistent with §5 local-first) that understands the real
+# PDF object/stream/filter model (including `/FlateDecode` via its bundled
+# `flate2` dependency) instead of scanning raw bytes for coincidental
+# byte patterns. `png` is used to re-encode raw (non-JPEG) embedded raster
+# image samples -- the common case for full-page scan images in
+# `/FlateDecode`-compressed XObjects -- into a real, standalone image file
+# the OCR engine can actually decode.
+lopdf = "0.32"
+png = "0.17.13"
+flate2 = "1"
+

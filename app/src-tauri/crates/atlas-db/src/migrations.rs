@@ -267,6 +267,39 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_settings_key_scope ON settings(key, scope, workspace_id);
         ",
     },
+    // Concept Graph (§20, §33.5, §33.6), owned by core-graph / atlas-graph.
+    // This was previously missing entirely -- `SqliteGraphRepository`
+    // (atlas-db::graph_adapter) was wired live into `AppFacade` (Fix 1,
+    // P0 audit) against tables that were never created, so every query
+    // would have failed with "no such table" even once the
+    // `unimplemented!()` stubs were replaced with real SQL. `concept_edges`
+    // rows loosely reference `concept_nodes` by id (no FOREIGN KEY),
+    // matching the existing `jobs`/`events`/`learning_progress` convention
+    // elsewhere in this file.
+    Migration {
+        id: "0016_create_concept_graph",
+        sql: "
+            CREATE TABLE IF NOT EXISTS concept_nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workspace_id INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                description TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_concept_nodes_workspace ON concept_nodes(workspace_id);
+            CREATE INDEX IF NOT EXISTS idx_concept_nodes_label ON concept_nodes(label);
+
+            CREATE TABLE IF NOT EXISTS concept_edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_node_id INTEGER NOT NULL,
+                to_node_id INTEGER NOT NULL,
+                relation_type TEXT NOT NULL,
+                weight REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_concept_edges_from ON concept_edges(from_node_id);
+            CREATE INDEX IF NOT EXISTS idx_concept_edges_to ON concept_edges(to_node_id);
+        ",
+    },
 ];
 
 pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {

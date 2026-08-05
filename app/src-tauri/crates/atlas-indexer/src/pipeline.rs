@@ -170,7 +170,17 @@ impl IndexingPipeline {
         match self.run_pipeline(workspace_id, record.id, absolute_path, parser) {
             Ok(chunk_count) => {
                 let mut done = record.clone();
-                done.parse_status = ParseStatus::Parsed;
+                // Fix 5 (P1 audit): a pipeline run that completes without
+                // error but produces zero chunks (corrupt file, an
+                // unsupported encoding the parser explicitly declines
+                // rather than guesses at, etc.) must not look identical to
+                // a real successful index -- that was a silent failure
+                // mode with nothing but a backend log line to notice it by.
+                done.parse_status = if chunk_count == 0 {
+                    ParseStatus::ParsedEmpty
+                } else {
+                    ParseStatus::Parsed
+                };
                 done.last_indexed_hash = Some(content_hash);
                 self.documents.upsert(done)?;
 
@@ -240,17 +250,37 @@ impl IndexingPipeline {
                 // PDF binary, not a real image, which no OCR engine
                 // (Tesseract or a vision model) can meaningfully read.
                 // Prefer the parser's real per-block image when it can
-                // provide one (`PdfParser` now extracts the actual
-                // embedded page image); only fall back to whole-file
-                // bytes when the parser can't do better -- correct for
+                // provide one (`PdfParser` now rasterizes/extracts the
+                // actual embedded page image, Fix 3 P0 audit); only fall
+                // back to whole-file bytes for a parser that never
+                // overrides `extract_ocr_image` at all (correct for
                 // `ImageParser`, where the whole file already IS the
-                // image.
-                let image_bytes = parser
-                    .extract_ocr_image(absolute_path, block_index)
-                    .or_else(|| std::fs::read(absolute_path).ok())
-                    .unwrap_or_default();
-                if let Ok(text) = self.ocr.extract_text(&image_bytes) {
-                    block.text_content = text;
+                // image). A parser that DOES override it
+                // (`supports_ocr_image_extraction() == true`) returning
+                // `None` means a genuine per-block extraction/render
+                // failure -- that must NOT silently fall through to raw
+                // whole-file bytes a second time (that both defeats the
+                // point of the real extraction and would hand the OCR
+                // engine garbage it can't decode either), so it's logged
+                // and this block's OCR is skipped (text stays empty; the
+                // rest of the document still indexes, per §45.1
+                // Recoverable).
+                let image_bytes = match parser.extract_ocr_image(absolute_path, block_index) {
+                    Some(bytes) => Some(bytes),
+                    None if parser.supports_ocr_image_extraction() => {
+                        atlas_utils::log_info!(
+                            "[IndexingPipeline] OCR image extraction failed for block {} of '{}' (parser reported a real per-block implementation); treating as a clean OCR failure for this block, not falling back to whole-file bytes",
+                            block_index,
+                            absolute_path
+                        );
+                        None
+                    }
+                    None => std::fs::read(absolute_path).ok(),
+                };
+                if let Some(image_bytes) = image_bytes {
+                    if let Ok(text) = self.ocr.extract_text(&image_bytes) {
+                        block.text_content = text;
+                    }
                 }
             }
         }
@@ -426,6 +456,36 @@ mod tests {
 
         let chunks = pipeline.chunks().list_for_document(docs[0].id).unwrap();
         assert!(!chunks.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Fix 5 (P1 audit): a document that parses without error but yields
+    /// zero chunks (here: an empty file, so the Markdown parser produces
+    /// no blocks at all) must be distinguishable from a real successful
+    /// index, not silently indistinguishable from `Parsed`.
+    #[test]
+    fn zero_chunk_result_is_recorded_as_parsed_empty_not_parsed() {
+        let pipeline = pipeline();
+        let path = temp_file("empty", "");
+
+        let outcome = pipeline
+            .index_document(WorkspaceId(1), "empty.md", path.to_str().unwrap())
+            .unwrap();
+
+        match outcome {
+            IndexOutcome::Indexed { chunk_count } => assert_eq!(chunk_count, 0),
+            IndexOutcome::Skipped => panic!("expected a fresh file to be indexed"),
+        }
+
+        let docs = pipeline
+            .documents()
+            .list_for_workspace(WorkspaceId(1))
+            .unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].parse_status, ParseStatus::ParsedEmpty);
+        assert_ne!(docs[0].parse_status, ParseStatus::Parsed);
+        assert_ne!(docs[0].parse_status, ParseStatus::Failed);
 
         let _ = std::fs::remove_file(&path);
     }

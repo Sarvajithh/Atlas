@@ -9,6 +9,16 @@ pub enum ParseStatus {
     Pending,
     Parsing,
     Parsed,
+    /// Fix 5 (P1 audit): the pipeline ran to completion with no error, but
+    /// produced zero chunks (e.g. a corrupt file, an unsupported PDF
+    /// encoding gap the parser explicitly declines rather than guesses at
+    /// -- see the `pdf` parser's documented limitations -- or any other
+    /// edge case). Distinct from `Parsed` (real content was indexed) and
+    /// from `Failed` (the pipeline itself errored out) -- previously this
+    /// state was indistinguishable from `Parsed`, so a document that
+    /// silently produced no usable content looked identical, in the UI, to
+    /// one that was successfully and completely indexed.
+    ParsedEmpty,
     Failed,
 }
 

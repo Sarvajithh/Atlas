@@ -44,6 +44,7 @@ use atlas_vector::VectorDbEmbeddingRepository;
 use atlas_watcher::FolderWatcher;
 use atlas_workspace::lifecycle::WorkspaceEngine;
 
+use crate::cancellation::{CancellationRegistry, RegisteredRequest};
 use crate::state::AppState;
 use crate::worker::IndexingWorker;
 
@@ -117,6 +118,15 @@ pub struct AppFacade {
     /// here too so `chat()` can drive Session Manager behavior without a
     /// second connection to the same table.
     chat: Arc<SqliteChatRepository>,
+    /// Fix 4 (P0 audit): kept as a field (rather than only consumed by
+    /// `scheduler`) so `chat_stream` can independently resolve the
+    /// terminal role's real `context_length` before assembling context and
+    /// before calling `generate_stream`, the same way `ModelScheduler`
+    /// does for the non-streaming `execute` path.
+    model_provider: Arc<dyn atlas_models::ModelProvider>,
+    /// Fix 6 (P1 audit): real in-flight request cancellation for
+    /// `assistant.cancel`/`chat_stream` (see `cancellation` module doc).
+    cancellations: Arc<CancellationRegistry>,
 }
 
 impl AppFacade {
@@ -246,7 +256,7 @@ impl AppFacade {
 
         let scheduler = Arc::new(ModelScheduler::new(
             default_routing_table(),
-            model_provider,
+            model_provider.clone(),
             Arc::new(atlas_models::ResourceManager::new(4)),
             context_builder.clone(),
             prompt_builder.clone(),
@@ -274,6 +284,8 @@ impl AppFacade {
             scheduler,
             model_discovery,
             chat,
+            model_provider,
+            cancellations: Arc::new(CancellationRegistry::new()),
         }
     }
 
@@ -366,7 +378,13 @@ impl AppFacade {
         limit: usize,
     ) -> Result<(String, Vec<Citation>), AppError> {
         let hits = self.retriever.retrieve(workspace_id, query, limit)?;
-        let context: AssembledContext = self.context_builder.assemble(query, hits)?;
+        // Fix 4 (P0 audit): this general-purpose search path isn't tied to
+        // a specific Engine role/model (unlike `chat_stream`/the
+        // Scheduler's `execute`), so there's no model-specific
+        // `context_length` to derive a tighter budget from here -- falls
+        // back to this builder's configured ceiling, preserving this
+        // method's prior behavior exactly.
+        let context: AssembledContext = self.context_builder.assemble(query, hits, self.context_builder.max_context_tokens())?;
         let citations = context.citations.clone();
         let prompt = self.prompt_builder.build(context);
         Ok((prompt.content, citations))
@@ -635,6 +653,14 @@ impl AppFacade {
     /// whose terminal role is inference-bearing and reachable directly
     /// (Vision/Tutor/Reasoning/Planner); retrieval/context assembly still
     /// happens up front, synchronously, exactly as in `chat`.
+    ///
+    /// `request_id` (Fix 6, P1 audit) is the frontend-generated id this
+    /// streaming turn is registered under in `self.cancellations` --
+    /// `assistant_cancel(request_id)` (a separate, concurrent IPC call)
+    /// signals it, and the streaming loop below stops forwarding/consuming
+    /// further chunks once it observes the signal. Per this fix's judgment
+    /// call on persistence (documented at the bottom of this method): a
+    /// cancelled response is not persisted -- see that comment for why.
     #[allow(clippy::too_many_arguments)]
     pub fn chat_stream(
         &self,
@@ -643,11 +669,18 @@ impl AppFacade {
         message: &str,
         intent: Intent,
         images: Option<Vec<String>>,
+        request_id: &str,
         mut on_chunk: impl FnMut(&str),
     ) -> Result<(ChatSessionId, ChatMessage, Vec<Citation>), AppError> {
         // TEMPORARY TRACE LOGGING (remove once the pipeline is confirmed working).
         let __t0 = std::time::Instant::now();
         atlas_utils::log_info!("[Facade] chat_stream entered workspace_id={} intent={intent:?}", workspace_id.0);
+
+        // Fix 6 (P1 audit): registered for the whole duration of this
+        // method via an RAII guard, so the registry entry is removed on
+        // every exit path (success, an early `?` error, or a cancellation)
+        // without needing a matching cleanup call at each return point.
+        let cancellation = RegisteredRequest::new(&self.cancellations, request_id.to_string())?;
 
         let now = atlas_utils::time::now_iso8601();
 
@@ -696,9 +729,27 @@ impl AppFacade {
             let hits = self.retriever.retrieve(workspace_id, message, 5)?;
             atlas_utils::log_info!("[Retriever] returned {} chunks elapsed={:?}", hits.len(), __t_retr.elapsed());
 
+            // Fix 4 (P0 audit): the context budget must be derived from
+            // the model actually resolved for this request's terminal
+            // role, not a fixed ceiling -- resolved here (before context
+            // assembly) the same way `ModelScheduler::execute` does,
+            // falling back to the builder's configured ceiling (with a
+            // warning) if no model is currently resolvable, rather than
+            // hard-failing a step that's only sizing a budget.
+            let model_context_length = match self.model_provider.current_model_for(terminal_role) {
+                Ok(entry) => entry.context_length,
+                Err(err) => {
+                    atlas_utils::log_warn!(
+                        "[Facade] could not resolve a model for {terminal_role:?} while sizing the context budget ({}), falling back to the context builder's configured ceiling",
+                        err.message
+                    );
+                    self.context_builder.max_context_tokens()
+                }
+            };
+
             atlas_utils::log_info!("[ContextBuilder] entered with {} hits", hits.len());
             let __t_ctx = std::time::Instant::now();
-            let context = self.context_builder.assemble(message, hits)?;
+            let context = self.context_builder.assemble(message, hits, model_context_length)?;
             atlas_utils::log_info!(
                 "[ContextBuilder] exited hits_kept={} citations={} total_tokens={} elapsed={:?}",
                 context.hits.len(),
@@ -746,12 +797,31 @@ impl AppFacade {
             prompt_content.len()
         );
         let __t_ollama = std::time::Instant::now();
-        let stream = self.ollama.generate_stream(&model.model_identifier, &prompt_content, prompt_images)?;
+        let stream = self
+            .ollama
+            .generate_stream(&model.model_identifier, &prompt_content, prompt_images, model.context_length)?;
         atlas_utils::log_info!("[OllamaProvider] request accepted, awaiting stream elapsed={:?}", __t_ollama.elapsed());
 
         let mut full_content = String::new();
         let mut chunk_count = 0usize;
+        let mut was_cancelled = false;
         for chunk in stream {
+            // Fix 6 (P1 audit): checked before consuming/forwarding each
+            // chunk -- once `assistant_cancel(request_id)` has signalled
+            // this request (from a second, concurrent IPC call), no
+            // further chunks are forwarded to `on_chunk` or accumulated
+            // into `full_content`. The underlying HTTP response body is
+            // simply stopped being read (dropping `stream`'s iterator at
+            // the end of this loop closes the connection); Ollama itself
+            // has no separate cancel API to call.
+            if cancellation.is_cancelled() {
+                atlas_utils::log_info!(
+                    "[Facade] request {request_id} cancelled mid-stream after {chunk_count} chunks, elapsed={:?}",
+                    __t_ollama.elapsed()
+                );
+                was_cancelled = true;
+                break;
+            }
             let chunk = chunk?;
             if chunk_count == 0 {
                 atlas_utils::log_info!("[OllamaProvider] first response chunk received elapsed={:?}", __t_ollama.elapsed());
@@ -763,11 +833,34 @@ impl AppFacade {
             }
         }
         atlas_utils::log_info!(
-            "[OllamaProvider] stream complete chunks={} total_chars={} elapsed={:?}",
+            "[OllamaProvider] stream complete chunks={} total_chars={} cancelled={} elapsed={:?}",
             chunk_count,
             full_content.len(),
+            was_cancelled,
             __t_ollama.elapsed()
         );
+
+        if was_cancelled {
+            // Fix 6 requirement 5 (judgment call, documented rather than
+            // silently resolved): a cancelled response is NOT persisted at
+            // all -- option (a) of the two the fix allows. `ChatMessage`
+            // (§33.11) has no "cancelled"/partial flag column, and adding
+            // one is a schema change outside this fix's stated scope (Fix
+            // 5, the one schema change this pass makes, is a different,
+            // already-justified column); persisting a silently-partial
+            // assistant message with no visible marker would be its own
+            // new silent-failure mode, which is exactly what this audit is
+            // trying to eliminate. The user's own message sent earlier in
+            // this method is already persisted (matches `chat`'s
+            // behavior), so the conversation isn't corrupted -- there's
+            // simply no assistant reply recorded for this turn.
+            atlas_utils::log_info!("[Facade] chat_stream exited CANCELLED, nothing persisted elapsed={:?}", __t0.elapsed());
+            return Err(AppError::new(
+                atlas_utils::error::ErrorCode::EngineError,
+                atlas_utils::error::ErrorCategory::Recoverable,
+                "request was cancelled",
+            ));
+        }
 
         let assistant_message = self.chat.append_message(ChatMessage {
             id: atlas_types::ids::ChatMessageId(0),
@@ -780,6 +873,14 @@ impl AppFacade {
 
         atlas_utils::log_info!("[Facade] chat_stream exited OK elapsed={:?}", __t0.elapsed());
         Ok((session, assistant_message, citations))
+    }
+
+    /// §43.1 `assistant.cancel` (Fix 6, P1 audit): signal cancellation for
+    /// an in-flight `chat_stream` request by the `request_id` it was
+    /// started with. A clean no-op for an unknown/already-finished id
+    /// (`CancellationRegistry::cancel`'s own contract).
+    pub fn cancel_request(&self, request_id: &str) -> Result<(), AppError> {
+        self.cancellations.cancel(request_id)
     }
 
     /// Quiz Generator feature (§14.1 Reasoning Engine composition; see
@@ -1215,12 +1316,23 @@ mod tests {
         let facade = AppFacade::new(SqliteConnection::open(":memory:"));
         let mut chunks = Vec::new();
         let err = facade
-            .chat_stream(WorkspaceId(1), None, "explain X", Intent::Tutoring, None, |c| chunks.push(c.to_string()))
+            .chat_stream(WorkspaceId(1), None, "explain X", Intent::Tutoring, None, "req-test-1", |c| {
+                chunks.push(c.to_string())
+            })
             .unwrap_err();
         assert_eq!(err.category, atlas_utils::ErrorCategory::ModelError);
         assert!(chunks.is_empty());
 
         let sessions = facade.memory_engine().chat().list_sessions_for_workspace(WorkspaceId(1)).unwrap();
         assert_eq!(sessions.len(), 1);
+    }
+
+    /// Fix 6 (P1 audit): `assistant.cancel` for a request id that never
+    /// started (or already finished) must be a clean no-op at the facade
+    /// level too, not just inside `CancellationRegistry` itself.
+    #[test]
+    fn cancel_request_for_an_unknown_id_is_a_clean_no_op() {
+        let facade = AppFacade::new(SqliteConnection::open(":memory:"));
+        assert!(facade.cancel_request("no-such-request").is_ok());
     }
 }

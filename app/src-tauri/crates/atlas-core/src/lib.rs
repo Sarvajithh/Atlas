@@ -25,6 +25,7 @@
 //! Also owns the Startup Sequence (§41) and Shutdown Sequence (§42)
 //! skeletons, and the transient Application State (§13, see [`state`]).
 
+pub mod cancellation;
 pub mod facade;
 mod paths;
 pub mod shutdown;

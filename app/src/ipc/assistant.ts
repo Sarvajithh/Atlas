@@ -32,6 +32,15 @@ export function assistantAsk(args: AssistantAskArgs): Promise<AssistantAnswer> {
   });
 }
 
+/**
+ * §43.1 `assistant.cancel` (Fix 6, P1 audit: real cancellation, no longer
+ * a defined "not implemented" error). `requestId` is the same id passed to
+ * `assistantAskStream` for the request being cancelled -- see that
+ * function's doc comment for where it comes from. A `requestId` that's
+ * unknown or already finished resolves successfully (the backend
+ * registry's own clean-no-op contract), so callers don't need to guard
+ * against "already done" themselves.
+ */
 export function assistantCancel(requestId: string): Promise<void> {
   return ipcInvoke<void>("assistant_cancel", { requestId });
 }
@@ -59,19 +68,21 @@ export interface AssistantStreamHandlers {
  * Streaming turn (§43.1 `assistant.ask` streaming counterpart, Part 1
  * "Streaming responses"/"Stop generation"). Subscribes to the three
  * `assistant://*` events the backend emits, invokes `assistant_ask_stream`,
- * and returns a `stopListening()` handle that tears down the listeners --
- * actual mid-generation cancellation on the backend is not implemented
- * yet (`assistant_cancel` returns a defined error, §45.2), so this only
- * stops the UI from reacting further to a response already in flight,
- * which the "Stop" button in the UI discloses via a status message rather
- * than pretending generation itself halted.
+ * and returns a `requestId` (Fix 6, P1 audit) plus a `stopListening()`
+ * handle. `requestId` is generated here, client-side, and is the same id
+ * the backend registers the in-flight request under (`AppFacade::chat_stream`
+ * via its `CancellationRegistry`) -- pass it to `assistantCancel(requestId)`
+ * to actually stop generation server-side, in addition to (not instead of)
+ * calling `stopListening()` to stop the UI reacting to a response already
+ * in flight.
  */
 export async function assistantAskStream(
   args: AssistantAskArgs,
   handlers: AssistantStreamHandlers,
-): Promise<{ stopListening: () => void }> {
+): Promise<{ stopListening: () => void; requestId: string }> {
   const unlistenFns: UnlistenFn[] = [];
   let settled = false;
+  const requestId = crypto.randomUUID();
 
   const cleanup = () => {
     for (const fn of unlistenFns) fn();
@@ -112,7 +123,7 @@ export async function assistantAskStream(
     // like a stream error instead.
     cleanup();
     handlers.onError(err instanceof Error ? err.message : String(err));
-    return { stopListening: cleanup };
+    return { stopListening: cleanup, requestId };
   }
 
   ipcInvoke<void>("assistant_ask_stream", {
@@ -121,6 +132,7 @@ export async function assistantAskStream(
     sessionId: args.sessionId ?? null,
     intent: args.intent ?? null,
     images: args.images ?? null,
+    requestId,
   })
     // TEMPORARY TRACE LOGGING -- confirms the invoke() promise itself
     // settles (i.e. the Tauri command returned/threw) independently of
@@ -136,7 +148,7 @@ export async function assistantAskStream(
 
   console.log("[IPC] assistant_ask_stream invoked");
 
-  return { stopListening: cleanup };
+  return { stopListening: cleanup, requestId };
 }
 
 /** Conversation Memory (§33.10, Part 5): sessions for a workspace, most-recently-updated first. */

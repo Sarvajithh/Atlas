@@ -70,4 +70,18 @@ describe("DocumentExplorer", () => {
     expect(screen.queryByText("chapter1.md")).toBeNull();
     expect(screen.getByText("syllabus.pdf")).toBeTruthy();
   });
+
+  // Fix 5 (P1 audit): a document that finished indexing without error but
+  // extracted zero chunks must be visibly distinguishable in the tree from
+  // both a normal successfully-parsed file and a hard `Failed` one.
+  it("shows a distinct indicator and tooltip for a document with no text extracted", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce([
+      makeDoc({ id: 3, relative_path: "blank-scan.pdf", file_type: "pdf", parse_status: "ParsedEmpty" }),
+    ]);
+    render(<DocumentExplorer workspaceId={1} onOpenDocument={vi.fn()} />);
+    const fileButton = await screen.findByText("blank-scan.pdf");
+    const button = fileButton.closest("button");
+    expect(button?.getAttribute("title")).toBe("No text extracted from this file");
+    expect(button?.textContent).toContain("∅");
+  });
 });

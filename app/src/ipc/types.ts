@@ -33,7 +33,7 @@ export interface ConceptNode {
   created_at: string;
 }
 
-export type ParseStatus = "Pending" | "Parsing" | "Parsed" | "Failed";
+export type ParseStatus = "Pending" | "Parsing" | "Parsed" | "ParsedEmpty" | "Failed";
 
 /** Mirrors backend `DocumentRecord` (§33.2), returned by `document.list`/`document.get`. */
 export interface DocumentRecord {

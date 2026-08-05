@@ -128,7 +128,27 @@ impl ModelScheduler {
 
         let prompt = if pipeline.contains(&EngineRole::Retriever) {
             let hits = retriever.retrieve(workspace_id, query, retrieval_limit)?;
-            let context = self.context_builder.assemble(query, hits)?;
+            // Fix 4 (P0 audit): resolve the terminal role's model *before*
+            // assembling context, so the context budget is derived from
+            // the same model whose real `num_ctx` will be used for the
+            // actual generation call (`OllamaEngine`/`OllamaProvider` do
+            // this same `current_model_for` lookup independently for the
+            // request itself) -- the two no longer risk disagreeing. If no
+            // model is currently resolvable for this role, that's not this
+            // step's failure to report (generation itself will fail with a
+            // clear model error downstream) -- fall back to this builder's
+            // configured ceiling for sizing purposes only, with a warning.
+            let model_context_length = match self.model_provider.current_model_for(terminal_role) {
+                Ok(entry) => entry.context_length,
+                Err(err) => {
+                    atlas_utils::log_warn!(
+                        "[Scheduler] could not resolve a model for {terminal_role:?} while sizing the context budget ({}), falling back to the context builder's configured ceiling",
+                        err.message
+                    );
+                    self.context_builder.max_context_tokens()
+                }
+            };
+            let context = self.context_builder.assemble(query, hits, model_context_length)?;
             let citations = context.citations.clone();
             let mut resolved = self.prompt_builder.build(context);
             resolved.images = images;

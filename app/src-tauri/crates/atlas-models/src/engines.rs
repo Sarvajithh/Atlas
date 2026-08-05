@@ -49,7 +49,7 @@ impl OllamaEngine {
         }
     }
 
-    fn try_generate(&self, model_identifier: &str, prompt: &ResolvedPrompt) -> Result<String, AppError> {
+    fn try_generate(&self, model_identifier: &str, context_length: u32, prompt: &ResolvedPrompt) -> Result<String, AppError> {
         atlas_utils::log_info!(
             "[OllamaProvider] sending request model={model_identifier} prompt_chars={}",
             prompt.content.len()
@@ -57,7 +57,7 @@ impl OllamaEngine {
         let __t0 = std::time::Instant::now();
         let result = self
             .ollama
-            .generate(model_identifier, &prompt.content, prompt.images.clone());
+            .generate(model_identifier, &prompt.content, prompt.images.clone(), context_length);
         match &result {
             Ok(text) => atlas_utils::log_info!(
                 "[OllamaProvider] response received {} chars elapsed={:?}",
@@ -90,7 +90,7 @@ impl Engine for OllamaEngine {
             })?;
         atlas_utils::log_info!("[ModelRegistry] selected model {} for role {:?}", primary.model_identifier, self.role);
 
-        match self.try_generate(&primary.model_identifier, &prompt) {
+        match self.try_generate(&primary.model_identifier, primary.context_length, &prompt) {
             Ok(content) => Ok(EngineOutput { content }),
             Err(primary_err) => {
                 // Fall back to any other Available model already registered
@@ -105,7 +105,7 @@ impl Engine for OllamaEngine {
                 });
 
                 for alternative in alternatives {
-                    if let Ok(content) = self.try_generate(&alternative.model_identifier, &prompt) {
+                    if let Ok(content) = self.try_generate(&alternative.model_identifier, alternative.context_length, &prompt) {
                         return Ok(EngineOutput { content });
                     }
                 }

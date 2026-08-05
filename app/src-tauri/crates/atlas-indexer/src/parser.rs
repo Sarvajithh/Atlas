@@ -25,6 +25,18 @@ pub trait Parser: Send + Sync {
     fn extract_ocr_image(&self, _path: &str, _block_index: usize) -> Option<Vec<u8>> {
         None
     }
+
+    /// Whether `extract_ocr_image` is a real per-block implementation for
+    /// this format (Fix 3, P0 audit). Default `false`: the pipeline's
+    /// whole-file fallback (`std::fs::read(absolute_path)`) is only
+    /// correct for a parser where the whole file already IS the image
+    /// (`ImageParser`). A parser that overrides `extract_ocr_image` with a
+    /// real implementation (`PdfParser`) should return `true` here so a
+    /// `None` result is treated as a genuine per-block OCR failure rather
+    /// than silently falling through to raw whole-file bytes again.
+    fn supports_ocr_image_extraction(&self) -> bool {
+        false
+    }
 }
 
 /// Registry-based selector (§36.1): file type -> registered `Parser`.
@@ -235,17 +247,50 @@ pub mod markdown {
 }
 
 /// Digital PDF Parser (§36.2): "extract text layer + layout structure;
-/// detect and flag pages that are image-only." This is a minimal,
-/// dependency-free PDF text-stream reader: it looks for uncompressed
-/// content streams' `Tj`/`TJ` text-showing operators. It intentionally
-/// does not attempt full PDF layout/font decoding (a project of its own);
-/// it is enough to distinguish "this page has an extractable text layer"
-/// from "this page is image-only" (§17: OCR only runs where detected, not
-/// assumed), which is the contract this Parser owes the rest of the
-/// pipeline (§36.3).
+/// detect and flag pages that are image-only."
+///
+/// FIX 2 (P0 audit): the previous implementation was a dependency-free,
+/// hand-rolled reader that only scanned raw page byte ranges for
+/// uncompressed `Tj`/`TJ` string literals. It had no support for
+/// `/FlateDecode` (zlib) content streams -- what nearly all real-world PDF
+/// producers actually use -- so most real PDFs extracted no text at all
+/// and were misclassified as image-only. This now uses `lopdf`, a
+/// well-maintained, pure-Rust, offline-capable PDF object-graph parser (no
+/// network calls, consistent with §5 local-first), for real per-page text
+/// extraction through the actual PDF object/stream/filter model instead of
+/// scanning raw bytes for coincidental patterns.
+///
+/// FIX 3 (P0 audit): `extract_ocr_image` used to search for the Nth
+/// `/DCTDecode` (JPEG) stream in the raw file bytes, which returns nothing
+/// for the non-JPEG image encodings scanned/handwritten PDF exporters
+/// (GoodNotes, Notability, Apple Notes, Samsung Notes) actually use.
+/// `pipeline.rs` then fell back to handing the OCR engine the *entire raw
+/// PDF file* as if it were one image, which no OCR engine can read, so
+/// every OCR-flagged block silently ended up with empty text. This now
+/// walks the real page/XObject object graph via `lopdf` to find that
+/// page's embedded raster image, and produces a real standalone image
+/// file for the OCR engine: JPEG/JPEG2000 streams are passed through
+/// as-is (their raw stream bytes already ARE a standalone image file --
+/// that's what those filter names mean), and raw/FlateDecode-compressed
+/// sample data is decoded and re-encoded as a real PNG using the image
+/// dictionary's Width/Height/ColorSpace/BitsPerComponent.
+///
+/// Known limitation (kept honest rather than silently guessing, see Fix
+/// 7's spirit): this extracts the page's embedded raster *image object*.
+/// It does not do full vector/text page rasterization, so a page whose
+/// scanned content is composed of vector ink strokes rather than a single
+/// embedded raster image (some GoodNotes export modes) is not covered by
+/// this fix and will still yield `None` from `extract_ocr_image` --
+/// `pipeline.rs` treats that as a clean per-block OCR failure rather than
+/// falling back to raw file bytes. CCITTFaxDecode/JBIG2Decode-encoded
+/// embedded images (common for pure black-and-white fax-style scans) and
+/// Indexed/CMYK color spaces are likewise not decoded by this fix and also
+/// yield `None`. Both are called out explicitly in the Fix 7 audit report
+/// rather than being silently accepted as "handled."
 pub mod pdf {
     use atlas_types::document::{Block, BlockType, DocumentMetadata, LocationRef, ParsedDocument};
     use atlas_utils::AppError;
+    use std::io::Read;
 
     use super::Parser;
 
@@ -264,132 +309,91 @@ pub mod pdf {
 
         fn extract_ocr_image(&self, path: &str, block_index: usize) -> Option<Vec<u8>> {
             let bytes = std::fs::read(path).ok()?;
-            extract_nth_embedded_jpeg(&bytes, block_index)
+            let doc = lopdf::Document::load_mem(&bytes).ok()?;
+            // Same iteration order as `parse_pdf_bytes` (a `BTreeMap`
+            // sorted by page number), so `block_index` lines up with the
+            // page this block was produced from.
+            let page_id = *doc.get_pages().values().nth(block_index)?;
+            let stream = find_page_image_stream(&doc, page_id)?;
+            stream_to_image_bytes(stream)
+        }
+
+        fn supports_ocr_image_extraction(&self) -> bool {
+            true
         }
     }
 
-    /// Extract `Tj`/`TJ` string-literal contents from a single content
-    /// stream's raw bytes. PDF strings are parenthesized, with `\(`, `\)`,
-    /// and `\\` as the only escapes this minimal reader needs to handle.
-    fn extract_text_from_stream(stream: &str) -> String {
-        let mut out = String::new();
-        let bytes = stream.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'(' {
-                let mut depth = 1;
-                let mut j = i + 1;
-                let mut literal = String::new();
-                while j < bytes.len() && depth > 0 {
-                    match bytes[j] {
-                        b'\\' if j + 1 < bytes.len() => {
-                            literal.push(bytes[j + 1] as char);
-                            j += 2;
-                            continue;
-                        }
-                        b'(' => depth += 1,
-                        b')' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                j += 1;
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                    literal.push(bytes[j] as char);
-                    j += 1;
-                }
-                out.push_str(&literal);
-                out.push(' ');
-                i = j;
-            } else {
-                i += 1;
-            }
-        }
-        out
-    }
-
-    /// Best-effort split of a raw PDF file into per-page content regions,
-    /// by counting `/Type /Page` object boundaries. A page whose region
-    /// yields no extractable text is flagged as an image block instead
-    /// (§17, §36.2: image-only pages are handed off at the Block level
-    /// rather than failing the whole document).
+    /// Real per-page text extraction and page/image splitting, via
+    /// `lopdf`'s object graph (Fix 2). One `Block` per page, in page
+    /// order, per the existing contract; a page with no extractable text
+    /// is produced as `BlockType::Image` rather than dropped, so
+    /// downstream OCR-gating (`requires_ocr`) keeps working unchanged.
     pub fn parse_pdf_bytes(path: &str, bytes: &[u8]) -> ParsedDocument {
-        let content = String::from_utf8_lossy(bytes);
-        let page_starts: Vec<usize> = content.match_indices("/Type /Page").map(|(i, _)| i).collect();
+        let metadata = DocumentMetadata {
+            title: path.to_string(),
+            file_type: "pdf".to_string(),
+            content_hash: atlas_utils::hashing::hash_bytes(bytes),
+        };
 
+        let doc = match lopdf::Document::load_mem(bytes) {
+            Ok(doc) => doc,
+            Err(_) => {
+                // Malformed, encrypted, or otherwise not walkable as a
+                // real PDF object graph. Per contract (§36.3, this fix's
+                // requirement 2), this must never be silently dropped --
+                // produce a single Image block so downstream OCR-gating
+                // still has something to act on, rather than an empty
+                // document or a panic.
+                return ParsedDocument {
+                    metadata,
+                    blocks: vec![Block {
+                        block_type: BlockType::Image,
+                        location_ref: LocationRef { page_or_location: "1".to_string() },
+                        text_content: String::new(),
+                    }],
+                };
+            }
+        };
+
+        let pages = doc.get_pages();
         let mut blocks = Vec::new();
-        if page_starts.is_empty() {
-            // No page markers found at all (e.g. an object-stream/xref-
-            // stream-based PDF this minimal reader doesn't parse) -- treat
-            // the whole file as a single page and let text extraction (or
-            // its absence) decide whether it needs OCR.
-            push_page_block(&mut blocks, &content, 1);
+        if pages.is_empty() {
+            blocks.push(Block {
+                block_type: BlockType::Image,
+                location_ref: LocationRef { page_or_location: "1".to_string() },
+                text_content: String::new(),
+            });
         } else {
-            for (idx, &start) in page_starts.iter().enumerate() {
-                let end = page_starts.get(idx + 1).copied().unwrap_or(content.len());
-                let page_slice = &content[start..end];
-                push_page_block(&mut blocks, page_slice, idx + 1);
+            for &page_number in pages.keys() {
+                let text = doc.extract_text(&[page_number]).unwrap_or_default();
+                let block_type = if looks_like_real_text(&text) {
+                    BlockType::Paragraph
+                } else {
+                    // §17/§36.2: image-only (or extraction-failed) page,
+                    // flagged for OCR rather than assumed absent.
+                    BlockType::Image
+                };
+                let text_content = if block_type == BlockType::Paragraph {
+                    text.trim().to_string()
+                } else {
+                    String::new()
+                };
+                blocks.push(Block {
+                    block_type,
+                    location_ref: LocationRef { page_or_location: page_number.to_string() },
+                    text_content,
+                });
             }
         }
 
-        ParsedDocument {
-            metadata: DocumentMetadata {
-                title: path.to_string(),
-                file_type: "pdf".to_string(),
-                content_hash: atlas_utils::hashing::hash_bytes(bytes),
-            },
-            blocks,
-        }
+        ParsedDocument { metadata, blocks }
     }
 
-    fn push_page_block(blocks: &mut Vec<Block>, page_slice: &str, page_number: usize) {
-        let text = extract_text_from_stream(page_slice);
-        // BUG FIX: this minimal reader can't distinguish a real
-        // uncompressed PDF text stream from binary/compressed page data
-        // that merely happens to contain "(" ... ")" byte sequences by
-        // coincidence -- extremely likely in any nontrivial compressed
-        // image stream. Accepting non-empty extraction as "this page has
-        // real text" without checking whether it actually looks like text
-        // caused image-only (e.g. scanned handwriting) pages to be
-        // misclassified as `Paragraph`, skipping OCR entirely and storing
-        // raw binary noise (reinterpreted byte-by-byte as characters,
-        // §254 `as char`) as the chunk's real content -- the
-        // "ï¿½ï¿½ï¿½..." pattern. `looks_like_real_text` rejects that.
-        let block_type = if looks_like_real_text(&text) {
-            BlockType::Paragraph
-        } else {
-            // §17/§36.2: image-only page, flagged for OCR rather than
-            // assumed absent. The OCR pipeline step (pipeline.rs) is
-            // responsible for rasterizing and filling this block's text.
-            BlockType::Image
-        };
-        let text_content = if block_type == BlockType::Paragraph {
-            text.trim().to_string()
-        } else {
-            // Discard whatever was "extracted" -- it's binary noise, not
-            // partial real text, so leaving it in would make
-            // `requires_ocr` skip this block (it only fires when
-            // `text_content` is empty).
-            String::new()
-        };
-        blocks.push(Block {
-            block_type,
-            location_ref: LocationRef {
-                page_or_location: page_number.to_string(),
-            },
-            text_content,
-        });
-    }
-
-    /// Sanity-check that `extract_text_from_stream`'s output plausibly IS
-    /// text, not binary/compressed data reinterpreted byte-by-byte as
-    /// characters. Real PDF text-showing operators contain ordinary
-    /// printable/whitespace characters; raw compressed or image data
-    /// reinterpreted the same way produces a high proportion of control
-    /// characters and high (0x80-0xFF range, cast directly to Unicode
-    /// codepoints U+0080-U+00FF by `as char`) bytes instead.
+    /// Sanity-check that extracted text plausibly IS text, kept from the
+    /// previous implementation: even `lopdf`'s real extraction can return
+    /// a near-empty or garbled string for a page with a broken/embedded
+    /// font encoding table, and that must still be treated as "needs OCR"
+    /// rather than stored as the page's real content.
     fn looks_like_real_text(text: &str) -> bool {
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -400,156 +404,351 @@ pub mod pdf {
             .chars()
             .filter(|c| c.is_ascii_graphic() || c.is_whitespace())
             .count();
-        // Require at least 90% ordinary printable ASCII/whitespace.
-        // Real extracted PDF text is effectively always this; binary
-        // noise reliably is not.
         plausible * 10 >= total * 9
     }
 
-    /// Best-effort extraction of the Nth embedded JPEG (`/Filter
-    /// /DCTDecode`) image object's raw stream bytes, in file order. A
-    /// `/DCTDecode` stream's raw bytes already ARE a standalone valid
-    /// JPEG file -- that filter name means "this stream is JPEG-encoded
-    /// data" -- so no re-encoding is needed, just slicing out the
-    /// `stream ... endstream` payload.
-    ///
-    /// This is a heuristic, not a real PDF object-graph resolver (this
-    /// parser's documented "minimal reader" scope, §36.2): it assumes one
-    /// embedded image per page, appearing in the same order as the pages
-    /// themselves. True for the overwhelming majority of scan-to-PDF
-    /// output (this app's primary handwritten-notes use case) -- not
-    /// guaranteed for an arbitrary PDF with multiple/zero images on a
-    /// page, or non-JPEG-encoded embedded images (`/FlateDecode`,
-    /// `/CCITTFaxDecode`, `/JPXDecode`), which this does not extract.
-    fn extract_nth_embedded_jpeg(bytes: &[u8], n: usize) -> Option<Vec<u8>> {
-        let mut found = 0usize;
-        let mut cursor = 0usize;
-        while let Some(rel) = find_subslice(&bytes[cursor..], b"/DCTDecode") {
-            let filter_idx = cursor + rel;
-            let Some(stream_rel) = find_subslice(&bytes[filter_idx..], b"stream") else {
-                cursor = filter_idx + 1;
-                continue;
-            };
-            let mut stream_start = filter_idx + stream_rel + b"stream".len();
-            // PDF spec: the `stream` keyword is followed by CRLF or LF
-            // before the binary data begins.
-            if bytes.get(stream_start) == Some(&b'\r') {
-                stream_start += 1;
+    /// Find the largest (by pixel area) embedded raster Image XObject
+    /// referenced by a page's resources. Scanned/handwritten PDF exports
+    /// are overwhelmingly one full-page image per page, so "largest image
+    /// on the page" is a reliable proxy for "the page scan" without
+    /// needing a true PDF object-graph resolver of every content-stream
+    /// `Do` operator invocation (this parser's documented minimal-reader
+    /// scope, §36.2).
+    fn find_page_image_stream(doc: &lopdf::Document, page_id: (u32, u16)) -> Option<&lopdf::Stream> {
+        // `get_page_resources` only returns a *direct* (inline) Resources
+        // dictionary as its first tuple element; real-world PDFs
+        // overwhelmingly store `/Resources` as an indirect reference
+        // instead, which only shows up in the second tuple element
+        // (`resource_ids`, already-resolved object ids of every Resources
+        // dict in this page's ancestry). Both must be checked, or this
+        // silently finds nothing for the common indirect-reference case.
+        let (inline_resources, resource_ids) = doc.get_page_resources(page_id);
+
+        let mut xobject_dicts: Vec<&lopdf::Dictionary> = Vec::new();
+        if let Some(dict) = inline_resources {
+            if let Ok(xobjects) = dict.get(b"XObject").and_then(|o| o.as_dict()) {
+                xobject_dicts.push(xobjects);
             }
-            if bytes.get(stream_start) == Some(&b'\n') {
-                stream_start += 1;
+        }
+        for resource_id in resource_ids {
+            let Ok(dict) = doc.get_dictionary(resource_id) else { continue };
+            if let Ok(xobjects) = dict.get(b"XObject").and_then(|o| o.as_dict()) {
+                xobject_dicts.push(xobjects);
             }
-            let Some(end_rel) = find_subslice(&bytes[stream_start..], b"endstream") else {
-                cursor = filter_idx + 1;
-                continue;
-            };
-            let mut stream_end = stream_start + end_rel;
-            // PDF spec: an EOL marker immediately precedes `endstream`
-            // and is not part of the stream's actual data -- without
-            // stripping it, every extracted "JPEG" would have one
-            // trailing byte that doesn't belong to the image.
-            if stream_end > stream_start && bytes.get(stream_end - 1) == Some(&b'\n') {
-                stream_end -= 1;
-                if stream_end > stream_start && bytes.get(stream_end - 1) == Some(&b'\r') {
-                    stream_end -= 1;
+        }
+
+        let mut best: Option<(&lopdf::Stream, i64)> = None;
+        for xobjects in xobject_dicts {
+            for (_name, value) in xobjects.iter() {
+                let Ok(obj_id) = value.as_reference() else { continue };
+                let Ok(object) = doc.get_object(obj_id) else { continue };
+                let Ok(stream) = object.as_stream() else { continue };
+                let is_image = stream
+                    .dict
+                    .get(b"Subtype")
+                    .and_then(|o| o.as_name_str())
+                    .map(|s| s == "Image")
+                    .unwrap_or(false);
+                if !is_image {
+                    continue;
+                }
+                let width = stream.dict.get(b"Width").and_then(|o| o.as_i64()).unwrap_or(0);
+                let height = stream.dict.get(b"Height").and_then(|o| o.as_i64()).unwrap_or(0);
+                let area = width.saturating_mul(height);
+                let is_bigger = best.map(|(_, best_area)| area > best_area).unwrap_or(true);
+                if is_bigger {
+                    best = Some((stream, area));
                 }
             }
-            if found == n {
-                return Some(bytes[stream_start..stream_end].to_vec());
-            }
-            found += 1;
-            cursor = stream_end;
         }
-        None
+        best.map(|(stream, _)| stream)
     }
 
-    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-        if needle.is_empty() || haystack.len() < needle.len() {
+    /// Convert an embedded image XObject `Stream` into standalone image
+    /// bytes the OCR engine can decode directly, based on its actual
+    /// encoding filter -- not assumed to always be JPEG.
+    fn stream_to_image_bytes(stream: &lopdf::Stream) -> Option<Vec<u8>> {
+        let filters = stream.filters().unwrap_or_default();
+        // Filters are listed in decoding order (PDF spec); the last one
+        // applied is the one whose semantics decide how to interpret
+        // `stream.content`.
+        let last_filter = filters.last().map(|s| s.as_str()).unwrap_or("");
+        match last_filter {
+            // A `/DCTDecode` (JPEG) or `/JPXDecode` (JPEG2000) stream's
+            // raw bytes already ARE a standalone valid image file -- that
+            // filter name means "this stream is encoded that way" -- no
+            // re-encoding needed, just handing the bytes through.
+            "DCTDecode" | "JPXDecode" => Some(stream.content.clone()),
+            // Raw or zlib-compressed sample data: decode (if needed) and
+            // re-encode as a real PNG using the image dict's geometry, so
+            // the OCR engine receives an actual image file rather than
+            // undecodable raw samples.
+            "FlateDecode" | "" => {
+                let raw = if last_filter == "FlateDecode" {
+                    decode_zlib(&stream.content)?
+                } else {
+                    stream.content.clone()
+                };
+                encode_png_from_raw_samples(&stream.dict, &raw)
+            }
+            // CCITTFaxDecode / JBIG2Decode / other encodings: not decoded
+            // by this fix -- a genuine, explicitly-acknowledged gap (see
+            // module doc comment and the Fix 7 audit) rather than a
+            // silent guess.
+            _ => None,
+        }
+    }
+
+    fn decode_zlib(data: &[u8]) -> Option<Vec<u8>> {
+        let mut decoder = flate2::read::ZlibDecoder::new(data);
+        let mut out = Vec::new();
+        decoder.read_to_end(&mut out).ok()?;
+        Some(out)
+    }
+
+    fn encode_png_from_raw_samples(dict: &lopdf::Dictionary, raw: &[u8]) -> Option<Vec<u8>> {
+        let width = dict.get(b"Width").ok()?.as_i64().ok()?.try_into().ok()?;
+        let height = dict.get(b"Height").ok()?.as_i64().ok()?.try_into().ok()?;
+        let bits_per_component: u8 = dict
+            .get(b"BitsPerComponent")
+            .ok()
+            .and_then(|o| o.as_i64().ok())
+            .unwrap_or(8)
+            .try_into()
+            .ok()?;
+        let color_space = dict
+            .get(b"ColorSpace")
+            .ok()
+            .and_then(|o| o.as_name_str().ok())
+            .unwrap_or("DeviceGray");
+
+        let (color_type, bit_depth) = match (color_space, bits_per_component) {
+            ("DeviceGray" | "CalGray", 1) => (png::ColorType::Grayscale, png::BitDepth::One),
+            ("DeviceGray" | "CalGray", 8) => (png::ColorType::Grayscale, png::BitDepth::Eight),
+            ("DeviceRGB" | "CalRGB", 8) => (png::ColorType::Rgb, png::BitDepth::Eight),
+            // Indexed palettes, CMYK, 16-bit-per-component, and other
+            // uncommon combinations are not handled here -- returning
+            // `None` (a clean per-block OCR failure) rather than
+            // guessing at a color transform that could silently corrupt
+            // the image.
+            _ => return None,
+        };
+        if width == 0 || height == 0 {
             return None;
         }
-        haystack.windows(needle.len()).position(|w| w == needle)
+
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, width, height);
+            encoder.set_color(color_type);
+            encoder.set_depth(bit_depth);
+            let mut writer = encoder.write_header().ok()?;
+            writer.write_image_data(raw).ok()?;
+        }
+        Some(out)
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
         use atlas_types::document::BlockType;
+        use lopdf::dictionary;
 
-        #[test]
-        fn extracts_text_from_a_simple_content_stream() {
-            let stream = "BT /F1 12 Tf (Hello World) Tj ET";
-            assert_eq!(extract_text_from_stream(stream).trim(), "Hello World");
-        }
+        /// Build a minimal single-page PDF whose content stream is
+        /// `/FlateDecode`-compressed, containing a `Tj` text-showing
+        /// operator -- the exact real-world shape (Fix 2) the previous
+        /// byte-scanning parser could never extract text from.
+        fn build_flate_compressed_text_pdf(text: &str) -> Vec<u8> {
+            let mut doc = lopdf::Document::with_version("1.5");
+            let pages_id = doc.new_object_id();
 
-        #[test]
-        fn handles_escaped_parentheses() {
-            let stream = r"(a \(b\) c) Tj";
-            assert_eq!(extract_text_from_stream(stream).trim(), "a (b) c");
-        }
+            let font_id = doc.add_object(lopdf::dictionary! {
+                "Type" => "Font",
+                "Subtype" => "Type1",
+                "BaseFont" => "Helvetica",
+            });
+            let resources_id = doc.add_object(lopdf::dictionary! {
+                "Font" => lopdf::dictionary! { "F1" => font_id },
+            });
 
-        #[test]
-        fn page_with_no_text_is_flagged_as_image_block() {
-            let fake_pdf = b"/Type /Page /Contents 5 0 R stream\n\xFF\xD8\xFF\xE0binarydata\nendstream".to_vec();
-            let doc = parse_pdf_bytes("scanned.pdf", &fake_pdf);
-            assert_eq!(doc.blocks[0].block_type, BlockType::Image);
-        }
+            let content = lopdf::content::Content {
+                operations: vec![
+                    lopdf::content::Operation::new("BT", vec![]),
+                    lopdf::content::Operation::new("Tf", vec!["F1".into(), 24.into()]),
+                    lopdf::content::Operation::new("Td", vec![100.into(), 700.into()]),
+                    lopdf::content::Operation::new(
+                        "Tj",
+                        vec![lopdf::Object::string_literal(text)],
+                    ),
+                    lopdf::content::Operation::new("ET", vec![]),
+                ],
+            };
+            let content_bytes = content.encode().unwrap();
+            let mut content_stream = lopdf::Stream::new(lopdf::dictionary! {}, content_bytes);
+            // Force real zlib compression so this is a faithful
+            // regression fixture for the FlateDecode bug, not an
+            // uncompressed stream that the old parser could already read.
+            content_stream.compress().unwrap();
+            let content_id = doc.add_object(content_stream);
 
-        #[test]
-        fn page_with_text_is_a_paragraph_block() {
-            let fake_pdf = b"/Type /Page /Contents 5 0 R stream\nBT (Chapter One) Tj ET\nendstream".to_vec();
-            let doc = parse_pdf_bytes("digital.pdf", &fake_pdf);
-            assert_eq!(doc.blocks[0].block_type, BlockType::Paragraph);
-            assert_eq!(doc.blocks[0].text_content, "Chapter One");
-        }
+            let page_id = doc.add_object(lopdf::dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "Contents" => content_id,
+                "Resources" => resources_id,
+            });
 
-        #[test]
-        fn multiple_pages_produce_multiple_blocks_with_increasing_location_ref() {
-            let fake_pdf = b"/Type /Page (Page one text) Tj /Type /Page (Page two text) Tj".to_vec();
-            let doc = parse_pdf_bytes("multi.pdf", &fake_pdf);
-            assert_eq!(doc.blocks.len(), 2);
-            assert_eq!(doc.blocks[0].location_ref.page_or_location, "1");
-            assert_eq!(doc.blocks[1].location_ref.page_or_location, "2");
-        }
-
-        /// Regression test for the bug traced live: a scanned/image-only
-        /// page whose compressed binary stream happens to contain "("/")"
-        /// byte sequences was previously misclassified as `Paragraph`
-        /// with that binary noise (reinterpreted byte-by-byte as
-        /// characters) as its "text", skipping OCR entirely.
-        #[test]
-        fn binary_noise_with_coincidental_parens_is_still_flagged_as_image() {
-            let mut fake_pdf = b"/Type /Page /Contents 5 0 R stream\n".to_vec();
-            // High (>0x7F), non-ASCII bytes with a stray '(' and ')' among
-            // them -- exactly what `extract_text_from_stream` would
-            // scoop up as "text" from real compressed/binary stream data.
-            fake_pdf.extend_from_slice(&[0xE2, 0x28, 0x9C, 0xFF, 0xD1, 0x29, 0x00, 0x8A, 0xB4]);
-            fake_pdf.extend_from_slice(b"\nendstream");
-            let doc = parse_pdf_bytes("scanned-binary.pdf", &fake_pdf);
-            assert_eq!(doc.blocks[0].block_type, BlockType::Image);
-            assert!(doc.blocks[0].text_content.is_empty());
-        }
-
-        #[test]
-        fn extracts_the_nth_embedded_jpeg_stream_by_dctdecode_filter() {
-            let mut fake_pdf = Vec::new();
-            fake_pdf.extend_from_slice(b"1 0 obj <</Filter /DCTDecode>> stream\n");
-            fake_pdf.extend_from_slice(&[0xFF, 0xD8, 0xFF, 0xE0, 0x01]); // fake JPEG bytes #1
-            fake_pdf.extend_from_slice(b"\nendstream endobj\n");
-            fake_pdf.extend_from_slice(b"2 0 obj <</Filter /DCTDecode>> stream\n");
-            fake_pdf.extend_from_slice(&[0xFF, 0xD8, 0xFF, 0xE0, 0x02]); // fake JPEG bytes #2
-            fake_pdf.extend_from_slice(b"\nendstream endobj\n");
-
-            assert_eq!(
-                extract_nth_embedded_jpeg(&fake_pdf, 0),
-                Some(vec![0xFF, 0xD8, 0xFF, 0xE0, 0x01])
+            doc.objects.insert(
+                pages_id,
+                lopdf::Object::Dictionary(lopdf::dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => vec![page_id.into()],
+                    "Count" => 1,
+                    "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                }),
             );
-            assert_eq!(
-                extract_nth_embedded_jpeg(&fake_pdf, 1),
-                Some(vec![0xFF, 0xD8, 0xFF, 0xE0, 0x02])
-            );
-            assert_eq!(extract_nth_embedded_jpeg(&fake_pdf, 2), None);
+            let catalog_id = doc.add_object(lopdf::dictionary! {
+                "Type" => "Catalog",
+                "Pages" => pages_id,
+            });
+            doc.trailer.set("Root", catalog_id);
+
+            let mut bytes = Vec::new();
+            doc.save_to(&mut bytes).unwrap();
+            bytes
         }
-    }
+
+        #[test]
+        fn extracts_text_from_a_flatedecode_compressed_content_stream() {
+            let pdf_bytes = build_flate_compressed_text_pdf("Hello Compressed World");
+            let parsed = parse_pdf_bytes("compressed.pdf", &pdf_bytes);
+            assert_eq!(parsed.blocks.len(), 1);
+            assert_eq!(parsed.blocks[0].block_type, BlockType::Paragraph);
+            assert!(parsed.blocks[0].text_content.contains("Hello Compressed World"));
+        }
+
+        #[test]
+        fn a_page_with_no_extractable_text_is_flagged_as_image() {
+            // A page with no content stream at all still has to produce
+            // a Block, and since it has no text it must be flagged for
+            // OCR rather than silently dropped.
+            let mut doc = lopdf::Document::with_version("1.5");
+            let pages_id = doc.new_object_id();
+            let page_id = doc.add_object(lopdf::dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+            });
+            doc.objects.insert(
+                pages_id,
+                lopdf::Object::Dictionary(lopdf::dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => vec![page_id.into()],
+                    "Count" => 1,
+                }),
+            );
+            let catalog_id = doc.add_object(lopdf::dictionary! {
+                "Type" => "Catalog",
+                "Pages" => pages_id,
+            });
+            doc.trailer.set("Root", catalog_id);
+            let mut bytes = Vec::new();
+            doc.save_to(&mut bytes).unwrap();
+
+            let parsed = parse_pdf_bytes("blank-page.pdf", &bytes);
+            assert_eq!(parsed.blocks.len(), 1);
+            assert_eq!(parsed.blocks[0].block_type, BlockType::Image);
+            assert!(parsed.blocks[0].text_content.is_empty());
+        }
+
+        #[test]
+        fn a_malformed_pdf_still_produces_a_single_image_block_not_a_panic_or_empty_doc() {
+            let parsed = parse_pdf_bytes("not-really-a-pdf.pdf", b"this is not a pdf file at all");
+            assert_eq!(parsed.blocks.len(), 1);
+            assert_eq!(parsed.blocks[0].block_type, BlockType::Image);
+        }
+
+        /// Build a single-page PDF whose page has one embedded raster
+        /// image XObject encoded with `/FlateDecode` (the common case for
+        /// a full-page scan that isn't JPEG-compressed) and confirm
+        /// `extract_ocr_image` returns real, valid PNG bytes for it, not
+        /// `None` and not the raw PDF file.
+        fn build_flate_image_pdf(width: u32, height: u32, gray_samples: &[u8]) -> Vec<u8> {
+            let mut doc = lopdf::Document::with_version("1.5");
+            let pages_id = doc.new_object_id();
+
+            let mut image_stream = lopdf::Stream::new(
+                lopdf::dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Image",
+                    "Width" => width as i64,
+                    "Height" => height as i64,
+                    "ColorSpace" => "DeviceGray",
+                    "BitsPerComponent" => 8,
+                },
+                gray_samples.to_vec(),
+            );
+            image_stream.compress().unwrap();
+            let image_id = doc.add_object(image_stream);
+
+            let resources_id = doc.add_object(lopdf::dictionary! {
+                "XObject" => lopdf::dictionary! { "Im0" => image_id },
+            });
+
+            let page_id = doc.add_object(lopdf::dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "Resources" => resources_id,
+            });
+            doc.objects.insert(
+                pages_id,
+                lopdf::Object::Dictionary(lopdf::dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => vec![page_id.into()],
+                    "Count" => 1,
+                }),
+            );
+            let catalog_id = doc.add_object(lopdf::dictionary! {
+                "Type" => "Catalog",
+                "Pages" => pages_id,
+            });
+            doc.trailer.set("Root", catalog_id);
+
+            let mut bytes = Vec::new();
+            doc.save_to(&mut bytes).unwrap();
+            bytes
+        }
+
+        #[test]
+fn extract_ocr_image_returns_valid_png_bytes_for_a_flatedecode_image_page() {
+    let width = 4u32;
+    let height = 2u32;
+    let samples = vec![10u8, 20, 30, 40, 50, 60, 70, 80]; // 4x2 grayscale
+    let pdf_bytes = build_flate_image_pdf(width, height, &samples);
+
+    let path = std::env::temp_dir().join("atlas_test_flate_image.pdf");
+    let parser = PdfParser;
+    std::fs::write(&path, &pdf_bytes).unwrap();
+    let image_bytes = parser
+        .extract_ocr_image(path.to_str().unwrap(), 0)
+        .expect("expected real PNG bytes, got None");
+
+    // Real PNG signature, not raw samples and not the PDF file.
+    assert_eq!(&image_bytes[0..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn extract_ocr_image_returns_none_for_a_page_with_no_image() {
+    let pdf_bytes = build_flate_compressed_text_pdf("no image here");
+    let path = std::env::temp_dir().join("atlas_test_no_image.pdf");
+    std::fs::write(&path, &pdf_bytes).unwrap();
+
+    let parser = PdfParser;
+    let result = parser.extract_ocr_image(path.to_str().unwrap(), 0);
+    assert!(result.is_none());
+    let _ = std::fs::remove_file(&path);
+}
+}
 }
 
 /// Word (DOCX) Parser (§36.2). A `.docx` file is a ZIP archive containing

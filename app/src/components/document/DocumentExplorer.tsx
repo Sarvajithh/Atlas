@@ -74,13 +74,28 @@ function Folder({ folder, depth, onOpen }: { folder: TreeFolder; depth: number; 
                 onClick={() => onOpen(doc)}
                 style={{ paddingLeft: `${(depth + 1) * 12 + 8}px` }}
                 className="flex w-full items-center gap-1.5 py-1 text-left text-sm hover:bg-accent"
-                title={doc.parse_status === "Failed" ? "Indexing failed for this file" : undefined}
+                title={
+                  doc.parse_status === "Failed"
+                    ? "Indexing failed for this file"
+                    : doc.parse_status === "ParsedEmpty"
+                      ? "No text extracted from this file"
+                      : undefined
+                }
               >
                 <span aria-hidden>{FILE_ICON[doc.file_type] ?? "📄"}</span>
                 <span className="truncate">{name}</span>
                 {doc.parse_status === "Failed" ? (
                   <span aria-hidden className="ml-auto text-destructive">
                     !
+                  </span>
+                ) : doc.parse_status === "ParsedEmpty" ? (
+                  // Fix 5 (P1 audit): previously indistinguishable from a
+                  // successful index in the UI -- a document that finished
+                  // indexing without error but produced no usable content
+                  // now gets its own, clearly different indicator rather
+                  // than either the "in progress" dot or silence.
+                  <span aria-hidden className="ml-auto text-xs text-muted-foreground">
+                    ∅
                   </span>
                 ) : doc.parse_status !== "Parsed" ? (
                   <span aria-hidden className="ml-auto h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500" />

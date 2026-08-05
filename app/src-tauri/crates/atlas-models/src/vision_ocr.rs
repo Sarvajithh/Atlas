@@ -104,7 +104,7 @@ impl OcrEngine for OllamaVisionOcrEngine {
         }
         match self
             .ollama
-            .generate(&model.model_identifier, TRANSCRIBE_PROMPT, Some(vec![encoded_image]))
+            .generate(&model.model_identifier, TRANSCRIBE_PROMPT, Some(vec![encoded_image]), model.context_length)
         {
             Ok(text) => Ok(text.trim().to_string()),
             Err(err) => {

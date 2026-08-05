@@ -125,20 +125,59 @@ struct GenerateRequest<'a> {
 /// (§39) so the token budget actually enforced by context assembly
 /// matches what's requested from the model, rather than the two numbers
 /// silently disagreeing.
+///
+/// Fix 4 (P0 audit): the above comment describes the intent, but `num_ctx`
+/// was still a hardcoded `4096` for every request regardless of which
+/// model was actually resolved for the role -- so a model registered with
+/// a real 32K+ context window was silently capped to 4096 (truncating
+/// large contexts with zero visibility), and a model genuinely limited to
+/// a smaller window than 4096 could be asked for more than it has.
+/// `ModelRegistryEntry::context_length` (populated by `discovery.rs` from
+/// Ollama's real `/api/show` response) already carries the correct value
+/// per model -- `GenerateOptions::for_model_context` now uses it instead
+/// of a fixed literal.
 #[derive(Debug, Serialize, Clone, Copy)]
 struct GenerateOptions {
     num_ctx: u32,
     num_predict: i32,
 }
 
-impl Default for GenerateOptions {
-    fn default() -> Self {
+/// Conservative fallback `num_ctx` used only when the resolved model's
+/// `context_length` is missing or reports `0` (e.g. an older Ollama server
+/// that didn't return a recognizable `*.context_length` key in
+/// `/api/show`, see `infer_context_length`). Named and documented per the
+/// "no bare literal" rule (Fix 4 requirement 1) rather than inlined --
+/// deliberately conservative (safe on an 8GB card, per the bug this
+/// constant's neighbor documents) rather than optimistic, since guessing
+/// too high risks the same VRAM-spill stall this fix exists to prevent.
+const FALLBACK_NUM_CTX: u32 = 4096;
+
+impl GenerateOptions {
+    /// Build request options for a specific resolved model's real context
+    /// window (Fix 4). Falls back to `FALLBACK_NUM_CTX` and logs a warning
+    /// when `context_length` is unavailable, rather than silently guessing
+    /// with no trace of why.
+    fn for_model_context(context_length: u32) -> Self {
+        let num_ctx = if context_length > 0 {
+            context_length
+        } else {
+            atlas_utils::log_warn!(
+                "[OllamaProvider] resolved model reported no usable context_length; falling back to {FALLBACK_NUM_CTX}"
+            );
+            FALLBACK_NUM_CTX
+        };
         Self {
-            num_ctx: 4096,
-            num_predict: 1024,
+            num_ctx,
+            num_predict: DEFAULT_NUM_PREDICT,
         }
     }
 }
+
+/// Default max tokens to generate per response. Unrelated to context-window
+/// sizing (Fix 4 is scoped to `num_ctx` only, per its requirement 3) --
+/// kept as a named constant rather than a bare literal for the same
+/// "no magic numbers" reason as `FALLBACK_NUM_CTX`.
+const DEFAULT_NUM_PREDICT: i32 = 1024;
 
 #[derive(Debug, Deserialize)]
 struct GenerateStreamLine {
@@ -236,7 +275,13 @@ impl OllamaProvider {
     /// Non-streaming generation, used where the caller needs the full
     /// answer before proceeding (e.g. quiz/flashcard generation composing
     /// structured output from the Reasoning Engine).
-    pub fn generate(&self, model: &str, prompt: &str, images: Option<Vec<String>>) -> Result<String, AppError> {
+    pub fn generate(
+        &self,
+        model: &str,
+        prompt: &str,
+        images: Option<Vec<String>>,
+        context_length: u32,
+    ) -> Result<String, AppError> {
         // TEMPORARY TRACE LOGGING (remove once the pipeline is confirmed working).
         let url = format!("{}/api/generate", self.connection.base_url());
         atlas_utils::log_info!("[OllamaProvider] generate() entered url={url} model={model}");
@@ -246,7 +291,7 @@ impl OllamaProvider {
             prompt,
             stream: false,
             images,
-            options: GenerateOptions::default(),
+            options: GenerateOptions::for_model_context(context_length),
         };
         let response = self
             .agent
@@ -286,6 +331,7 @@ impl OllamaProvider {
         model: &str,
         prompt: &str,
         images: Option<Vec<String>>,
+        context_length: u32,
     ) -> Result<impl Iterator<Item = Result<GenerationChunk, AppError>>, AppError> {
         // TEMPORARY TRACE LOGGING (remove once the pipeline is confirmed working).
         let url = format!("{}/api/generate", self.connection.base_url());
@@ -296,7 +342,7 @@ impl OllamaProvider {
             prompt,
             stream: true,
             images,
-            options: GenerateOptions::default(),
+            options: GenerateOptions::for_model_context(context_length),
         };
         let response = self
             .agent
@@ -556,7 +602,7 @@ mod tests {
             "/api/generate",
             serde_json::json!({ "response": "hello world", "done": true }),
         )]);
-        let text = server.provider().generate("llama3.1", "hi", None).unwrap();
+        let text = server.provider().generate("llama3.1", "hi", None, 8192).unwrap();
         assert_eq!(text, "hello world");
     }
 

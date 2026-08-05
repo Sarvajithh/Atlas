@@ -7,6 +7,7 @@ import "katex/dist/katex.min.css";
 
 import {
   assistantAskStream,
+  assistantCancel,
   assistantGetSessionMessages,
   assistantListSessions,
   type AssistantIntent,
@@ -71,7 +72,7 @@ export function AssistantPanel() {
   const [selectedText, setSelectedText] = useState<string | null>(null);
   const [showSessions, setShowSessions] = useState(false);
 
-  const stopRef = useRef<{ stopListening: () => void } | null>(null);
+  const stopRef = useRef<{ stopListening: () => void; requestId: string } | null>(null);
   const lastUserMessageRef = useRef<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const localIdRef = useRef(0);
@@ -111,7 +112,18 @@ export function AssistantPanel() {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   }, [messages]);
 
-  useEffect(() => () => stopRef.current?.stopListening(), []);
+  useEffect(
+    () => () => {
+      if (stopRef.current) {
+        stopRef.current.stopListening();
+        assistantCancel(stopRef.current.requestId).catch(() => {
+          // §45.1 recoverable: unmounting is not the place to surface a
+          // cancel failure to the user.
+        });
+      }
+    },
+    [],
+  );
 
   async function resumeSession(id: number) {
     setLoadError(null);
@@ -207,15 +219,23 @@ export function AssistantPanel() {
   }
 
   function stopGeneration() {
-    // §45.2 honest degradation: the backend does not yet support
-    // mid-generation cancellation (`assistant_cancel` returns a defined
-    // "not implemented" error). This detaches the UI from the in-flight
-    // stream rather than pretending the model itself stopped.
-    stopRef.current?.stopListening();
+    // Fix 6 (P1 audit): `assistant_cancel` now performs real backend
+    // cancellation -- the model stops generating and no further chunks
+    // are forwarded, not just the UI detaching from a stream it ignores.
+    // `stopListening()` still runs too, so the UI stops reacting the
+    // instant the button is pressed rather than waiting on the cancel
+    // round-trip.
+    const handle = stopRef.current;
     stopRef.current = null;
+    handle?.stopListening();
     setIsGenerating(false);
     setMessages((prev) => prev.map((m) => (m.pending ? { ...m, pending: false } : m)));
-    pushToast({ kind: "info", message: "Stopped listening for more of this response." });
+    pushToast({ kind: "info", message: "Stopping generation..." });
+    if (handle) {
+      assistantCancel(handle.requestId).catch((err) => {
+        console.log("[Assistant] assistant_cancel failed", err);
+      });
+    }
   }
 
   function retryLast() {

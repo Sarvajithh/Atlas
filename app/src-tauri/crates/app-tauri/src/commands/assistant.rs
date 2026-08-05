@@ -12,7 +12,6 @@ use atlas_models::Intent;
 use atlas_types::chat::{ChatMessage, ChatSession};
 use atlas_types::ids::{ChatSessionId, ConceptNodeId, WorkspaceId};
 use atlas_types::retrieval::Citation;
-use atlas_utils::error::{ErrorCategory, ErrorCode};
 use atlas_utils::AppError;
 use serde::{Deserialize, Serialize};
 
@@ -98,11 +97,12 @@ pub fn assistant_ask_stream(
     session_id: Option<i64>,
     intent: Option<String>,
     images: Option<Vec<String>>,
+    request_id: String,
 ) -> Result<(), AppError> {
     // TEMPORARY TRACE LOGGING (remove once the pipeline is confirmed working).
     let __t0 = std::time::Instant::now();
     atlas_utils::log_info!(
-        "[IPC] assistant_ask_stream entered workspace_id={workspace_id} session_id={session_id:?} intent={intent:?}"
+        "[IPC] assistant_ask_stream entered workspace_id={workspace_id} session_id={session_id:?} intent={intent:?} request_id={request_id}"
     );
 
     let resolved_intent = intent.as_deref().map(parse_intent).unwrap_or(Intent::Tutoring);
@@ -115,6 +115,7 @@ pub fn assistant_ask_stream(
         &question,
         resolved_intent,
         images,
+        &request_id,
         |chunk: &str| {
             // TEMPORARY TRACE LOGGING
             atlas_utils::log_info!("[IPC] chunk from facade, len={}", chunk.len());
@@ -167,19 +168,19 @@ pub fn assistant_ask_stream(
     }
 }
 
-/// §43.1 `assistant.cancel`. Full in-flight cancellation (aborting a
-/// streaming Ollama request mid-generation from a second IPC call) needs a
-/// per-request cancellation-token registry that doesn't exist yet -- this
-/// remains a defined, honest "not implemented" error (§45.2: no bare
-/// silent no-op) rather than a fabricated success, so the UI can surface
-/// it truthfully instead of assuming cancellation took effect.
+/// §43.1 `assistant.cancel` (Fix 6, P1 audit). Real in-flight
+/// cancellation: signals the `CancellationRegistry` entry `request_id` was
+/// registered under at the start of `assistant_ask_stream` -- the
+/// streaming loop in `AppFacade::chat_stream` observes the signal and
+/// stops forwarding/consuming further chunks. A `request_id` that's
+/// unknown or already finished is a clean success, not an error (the
+/// registry's own contract, since either way nothing is still running for
+/// that id) -- the UI can treat any `Ok` here as "this request is not
+/// (or no longer) generating," without needing to distinguish "cancelled
+/// it just now" from "it had already finished."
 #[tauri::command]
-pub fn assistant_cancel(_request_id: String) -> Result<(), AppError> {
-    Err(AppError::new(
-        ErrorCode::EngineError,
-        ErrorCategory::Recoverable,
-        "assistant.cancel: in-flight request cancellation is not implemented in this milestone",
-    ))
+pub fn assistant_cancel(facade: State<'_, AppFacade>, request_id: String) -> Result<(), AppError> {
+    facade.cancel_request(&request_id)
 }
 
 /// §43.1 Conversation Memory ("Previous conversations", "Resume previous

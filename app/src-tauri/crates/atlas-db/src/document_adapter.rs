@@ -28,6 +28,7 @@ fn status_to_str(status: &ParseStatus) -> &'static str {
         ParseStatus::Pending => "pending",
         ParseStatus::Parsing => "parsing",
         ParseStatus::Parsed => "parsed",
+        ParseStatus::ParsedEmpty => "parsed_empty",
         ParseStatus::Failed => "failed",
     }
 }
@@ -37,6 +38,7 @@ fn status_from_str(value: &str) -> Result<ParseStatus, AppError> {
         "pending" => Ok(ParseStatus::Pending),
         "parsing" => Ok(ParseStatus::Parsing),
         "parsed" => Ok(ParseStatus::Parsed),
+        "parsed_empty" => Ok(ParseStatus::ParsedEmpty),
         "failed" => Ok(ParseStatus::Failed),
         other => Err(AppError::storage(format!(
             "unrecognized parse_status in database: {other}"

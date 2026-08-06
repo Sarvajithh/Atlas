@@ -114,6 +114,14 @@ struct GenerateRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     images: Option<Vec<String>>,
     options: GenerateOptions,
+    // Bug fix (traced live, 96s+ gap before the first token on repeat
+    // requests): without an explicit `keep_alive`, Ollama uses its own
+    // server default (5 minutes) and unloads the model from memory/VRAM
+    // once idle past that -- the *next* request then pays the full
+    // model-load cost again before it can emit a single token. Keeping
+    // the model resident across the session (see `OLLAMA_KEEP_ALIVE`)
+    // avoids paying that cost on every turn.
+    keep_alive: &'a str,
 }
 
 /// Bug fix (traced live): without an explicit `num_ctx`, Ollama falls
@@ -152,13 +160,35 @@ struct GenerateOptions {
 /// too high risks the same VRAM-spill stall this fix exists to prevent.
 const FALLBACK_NUM_CTX: u32 = 4096;
 
+/// Floor for the requested `num_ctx` regardless of how short the prompt
+/// is (Part 5, latency audit). Trace-instrumented live: requesting the
+/// model's *full* advertised window unconditionally (e.g. 131072 for a
+/// model whose real usage was a few hundred tokens) forces Ollama to
+/// allocate a KV cache sized for the full window every request. On an
+/// 8GB card that pushed total runtime memory (weights + cache) past free
+/// VRAM, causing a silent fallback to CPU inference -- not a crash, just
+/// a 20-50x slowdown with no visible error. Sizing the request to what
+/// the prompt actually needs (with headroom) instead of the model's
+/// theoretical maximum keeps the KV cache proportional to real usage.
+/// This floor exists only so a trivially short prompt doesn't request an
+/// unreasonably tiny cache that risks truncating a longer-than-expected
+/// response.
+const MIN_NUM_CTX: u32 = 2048;
+
 impl GenerateOptions {
     /// Build request options for a specific resolved model's real context
-    /// window (Fix 4). Falls back to `FALLBACK_NUM_CTX` and logs a warning
-    /// when `context_length` is unavailable, rather than silently guessing
-    /// with no trace of why.
-    fn for_model_context(context_length: u32) -> Self {
-        let num_ctx = if context_length > 0 {
+    /// window (Fix 4), sized to what `prompt` actually needs rather than
+    /// the model's full advertised window (Part 5 latency fix, see
+    /// `MIN_NUM_CTX`). Requested `num_ctx` is
+    /// `clamp(prompt_tokens + num_predict + headroom, MIN_NUM_CTX, model_ceiling)`
+    /// -- never more than the model can actually support (Fix 4's
+    /// original guarantee: never silently truncate a large model's real
+    /// capability), but also never the full window when the real prompt
+    /// is far smaller than that. Falls back to `FALLBACK_NUM_CTX` as the
+    /// ceiling and logs a warning when `context_length` is unavailable,
+    /// rather than silently guessing with no trace of why.
+    fn for_model_context(context_length: u32, prompt: &str) -> Self {
+        let model_ceiling = if context_length > 0 {
             context_length
         } else {
             atlas_utils::log_warn!(
@@ -166,6 +196,12 @@ impl GenerateOptions {
             );
             FALLBACK_NUM_CTX
         };
+        // Same whitespace-word approximation ContextBuilder uses for its
+        // own token budgeting (§18 convention) -- good enough to size a
+        // KV cache request, without pulling in a real tokenizer here.
+        let prompt_tokens = prompt.split_whitespace().count() as u32;
+        let needed = prompt_tokens.saturating_add(DEFAULT_NUM_PREDICT as u32);
+        let num_ctx = needed.clamp(MIN_NUM_CTX, model_ceiling);
         Self {
             num_ctx,
             num_predict: DEFAULT_NUM_PREDICT,
@@ -178,6 +214,16 @@ impl GenerateOptions {
 /// kept as a named constant rather than a bare literal for the same
 /// "no magic numbers" reason as `FALLBACK_NUM_CTX`.
 const DEFAULT_NUM_PREDICT: i32 = 1024;
+
+/// How long Ollama keeps a resolved model resident in memory/VRAM after
+/// the last request before unloading it. Ollama's own default is `"5m"`,
+/// short enough that a normal pause between chat turns (or the retrieval/
+/// context-build work between the embedding call and the generation call
+/// on the very same request) can cost a full model reload on the next
+/// call. `"30m"` trades a modest amount of standing VRAM for keeping the
+/// assistant responsive across a realistic study session. Named/documented
+/// per the "no bare literal" convention rather than inlined.
+const OLLAMA_KEEP_ALIVE: &str = "30m";
 
 #[derive(Debug, Deserialize)]
 struct GenerateStreamLine {
@@ -217,8 +263,23 @@ pub struct OllamaProvider {
 
 impl OllamaProvider {
     pub fn new(connection: OllamaConnection) -> Self {
+        // BUG FIX (os error 10060 mid-stream on Windows): `.timeout(d)` sets
+        // a single ABSOLUTE deadline covering the entire call -- connect,
+        // write, AND the full duration of reading the response body. For
+        // generate_stream() that means any generation whose *total*
+        // streaming time exceeds `request_timeout` gets forcibly aborted by
+        // ureq mid-read, which Windows reports as WSAETIMEDOUT (10060) even
+        // though hundreds of chunks streamed successfully beforehand.
+        //
+        // Fix: use a short connect timeout (fails fast if Ollama is
+        // unreachable) plus per-operation idle read/write timeouts, which
+        // reset on every chunk transferred instead of counting cumulative
+        // time. This still fails fast on a genuinely hung connection, but
+        // no longer punishes long-running-but-healthy streams.
         let agent = ureq::AgentBuilder::new()
-            .timeout(connection.request_timeout)
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_read(connection.request_timeout)
+            .timeout_write(connection.request_timeout)
             .build();
         Self { connection, agent }
     }
@@ -291,7 +352,8 @@ impl OllamaProvider {
             prompt,
             stream: false,
             images,
-            options: GenerateOptions::for_model_context(context_length),
+            options: GenerateOptions::for_model_context(context_length, prompt),
+            keep_alive: OLLAMA_KEEP_ALIVE,
         };
         let response = self
             .agent
@@ -342,7 +404,8 @@ impl OllamaProvider {
             prompt,
             stream: true,
             images,
-            options: GenerateOptions::for_model_context(context_length),
+            options: GenerateOptions::for_model_context(context_length, prompt),
+            keep_alive: OLLAMA_KEEP_ALIVE,
         };
         let response = self
             .agent

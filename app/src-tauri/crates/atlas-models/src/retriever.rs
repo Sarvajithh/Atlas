@@ -43,6 +43,21 @@ impl Default for HybridWeights {
     }
 }
 
+/// Part 4 (retrieval-behavior audit): the Retriever's `limit` parameter is
+/// the *final* number of chunks a caller ultimately wants, but truncating
+/// to exactly that count immediately after the hybrid merge -- before
+/// reranking ever runs -- means the reranker can only ever reorder within
+/// whatever the raw weighted-merge score already chose, and can never
+/// promote a genuinely more relevant chunk that merge happened to score
+/// just outside the cutoff. Retrieval now fetches and merges a wider
+/// candidate pool (`limit * CANDIDATE_POOL_MULTIPLIER`) and returns that
+/// whole pool; `ContextBuilder::assemble` (§39.1) is what actually narrows
+/// it down, via reranking against the real query followed by dynamic
+/// token budgeting -- matching the intended pipeline order (hybrid
+/// retrieval -> merge -> dedupe -> rerank -> dynamic token budgeting)
+/// rather than a naive top-k cut before reranking ever sees the rest.
+const CANDIDATE_POOL_MULTIPLIER: usize = 3;
+
 pub struct Retriever {
     keyword_search: Arc<dyn KeywordSearchRepository>,
     vector_search: Arc<dyn VectorSearchRepository>,
@@ -77,6 +92,15 @@ impl Retriever {
     /// text/location, §18) -- this method fills in the missing fields from
     /// `ChunkRepository` before merging, so every returned `SearchHit` is
     /// complete regardless of which path produced it.
+    ///
+    /// Part 4 (retrieval-behavior audit): `limit` describes how many
+    /// chunks the caller ultimately wants, but this method returns a wider
+    /// candidate pool (`limit * CANDIDATE_POOL_MULTIPLIER`, see its doc)
+    /// rather than truncating to exactly `limit` here -- the caller's
+    /// `ContextBuilder::assemble` reranks and token-budgets that pool down
+    /// to the real final set, so a chunk that merge scored just outside a
+    /// naive top-`limit` cut still gets a fair chance to be promoted by
+    /// the reranker instead of being discarded before it ever runs.
     pub fn retrieve(
         &self,
         workspace_id: WorkspaceId,
@@ -87,19 +111,24 @@ impl Retriever {
         let __t0 = std::time::Instant::now();
         atlas_utils::log_info!("[Retriever] entered workspace_id={} query={query:?} limit={limit}", workspace_id.0);
 
-        let keyword_hits = self.keyword_search.search(workspace_id, query, limit * 2)?;
+        let candidate_pool = limit.saturating_mul(CANDIDATE_POOL_MULTIPLIER).max(limit);
+        let keyword_hits = self.keyword_search.search(workspace_id, query, candidate_pool)?;
         atlas_utils::log_info!("[Retriever] keyword_search returned {} hits", keyword_hits.len());
 
         let query_vector = self.embedder.embed(query)?;
         let raw_vector_hits = self
             .vector_search
-            .search(workspace_id, &query_vector, limit * 2)?;
+            .search(workspace_id, &query_vector, candidate_pool)?;
         atlas_utils::log_info!("[Retriever] vector_search returned {} raw hits", raw_vector_hits.len());
         let vector_hits = self.hydrate_vector_hits(raw_vector_hits)?;
         atlas_utils::log_info!("[Retriever] vector hits hydrated to {} (chunk lookups that missed are dropped)", vector_hits.len());
 
-        let merged = self.merge(keyword_hits, vector_hits, limit);
-        atlas_utils::log_info!("[Retriever] exited, returned {} merged chunks elapsed={:?}", merged.len(), __t0.elapsed());
+        let merged = self.merge(keyword_hits, vector_hits, candidate_pool);
+        atlas_utils::log_info!(
+            "[Retriever] exited, returned {} merged candidates (pool={candidate_pool}, final narrowing happens in ContextBuilder) elapsed={:?}",
+            merged.len(),
+            __t0.elapsed()
+        );
         Ok(merged)
     }
 
@@ -229,7 +258,11 @@ mod tests {
     }
 
     #[test]
-    fn retrieve_respects_the_limit() {
+    fn retrieve_returns_a_wider_candidate_pool_than_the_final_limit() {
+        // Part 4: Retriever no longer truncates to exactly `limit` -- it
+        // returns a wider pool (limit * CANDIDATE_POOL_MULTIPLIER) so
+        // ContextBuilder's reranker gets a real chance to reorder/promote
+        // candidates instead of only ever seeing an already-cut top-k.
         let retriever = Retriever::new(
             Arc::new(FixedKeywordSearch(vec![hit(1, 1.0), hit(2, 1.0), hit(3, 1.0)])),
             Arc::new(FixedVectorSearch(vec![])),
@@ -237,7 +270,9 @@ mod tests {
             Arc::new(FixedChunks(vec![chunk(1, "a"), chunk(2, "b"), chunk(3, "c")])),
         );
         let results = retriever.retrieve(WorkspaceId(1), "x", 2).unwrap();
-        assert_eq!(results.len(), 2);
+        // All 3 available hits survive into the candidate pool (2 * 3 = 6
+        // >= 3), rather than being cut down to 2 before reranking runs.
+        assert_eq!(results.len(), 3);
     }
 
     #[test]

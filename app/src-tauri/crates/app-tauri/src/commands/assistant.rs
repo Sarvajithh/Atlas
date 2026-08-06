@@ -5,7 +5,7 @@
 //! through the Model Scheduler, retrieval, and Session Manager behavior all
 //! live in `atlas-core`'s `AppFacade`.
 
-use tauri::{Emitter, State, Window};
+use tauri::{Emitter, Manager, State, Window};
 
 use atlas_core::AppFacade;
 use atlas_models::Intent;
@@ -82,15 +82,35 @@ struct StreamErrorPayload {
 }
 
 /// §43.1 `assistant.ask` streaming counterpart (§12: "use Tauri's event
-/// system to stream progress/tokens back to the frontend"; requirement
-/// "Stream responses to the frontend"). Runs synchronously on the IPC
-/// thread (Ollama streaming reads are already non-blocking per-chunk;
-/// `AppFacade::chat_stream` is the one place token-by-token forwarding
-/// happens) and emits three possible event types on `window`:
-/// `assistant://chunk`, `assistant://done`, `assistant://error`.
+/// §43.1 `assistant.ask_stream`: like `assistant_ask`, but forwards each
+/// token as it's produced (§12 "Long-running operations... use Tauri's
+/// event system to stream progress/tokens back to the frontend";
+/// requirement "Stream responses to the frontend"). Emits three possible
+/// event types on `window`: `assistant://chunk`, `assistant://done`,
+/// `assistant://error`.
+///
+/// Part 6 fix (latency/UI-responsiveness audit): this used to be a plain
+/// synchronous `fn`, and its own doc comment said so explicitly ("Runs
+/// synchronously on the IPC thread"). A single request here blocks for the
+/// full duration of retrieval + generation -- which, per the traced logs,
+/// could run past 180s on a slow model load. Whether or not Tauri's
+/// default command dispatch happens to offload a sync `fn` to a worker
+/// thread on any given version, holding the *invoking* task/thread for
+/// minutes at a time is exactly the pattern that starves whatever pool
+/// services other concurrent IPC calls (opening a document, browsing the
+/// file tree) -- which is what produced the "can't click anything while
+/// it's thinking" symptom. This is now `async fn`, and the actual blocking
+/// work (`facade.chat_stream`, which does synchronous DB + HTTP I/O) runs
+/// inside `tauri::async_runtime::spawn_blocking`, on a thread dedicated to
+/// blocking work rather than occupying an async-reactor-facing slot for
+/// the whole request. `app_handle` (not `State<'_, AppFacade>`) is taken
+/// so the facade can be re-resolved *inside* the spawned blocking closure,
+/// which needs `'static` ownership; `AppFacade` isn't `Clone`, and
+/// `AppHandle::state::<T>()` is the standard Tauri pattern for this rather
+/// than adding a blanket `Clone` impl the type wasn't designed for.
 #[tauri::command]
-pub fn assistant_ask_stream(
-    facade: State<'_, AppFacade>,
+pub async fn assistant_ask_stream(
+    app_handle: tauri::AppHandle,
     window: Window,
     workspace_id: i64,
     question: String,
@@ -109,31 +129,47 @@ pub fn assistant_ask_stream(
     atlas_utils::log_info!("[IPC] resolved intent = {resolved_intent:?}");
 
     atlas_utils::log_info!("[IPC] calling facade.chat_stream");
-    let result = facade.chat_stream(
-        WorkspaceId(workspace_id),
-        session_id.map(ChatSessionId),
-        &question,
-        resolved_intent,
-        images,
-        &request_id,
-        |chunk: &str| {
-            // TEMPORARY TRACE LOGGING
-            atlas_utils::log_info!("[IPC] chunk from facade, len={}", chunk.len());
-            // A stream chunk failing to emit is a UI/transport concern, not
-            // a reason to abort generation (§45.2: don't let a
-            // non-critical failure silently break the whole operation) --
-            // logged, not propagated.
-            if let Err(err) = window.emit(
-                "assistant://chunk",
-                StreamChunkPayload {
-                    session_id: session_id.unwrap_or(0),
-                    content: chunk.to_string(),
-                },
-            ) {
-                atlas_utils::log_warn!("failed to emit assistant://chunk: {err}");
-            }
-        },
-    );
+    let stream_window = window.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let facade = app_handle.state::<AppFacade>();
+        facade.chat_stream(
+            WorkspaceId(workspace_id),
+            session_id.map(ChatSessionId),
+            &question,
+            resolved_intent,
+            images,
+            &request_id,
+            |chunk: &str| {
+                // TEMPORARY TRACE LOGGING
+                atlas_utils::log_info!("[IPC] chunk from facade, len={}", chunk.len());
+                // A stream chunk failing to emit is a UI/transport concern, not
+                // a reason to abort generation (§45.2: don't let a
+                // non-critical failure silently break the whole operation) --
+                // logged, not propagated.
+                if let Err(err) = stream_window.emit(
+                    "assistant://chunk",
+                    StreamChunkPayload {
+                        session_id: session_id.unwrap_or(0),
+                        content: chunk.to_string(),
+                    },
+                ) {
+                    atlas_utils::log_warn!("failed to emit assistant://chunk: {err}");
+                }
+            },
+        )
+    })
+    .await
+    .unwrap_or_else(|join_err| {
+        // §45.1: a panic inside the blocking task is a system error, not
+        // silently swallowed or turned into a generic failure with no
+        // trace -- surfaced as a real `AppError` so the UI's error path
+        // (already wired below) handles it the same as any other failure.
+        Err(AppError::new(
+            atlas_utils::error::ErrorCode::EngineError,
+            atlas_utils::error::ErrorCategory::SystemError,
+            format!("assistant_ask_stream worker task panicked: {join_err}"),
+        ))
+    });
 
     // TEMPORARY TRACE LOGGING
     atlas_utils::log_info!(

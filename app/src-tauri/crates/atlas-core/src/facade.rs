@@ -386,7 +386,7 @@ impl AppFacade {
         // method's prior behavior exactly.
         let context: AssembledContext = self.context_builder.assemble(query, hits, self.context_builder.max_context_tokens())?;
         let citations = context.citations.clone();
-        let prompt = self.prompt_builder.build(context);
+        let prompt = self.prompt_builder.build(query, context);
         Ok((prompt.content, citations))
     }
 
@@ -723,11 +723,12 @@ impl AppFacade {
             .ok_or_else(|| AppError::model(format!("routing table has no answer-producing role for {intent:?}")))?;
         atlas_utils::log_info!("[Scheduler] terminal role = {terminal_role:?}");
 
-        let (prompt_content, prompt_images, citations) = if pipeline.contains(&EngineRole::Retriever) {
+        let (prompt_content, prompt_images, citations, retrieval_duration, context_build_duration, prompt_build_duration) = if pipeline.contains(&EngineRole::Retriever) {
             atlas_utils::log_info!("[Retriever] searching... workspace_id={} query_len={}", workspace_id.0, message.len());
             let __t_retr = std::time::Instant::now();
             let hits = self.retriever.retrieve(workspace_id, message, 5)?;
-            atlas_utils::log_info!("[Retriever] returned {} chunks elapsed={:?}", hits.len(), __t_retr.elapsed());
+            let retrieval_duration = __t_retr.elapsed();
+            atlas_utils::log_info!("[Retriever] returned {} chunks elapsed={:?}", hits.len(), retrieval_duration);
 
             // Fix 4 (P0 audit): the context budget must be derived from
             // the model actually resolved for this request's terminal
@@ -750,27 +751,34 @@ impl AppFacade {
             atlas_utils::log_info!("[ContextBuilder] entered with {} hits", hits.len());
             let __t_ctx = std::time::Instant::now();
             let context = self.context_builder.assemble(message, hits, model_context_length)?;
+            let context_build_duration = __t_ctx.elapsed();
             atlas_utils::log_info!(
                 "[ContextBuilder] exited hits_kept={} citations={} total_tokens={} elapsed={:?}",
                 context.hits.len(),
                 context.citations.len(),
                 context.total_tokens,
-                __t_ctx.elapsed()
+                context_build_duration
             );
 
             let citations = context.citations.clone();
             atlas_utils::log_info!("[PromptBuilder] entered");
             let __t_pb = std::time::Instant::now();
-            let resolved = self.prompt_builder.build(context);
+            // Root-cause fix (Part 1, prompt-quality audit): `message` --
+            // the user's actual question -- now reaches PromptBuilder.
+            // Previously only `context` was passed, so the model never
+            // received the question itself, which is why answers degraded
+            // into citation-dumps instead of explanations.
+            let resolved = self.prompt_builder.build(message, context);
+            let prompt_build_duration = __t_pb.elapsed();
             atlas_utils::log_info!(
                 "[PromptBuilder] prompt size = {} chars elapsed={:?}",
                 resolved.content.len(),
-                __t_pb.elapsed()
+                prompt_build_duration
             );
-            (resolved.content, images, citations)
+            (resolved.content, images, citations, Some(retrieval_duration), Some(context_build_duration), Some(prompt_build_duration))
         } else {
             atlas_utils::log_info!("[Scheduler] pipeline has no Retriever step -- skipping retrieval/context/prompt build");
-            (message.to_string(), images, Vec::new())
+            (message.to_string(), images, Vec::new(), None, None, None)
         };
 
         atlas_utils::log_info!("[ModelRegistry] resolving model for role {terminal_role:?}");
@@ -805,6 +813,7 @@ impl AppFacade {
         let mut full_content = String::new();
         let mut chunk_count = 0usize;
         let mut was_cancelled = false;
+        let mut first_token_duration: Option<std::time::Duration> = None;
         for chunk in stream {
             // Fix 6 (P1 audit): checked before consuming/forwarding each
             // chunk -- once `assistant_cancel(request_id)` has signalled
@@ -824,6 +833,7 @@ impl AppFacade {
             }
             let chunk = chunk?;
             if chunk_count == 0 {
+                first_token_duration = Some(__t_ollama.elapsed());
                 atlas_utils::log_info!("[OllamaProvider] first response chunk received elapsed={:?}", __t_ollama.elapsed());
             }
             if !chunk.content.is_empty() {
@@ -832,12 +842,13 @@ impl AppFacade {
                 chunk_count += 1;
             }
         }
+        let generation_duration = __t_ollama.elapsed();
         atlas_utils::log_info!(
             "[OllamaProvider] stream complete chunks={} total_chars={} cancelled={} elapsed={:?}",
             chunk_count,
             full_content.len(),
             was_cancelled,
-            __t_ollama.elapsed()
+            generation_duration
         );
 
         if was_cancelled {
@@ -870,6 +881,22 @@ impl AppFacade {
             engine_pipeline_used: Some(format!("{pipeline:?}")),
             created_at: atlas_utils::time::now_iso8601(),
         })?;
+
+        // Part 5 (latency audit): a single consolidated timing report per
+        // request, so a slow turn can be diagnosed from one log line
+        // instead of grepping several scattered `elapsed=` entries across
+        // the whole request. Retrieval/context/prompt-build durations are
+        // `None` when the pipeline has no Retriever step (e.g. a
+        // non-retrieval intent) rather than fabricated zeros.
+        atlas_utils::log_info!(
+            "[Timing Report] retrieval={:?} context_build={:?} prompt_build={:?} first_token={:?} generation_total={:?} request_total={:?}",
+            retrieval_duration,
+            context_build_duration,
+            prompt_build_duration,
+            first_token_duration,
+            generation_duration,
+            __t0.elapsed()
+        );
 
         atlas_utils::log_info!("[Facade] chat_stream exited OK elapsed={:?}", __t0.elapsed());
         Ok((session, assistant_message, citations))

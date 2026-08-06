@@ -150,7 +150,7 @@ impl ModelScheduler {
             };
             let context = self.context_builder.assemble(query, hits, model_context_length)?;
             let citations = context.citations.clone();
-            let mut resolved = self.prompt_builder.build(context);
+            let mut resolved = self.prompt_builder.build(query, context);
             resolved.images = images;
             atlas_utils::log_info!("[Scheduler] handing prompt to EnginePool.run_role({terminal_role:?})");
             let output = engines.run_role(terminal_role, resolved)?;

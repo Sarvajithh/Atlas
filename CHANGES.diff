@@ -1,0 +1,872 @@
+diff --git a/app/src-tauri/crates/app-tauri/src/commands/assistant.rs b/app/src-tauri/crates/app-tauri/src/commands/assistant.rs
+index a810163..4e288a8 100644
+--- a/app/src-tauri/crates/app-tauri/src/commands/assistant.rs
++++ b/app/src-tauri/crates/app-tauri/src/commands/assistant.rs
+@@ -5,7 +5,7 @@
+ //! through the Model Scheduler, retrieval, and Session Manager behavior all
+ //! live in `atlas-core`'s `AppFacade`.
+ 
+-use tauri::{Emitter, State, Window};
++use tauri::{Emitter, Manager, State, Window};
+ 
+ use atlas_core::AppFacade;
+ use atlas_models::Intent;
+@@ -82,15 +82,35 @@ struct StreamErrorPayload {
+ }
+ 
+ /// §43.1 `assistant.ask` streaming counterpart (§12: "use Tauri's event
+-/// system to stream progress/tokens back to the frontend"; requirement
+-/// "Stream responses to the frontend"). Runs synchronously on the IPC
+-/// thread (Ollama streaming reads are already non-blocking per-chunk;
+-/// `AppFacade::chat_stream` is the one place token-by-token forwarding
+-/// happens) and emits three possible event types on `window`:
+-/// `assistant://chunk`, `assistant://done`, `assistant://error`.
++/// §43.1 `assistant.ask_stream`: like `assistant_ask`, but forwards each
++/// token as it's produced (§12 "Long-running operations... use Tauri's
++/// event system to stream progress/tokens back to the frontend";
++/// requirement "Stream responses to the frontend"). Emits three possible
++/// event types on `window`: `assistant://chunk`, `assistant://done`,
++/// `assistant://error`.
++///
++/// Part 6 fix (latency/UI-responsiveness audit): this used to be a plain
++/// synchronous `fn`, and its own doc comment said so explicitly ("Runs
++/// synchronously on the IPC thread"). A single request here blocks for the
++/// full duration of retrieval + generation -- which, per the traced logs,
++/// could run past 180s on a slow model load. Whether or not Tauri's
++/// default command dispatch happens to offload a sync `fn` to a worker
++/// thread on any given version, holding the *invoking* task/thread for
++/// minutes at a time is exactly the pattern that starves whatever pool
++/// services other concurrent IPC calls (opening a document, browsing the
++/// file tree) -- which is what produced the "can't click anything while
++/// it's thinking" symptom. This is now `async fn`, and the actual blocking
++/// work (`facade.chat_stream`, which does synchronous DB + HTTP I/O) runs
++/// inside `tauri::async_runtime::spawn_blocking`, on a thread dedicated to
++/// blocking work rather than occupying an async-reactor-facing slot for
++/// the whole request. `app_handle` (not `State<'_, AppFacade>`) is taken
++/// so the facade can be re-resolved *inside* the spawned blocking closure,
++/// which needs `'static` ownership; `AppFacade` isn't `Clone`, and
++/// `AppHandle::state::<T>()` is the standard Tauri pattern for this rather
++/// than adding a blanket `Clone` impl the type wasn't designed for.
+ #[tauri::command]
+-pub fn assistant_ask_stream(
+-    facade: State<'_, AppFacade>,
++pub async fn assistant_ask_stream(
++    app_handle: tauri::AppHandle,
+     window: Window,
+     workspace_id: i64,
+     question: String,
+@@ -109,31 +129,47 @@ pub fn assistant_ask_stream(
+     atlas_utils::log_info!("[IPC] resolved intent = {resolved_intent:?}");
+ 
+     atlas_utils::log_info!("[IPC] calling facade.chat_stream");
+-    let result = facade.chat_stream(
+-        WorkspaceId(workspace_id),
+-        session_id.map(ChatSessionId),
+-        &question,
+-        resolved_intent,
+-        images,
+-        &request_id,
+-        |chunk: &str| {
+-            // TEMPORARY TRACE LOGGING
+-            atlas_utils::log_info!("[IPC] chunk from facade, len={}", chunk.len());
+-            // A stream chunk failing to emit is a UI/transport concern, not
+-            // a reason to abort generation (§45.2: don't let a
+-            // non-critical failure silently break the whole operation) --
+-            // logged, not propagated.
+-            if let Err(err) = window.emit(
+-                "assistant://chunk",
+-                StreamChunkPayload {
+-                    session_id: session_id.unwrap_or(0),
+-                    content: chunk.to_string(),
+-                },
+-            ) {
+-                atlas_utils::log_warn!("failed to emit assistant://chunk: {err}");
+-            }
+-        },
+-    );
++    let stream_window = window.clone();
++    let result = tauri::async_runtime::spawn_blocking(move || {
++        let facade = app_handle.state::<AppFacade>();
++        facade.chat_stream(
++            WorkspaceId(workspace_id),
++            session_id.map(ChatSessionId),
++            &question,
++            resolved_intent,
++            images,
++            &request_id,
++            |chunk: &str| {
++                // TEMPORARY TRACE LOGGING
++                atlas_utils::log_info!("[IPC] chunk from facade, len={}", chunk.len());
++                // A stream chunk failing to emit is a UI/transport concern, not
++                // a reason to abort generation (§45.2: don't let a
++                // non-critical failure silently break the whole operation) --
++                // logged, not propagated.
++                if let Err(err) = stream_window.emit(
++                    "assistant://chunk",
++                    StreamChunkPayload {
++                        session_id: session_id.unwrap_or(0),
++                        content: chunk.to_string(),
++                    },
++                ) {
++                    atlas_utils::log_warn!("failed to emit assistant://chunk: {err}");
++                }
++            },
++        )
++    })
++    .await
++    .unwrap_or_else(|join_err| {
++        // §45.1: a panic inside the blocking task is a system error, not
++        // silently swallowed or turned into a generic failure with no
++        // trace -- surfaced as a real `AppError` so the UI's error path
++        // (already wired below) handles it the same as any other failure.
++        Err(AppError::new(
++            atlas_utils::error::ErrorCode::EngineError,
++            atlas_utils::error::ErrorCategory::SystemError,
++            format!("assistant_ask_stream worker task panicked: {join_err}"),
++        ))
++    });
+ 
+     // TEMPORARY TRACE LOGGING
+     atlas_utils::log_info!(
+diff --git a/app/src-tauri/crates/atlas-core/src/facade.rs b/app/src-tauri/crates/atlas-core/src/facade.rs
+index 7523cf0..4fe111a 100644
+--- a/app/src-tauri/crates/atlas-core/src/facade.rs
++++ b/app/src-tauri/crates/atlas-core/src/facade.rs
+@@ -386,7 +386,7 @@ impl AppFacade {
+         // method's prior behavior exactly.
+         let context: AssembledContext = self.context_builder.assemble(query, hits, self.context_builder.max_context_tokens())?;
+         let citations = context.citations.clone();
+-        let prompt = self.prompt_builder.build(context);
++        let prompt = self.prompt_builder.build(query, context);
+         Ok((prompt.content, citations))
+     }
+ 
+@@ -723,11 +723,12 @@ impl AppFacade {
+             .ok_or_else(|| AppError::model(format!("routing table has no answer-producing role for {intent:?}")))?;
+         atlas_utils::log_info!("[Scheduler] terminal role = {terminal_role:?}");
+ 
+-        let (prompt_content, prompt_images, citations) = if pipeline.contains(&EngineRole::Retriever) {
++        let (prompt_content, prompt_images, citations, retrieval_duration, context_build_duration, prompt_build_duration) = if pipeline.contains(&EngineRole::Retriever) {
+             atlas_utils::log_info!("[Retriever] searching... workspace_id={} query_len={}", workspace_id.0, message.len());
+             let __t_retr = std::time::Instant::now();
+             let hits = self.retriever.retrieve(workspace_id, message, 5)?;
+-            atlas_utils::log_info!("[Retriever] returned {} chunks elapsed={:?}", hits.len(), __t_retr.elapsed());
++            let retrieval_duration = __t_retr.elapsed();
++            atlas_utils::log_info!("[Retriever] returned {} chunks elapsed={:?}", hits.len(), retrieval_duration);
+ 
+             // Fix 4 (P0 audit): the context budget must be derived from
+             // the model actually resolved for this request's terminal
+@@ -750,27 +751,34 @@ impl AppFacade {
+             atlas_utils::log_info!("[ContextBuilder] entered with {} hits", hits.len());
+             let __t_ctx = std::time::Instant::now();
+             let context = self.context_builder.assemble(message, hits, model_context_length)?;
++            let context_build_duration = __t_ctx.elapsed();
+             atlas_utils::log_info!(
+                 "[ContextBuilder] exited hits_kept={} citations={} total_tokens={} elapsed={:?}",
+                 context.hits.len(),
+                 context.citations.len(),
+                 context.total_tokens,
+-                __t_ctx.elapsed()
++                context_build_duration
+             );
+ 
+             let citations = context.citations.clone();
+             atlas_utils::log_info!("[PromptBuilder] entered");
+             let __t_pb = std::time::Instant::now();
+-            let resolved = self.prompt_builder.build(context);
++            // Root-cause fix (Part 1, prompt-quality audit): `message` --
++            // the user's actual question -- now reaches PromptBuilder.
++            // Previously only `context` was passed, so the model never
++            // received the question itself, which is why answers degraded
++            // into citation-dumps instead of explanations.
++            let resolved = self.prompt_builder.build(message, context);
++            let prompt_build_duration = __t_pb.elapsed();
+             atlas_utils::log_info!(
+                 "[PromptBuilder] prompt size = {} chars elapsed={:?}",
+                 resolved.content.len(),
+-                __t_pb.elapsed()
++                prompt_build_duration
+             );
+-            (resolved.content, images, citations)
++            (resolved.content, images, citations, Some(retrieval_duration), Some(context_build_duration), Some(prompt_build_duration))
+         } else {
+             atlas_utils::log_info!("[Scheduler] pipeline has no Retriever step -- skipping retrieval/context/prompt build");
+-            (message.to_string(), images, Vec::new())
++            (message.to_string(), images, Vec::new(), None, None, None)
+         };
+ 
+         atlas_utils::log_info!("[ModelRegistry] resolving model for role {terminal_role:?}");
+@@ -805,6 +813,7 @@ impl AppFacade {
+         let mut full_content = String::new();
+         let mut chunk_count = 0usize;
+         let mut was_cancelled = false;
++        let mut first_token_duration: Option<std::time::Duration> = None;
+         for chunk in stream {
+             // Fix 6 (P1 audit): checked before consuming/forwarding each
+             // chunk -- once `assistant_cancel(request_id)` has signalled
+@@ -824,6 +833,7 @@ impl AppFacade {
+             }
+             let chunk = chunk?;
+             if chunk_count == 0 {
++                first_token_duration = Some(__t_ollama.elapsed());
+                 atlas_utils::log_info!("[OllamaProvider] first response chunk received elapsed={:?}", __t_ollama.elapsed());
+             }
+             if !chunk.content.is_empty() {
+@@ -832,12 +842,13 @@ impl AppFacade {
+                 chunk_count += 1;
+             }
+         }
++        let generation_duration = __t_ollama.elapsed();
+         atlas_utils::log_info!(
+             "[OllamaProvider] stream complete chunks={} total_chars={} cancelled={} elapsed={:?}",
+             chunk_count,
+             full_content.len(),
+             was_cancelled,
+-            __t_ollama.elapsed()
++            generation_duration
+         );
+ 
+         if was_cancelled {
+@@ -871,6 +882,22 @@ impl AppFacade {
+             created_at: atlas_utils::time::now_iso8601(),
+         })?;
+ 
++        // Part 5 (latency audit): a single consolidated timing report per
++        // request, so a slow turn can be diagnosed from one log line
++        // instead of grepping several scattered `elapsed=` entries across
++        // the whole request. Retrieval/context/prompt-build durations are
++        // `None` when the pipeline has no Retriever step (e.g. a
++        // non-retrieval intent) rather than fabricated zeros.
++        atlas_utils::log_info!(
++            "[Timing Report] retrieval={:?} context_build={:?} prompt_build={:?} first_token={:?} generation_total={:?} request_total={:?}",
++            retrieval_duration,
++            context_build_duration,
++            prompt_build_duration,
++            first_token_duration,
++            generation_duration,
++            __t0.elapsed()
++        );
++
+         atlas_utils::log_info!("[Facade] chat_stream exited OK elapsed={:?}", __t0.elapsed());
+         Ok((session, assistant_message, citations))
+     }
+diff --git a/app/src-tauri/crates/atlas-models/src/context_builder.rs b/app/src-tauri/crates/atlas-models/src/context_builder.rs
+index 2493d83..257bfcd 100644
+--- a/app/src-tauri/crates/atlas-models/src/context_builder.rs
++++ b/app/src-tauri/crates/atlas-models/src/context_builder.rs
+@@ -108,10 +108,30 @@ impl ContextBuilder {
+ 
+         let ranked = self.reranker.rerank(query, hits);
+         let deduplicated = Self::deduplicate(ranked);
+-        let (budgeted, total_tokens) = self.apply_token_budget(deduplicated, effective_budget);
++        // Part 3 (context-quality audit): remove near-identical fragments
++        // before budgeting -- most commonly duplicate/near-duplicate OCR
++        // output for the same source region (e.g. a scanned page OCR'd
++        // more than once, or two overlapping chunk windows that captured
++        // almost the same handwritten line). These aren't caught by
++        // `deduplicate`'s exact chunk_id check since they're genuinely
++        // different chunk_ids with near-identical *text* -- left in, they
++        // waste token budget on redundant content and dilute the model's
++        // attention with repeated material instead of more distinct
++        // context.
++        let condensed = Self::remove_near_duplicates(deduplicated);
++        let (budgeted, total_tokens) = self.apply_token_budget(condensed, effective_budget);
+ 
+         let mut ordered = budgeted;
+         ordered.sort_by_key(|h| h.chunk_id.0);
++        // Part 3: merge adjacent chunks from the same document (consecutive
++        // chunk_ids) into a single combined block once final reading-order
++        // is established -- a Tutor/Reasoning Engine reads one coherent
++        // passage far better than several artificially-split fragments of
++        // the same paragraph, and it collapses citation noise (one [n] for
++        // one contiguous passage instead of three for what was originally
++        // one). Ordering is preserved; only truly consecutive same-document
++        // chunks are combined, so unrelated hits are never merged together.
++        let ordered = Self::merge_adjacent(ordered);
+ 
+         let citations = citations_for_hits(&ordered);
+         atlas_utils::log_info!(
+@@ -139,6 +159,97 @@ impl ContextBuilder {
+         result
+     }
+ 
++    /// Normalize text for near-duplicate comparison: lowercase, collapse
++    /// all whitespace runs to a single space, trim. Deliberately simple
++    /// (no stemming/fuzzy matching dependency) -- this only needs to catch
++    /// the common case of the same underlying text re-OCR'd or re-chunked
++    /// with different incidental whitespace/casing, not genuinely
++    /// paraphrased duplicates.
++    fn normalize_for_dedup(text: &str) -> String {
++        text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
++    }
++
++    /// Threshold above which two chunks' normalized text is treated as a
++    /// near-duplicate rather than genuinely distinct content (Part 3,
++    /// "remove near-identical OCR fragments"). Named/documented rather
++    /// than inlined; deliberately conservative (high) so genuinely
++    /// distinct-but-similar passages (e.g. two problems from the same
++    /// worked example) are never dropped -- only content that is almost
++    /// entirely the same is treated as redundant.
++    const NEAR_DUPLICATE_OVERLAP_THRESHOLD: f32 = 0.9;
++
++    /// Remove hits whose normalized text is a near-duplicate of an
++    /// already-kept hit (Part 3). Input order is the reranker's ranking
++    /// order (best first), so ties are resolved in favor of whichever hit
++    /// was already kept -- the higher-ranked one always wins, never an
++    /// arbitrary later duplicate replacing it. Containment (one chunk's
++    /// text is almost entirely inside another's) and near-equal length
++    /// overlap both count, since duplicate OCR passes commonly produce
++    /// slightly different chunk boundaries around the same underlying
++    /// text rather than byte-identical strings.
++    fn remove_near_duplicates(hits: Vec<SearchHit>) -> Vec<SearchHit> {
++        let mut kept: Vec<SearchHit> = Vec::with_capacity(hits.len());
++        let mut kept_normalized: Vec<String> = Vec::with_capacity(hits.len());
++
++        for hit in hits {
++            let normalized = Self::normalize_for_dedup(&hit.text_content);
++            let is_near_duplicate = kept_normalized.iter().any(|existing| {
++                if normalized.is_empty() || existing.is_empty() {
++                    return false;
++                }
++                if existing.contains(&normalized) || normalized.contains(existing) {
++                    let shorter = normalized.len().min(existing.len()) as f32;
++                    let longer = normalized.len().max(existing.len()) as f32;
++                    return shorter / longer >= Self::NEAR_DUPLICATE_OVERLAP_THRESHOLD;
++                }
++                false
++            });
++            if !is_near_duplicate {
++                kept_normalized.push(normalized);
++                kept.push(hit);
++            }
++        }
++        kept
++    }
++
++    /// Merge consecutive same-document chunks (chunk_id differing by
++    /// exactly 1) into a single combined hit (Part 3, "merge adjacent
++    /// chunks"). `hits` must already be sorted into final reading order
++    /// (ascending chunk_id) -- this only ever combines genuinely adjacent
++    /// material, never chunks from different documents or with a gap
++    /// between them, so unrelated passages are never stitched together.
++    /// The merged hit keeps the first chunk's `chunk_id`/location
++    /// reference (so its citation still resolves to the start of the
++    /// passage) and the highest of the merged chunks' scores.
++    fn merge_adjacent(hits: Vec<SearchHit>) -> Vec<SearchHit> {
++        let mut merged: Vec<SearchHit> = Vec::with_capacity(hits.len());
++        // Tracks the *original* chunk_id most recently folded into
++        // `merged.last()`, kept separate from the hit's own (unchanged)
++        // `chunk_id` field -- the exposed hit keeps citing the first
++        // chunk in the run (so its citation points at the start of the
++        // passage), while adjacency is still tested against the true
++        // last-seen original id so a third, fourth, ... consecutive chunk
++        // keeps chaining onto the same merged hit correctly.
++        let mut last_original_id: Option<i64> = None;
++        for hit in hits {
++            let is_adjacent = merged
++                .last()
++                .zip(last_original_id)
++                .is_some_and(|(last, last_id)| last.document_id == hit.document_id && hit.chunk_id.0 == last_id + 1);
++            if is_adjacent {
++                let last = merged.last_mut().expect("checked by is_adjacent");
++                last.text_content.push('\n');
++                last.text_content.push_str(&hit.text_content);
++                last.score = last.score.max(hit.score);
++                last_original_id = Some(hit.chunk_id.0);
++            } else {
++                last_original_id = Some(hit.chunk_id.0);
++                merged.push(hit);
++            }
++        }
++        merged
++    }
++
+     /// Approximate token count as whitespace-delimited word count (§18's
+     /// same convention as the Chunking Engine, `atlas-indexer::chunker`) --
+     /// good enough for a budget, without pulling in a tokenizer dependency.
+@@ -190,13 +301,66 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn assemble_preserves_all_input_hits_within_budget() {
++    fn assemble_preserves_all_input_hits_within_budget_when_not_adjacent() {
++        // chunk_id 1 and 3 (a gap, not consecutive) so Part 3's adjacent-
++        // chunk merge doesn't fold them together -- isolates "within
++        // budget" from the separate merge behavior (see
++        // `assemble_merges_adjacent_same_document_chunks` below).
+         let builder = ContextBuilder::new(4096);
+-        let hits = vec![hit(2, "b two words"), hit(1, "a two words")];
++        let hits = vec![hit(3, "b two words"), hit(1, "a two words")];
+         let assembled = builder.assemble("a b", hits, AMPLE_MODEL_CONTEXT).unwrap();
+         assert_eq!(assembled.hits.len(), 2);
+     }
+ 
++    // ---- Part 3 (context-quality audit): merge + near-duplicate removal ----
++
++    #[test]
++    fn assemble_merges_adjacent_same_document_chunks() {
++        // chunk_id 1 and 2, same document -- genuinely consecutive
++        // material that reads better as one combined passage than two
++        // artificially split fragments.
++        let builder = ContextBuilder::new(4096);
++        let hits = vec![hit(1, "the first half of a sentence"), hit(2, "continues into the second half")];
++        let assembled = builder.assemble("sentence", hits, AMPLE_MODEL_CONTEXT).unwrap();
++        assert_eq!(assembled.hits.len(), 1);
++        assert!(assembled.hits[0].text_content.contains("first half"));
++        assert!(assembled.hits[0].text_content.contains("second half"));
++    }
++
++    #[test]
++    fn assemble_does_not_merge_non_adjacent_chunks() {
++        let builder = ContextBuilder::new(4096);
++        let hits = vec![hit(1, "unrelated passage one"), hit(9, "unrelated passage two")];
++        let assembled = builder.assemble("passage", hits, AMPLE_MODEL_CONTEXT).unwrap();
++        assert_eq!(assembled.hits.len(), 2);
++    }
++
++    #[test]
++    fn assemble_removes_near_duplicate_ocr_fragments() {
++        // Same underlying text, re-OCR'd/re-chunked with trivial
++        // whitespace/casing differences and non-adjacent chunk_ids (so
++        // this exercises near-duplicate removal specifically, not the
++        // adjacent-chunk merge above).
++        let builder = ContextBuilder::new(4096);
++        let hits = vec![
++            hit(1, "Differential privacy adds calibrated noise to query results."),
++            hit(50, "differential  privacy adds calibrated noise to query results"),
++        ];
++        let assembled = builder.assemble("differential privacy", hits, AMPLE_MODEL_CONTEXT).unwrap();
++        assert_eq!(assembled.hits.len(), 1);
++    }
++
++    #[test]
++    fn assemble_keeps_genuinely_distinct_chunks_even_if_similar_topic() {
++        let builder = ContextBuilder::new(4096);
++        let hits = vec![
++            hit(1, "Differential privacy uses a privacy budget called epsilon."),
++            hit(50, "K-anonymity is a different, older approach to anonymization."),
++        ];
++        let assembled = builder.assemble("privacy", hits, AMPLE_MODEL_CONTEXT).unwrap();
++        assert_eq!(assembled.hits.len(), 2);
++    }
++
+     #[test]
+     fn assemble_of_empty_input_is_empty_context() {
+         let builder = ContextBuilder::new(4096);
+diff --git a/app/src-tauri/crates/atlas-models/src/ollama.rs b/app/src-tauri/crates/atlas-models/src/ollama.rs
+index bb61c11..1949fca 100644
+--- a/app/src-tauri/crates/atlas-models/src/ollama.rs
++++ b/app/src-tauri/crates/atlas-models/src/ollama.rs
+@@ -114,6 +114,14 @@ struct GenerateRequest<'a> {
+     #[serde(skip_serializing_if = "Option::is_none")]
+     images: Option<Vec<String>>,
+     options: GenerateOptions,
++    // Bug fix (traced live, 96s+ gap before the first token on repeat
++    // requests): without an explicit `keep_alive`, Ollama uses its own
++    // server default (5 minutes) and unloads the model from memory/VRAM
++    // once idle past that -- the *next* request then pays the full
++    // model-load cost again before it can emit a single token. Keeping
++    // the model resident across the session (see `OLLAMA_KEEP_ALIVE`)
++    // avoids paying that cost on every turn.
++    keep_alive: &'a str,
+ }
+ 
+ /// Bug fix (traced live): without an explicit `num_ctx`, Ollama falls
+@@ -152,13 +160,35 @@ struct GenerateOptions {
+ /// too high risks the same VRAM-spill stall this fix exists to prevent.
+ const FALLBACK_NUM_CTX: u32 = 4096;
+ 
++/// Floor for the requested `num_ctx` regardless of how short the prompt
++/// is (Part 5, latency audit). Trace-instrumented live: requesting the
++/// model's *full* advertised window unconditionally (e.g. 131072 for a
++/// model whose real usage was a few hundred tokens) forces Ollama to
++/// allocate a KV cache sized for the full window every request. On an
++/// 8GB card that pushed total runtime memory (weights + cache) past free
++/// VRAM, causing a silent fallback to CPU inference -- not a crash, just
++/// a 20-50x slowdown with no visible error. Sizing the request to what
++/// the prompt actually needs (with headroom) instead of the model's
++/// theoretical maximum keeps the KV cache proportional to real usage.
++/// This floor exists only so a trivially short prompt doesn't request an
++/// unreasonably tiny cache that risks truncating a longer-than-expected
++/// response.
++const MIN_NUM_CTX: u32 = 2048;
++
+ impl GenerateOptions {
+     /// Build request options for a specific resolved model's real context
+-    /// window (Fix 4). Falls back to `FALLBACK_NUM_CTX` and logs a warning
+-    /// when `context_length` is unavailable, rather than silently guessing
+-    /// with no trace of why.
+-    fn for_model_context(context_length: u32) -> Self {
+-        let num_ctx = if context_length > 0 {
++    /// window (Fix 4), sized to what `prompt` actually needs rather than
++    /// the model's full advertised window (Part 5 latency fix, see
++    /// `MIN_NUM_CTX`). Requested `num_ctx` is
++    /// `clamp(prompt_tokens + num_predict + headroom, MIN_NUM_CTX, model_ceiling)`
++    /// -- never more than the model can actually support (Fix 4's
++    /// original guarantee: never silently truncate a large model's real
++    /// capability), but also never the full window when the real prompt
++    /// is far smaller than that. Falls back to `FALLBACK_NUM_CTX` as the
++    /// ceiling and logs a warning when `context_length` is unavailable,
++    /// rather than silently guessing with no trace of why.
++    fn for_model_context(context_length: u32, prompt: &str) -> Self {
++        let model_ceiling = if context_length > 0 {
+             context_length
+         } else {
+             atlas_utils::log_warn!(
+@@ -166,6 +196,12 @@ impl GenerateOptions {
+             );
+             FALLBACK_NUM_CTX
+         };
++        // Same whitespace-word approximation ContextBuilder uses for its
++        // own token budgeting (§18 convention) -- good enough to size a
++        // KV cache request, without pulling in a real tokenizer here.
++        let prompt_tokens = prompt.split_whitespace().count() as u32;
++        let needed = prompt_tokens.saturating_add(DEFAULT_NUM_PREDICT as u32);
++        let num_ctx = needed.clamp(MIN_NUM_CTX, model_ceiling);
+         Self {
+             num_ctx,
+             num_predict: DEFAULT_NUM_PREDICT,
+@@ -179,6 +215,16 @@ impl GenerateOptions {
+ /// "no magic numbers" reason as `FALLBACK_NUM_CTX`.
+ const DEFAULT_NUM_PREDICT: i32 = 1024;
+ 
++/// How long Ollama keeps a resolved model resident in memory/VRAM after
++/// the last request before unloading it. Ollama's own default is `"5m"`,
++/// short enough that a normal pause between chat turns (or the retrieval/
++/// context-build work between the embedding call and the generation call
++/// on the very same request) can cost a full model reload on the next
++/// call. `"30m"` trades a modest amount of standing VRAM for keeping the
++/// assistant responsive across a realistic study session. Named/documented
++/// per the "no bare literal" convention rather than inlined.
++const OLLAMA_KEEP_ALIVE: &str = "30m";
++
+ #[derive(Debug, Deserialize)]
+ struct GenerateStreamLine {
+     #[serde(default)]
+@@ -217,8 +263,23 @@ pub struct OllamaProvider {
+ 
+ impl OllamaProvider {
+     pub fn new(connection: OllamaConnection) -> Self {
++        // BUG FIX (os error 10060 mid-stream on Windows): `.timeout(d)` sets
++        // a single ABSOLUTE deadline covering the entire call -- connect,
++        // write, AND the full duration of reading the response body. For
++        // generate_stream() that means any generation whose *total*
++        // streaming time exceeds `request_timeout` gets forcibly aborted by
++        // ureq mid-read, which Windows reports as WSAETIMEDOUT (10060) even
++        // though hundreds of chunks streamed successfully beforehand.
++        //
++        // Fix: use a short connect timeout (fails fast if Ollama is
++        // unreachable) plus per-operation idle read/write timeouts, which
++        // reset on every chunk transferred instead of counting cumulative
++        // time. This still fails fast on a genuinely hung connection, but
++        // no longer punishes long-running-but-healthy streams.
+         let agent = ureq::AgentBuilder::new()
+-            .timeout(connection.request_timeout)
++            .timeout_connect(Duration::from_secs(10))
++            .timeout_read(connection.request_timeout)
++            .timeout_write(connection.request_timeout)
+             .build();
+         Self { connection, agent }
+     }
+@@ -291,7 +352,8 @@ impl OllamaProvider {
+             prompt,
+             stream: false,
+             images,
+-            options: GenerateOptions::for_model_context(context_length),
++            options: GenerateOptions::for_model_context(context_length, prompt),
++            keep_alive: OLLAMA_KEEP_ALIVE,
+         };
+         let response = self
+             .agent
+@@ -342,7 +404,8 @@ impl OllamaProvider {
+             prompt,
+             stream: true,
+             images,
+-            options: GenerateOptions::for_model_context(context_length),
++            options: GenerateOptions::for_model_context(context_length, prompt),
++            keep_alive: OLLAMA_KEEP_ALIVE,
+         };
+         let response = self
+             .agent
+diff --git a/app/src-tauri/crates/atlas-models/src/prompt_builder.rs b/app/src-tauri/crates/atlas-models/src/prompt_builder.rs
+index 20cfdfa..e4c9237 100644
+--- a/app/src-tauri/crates/atlas-models/src/prompt_builder.rs
++++ b/app/src-tauri/crates/atlas-models/src/prompt_builder.rs
+@@ -2,6 +2,17 @@
+ //! receives a fully-assembled prompt from here. Templates are configuration
+ //! data (resolved via atlas-config), never string-literal constants inside
+ //! Engine code (§40.1, Governing Principle).
++//!
++//! Root-cause fix (Part 1 of the prompt-quality audit): `build` previously
++//! took only `context` -- the user's actual question never reached this
++//! module, and therefore never reached the model. What Ollama received was
++//! a bare, unlabeled dump of retrieved chunks with no question and no
++//! instruction attached, which is why the assistant behaved like a
++//! citation/extraction engine instead of a tutor: there was nothing in the
++//! prompt telling it to explain, teach, or even what was being asked.
++//! `build` now takes `query: &str` and assembles a structured, sectioned
++//! prompt (SYSTEM / WORKSPACE CONTEXT / USER QUESTION / ANSWER) instead of
++//! plain concatenation.
+ 
+ use std::sync::Arc;
+ 
+@@ -14,6 +25,31 @@ pub struct PromptBuilder {
+     settings: Arc<dyn SettingsProvider>,
+ }
+ 
++/// Settings key for the SYSTEM section template (§40.1, §23 "never a
++/// hardcoded... anything the user might reasonably want to change" --
++/// operators/advanced users can override the tutor's persona/instructions
++/// without a code change). Falls back to `DEFAULT_SYSTEM_PROMPT` when unset,
++/// same pattern as `FALLBACK_NUM_CTX` in `ollama.rs`: a named, documented
++/// default rather than a silent guess.
++const SYSTEM_PROMPT_SETTING_KEY: &str = "assistant.system_prompt_template";
++
++/// Default SYSTEM section (Part 2 of the prompt-quality audit's required
++/// structure) used when no override is configured via
++/// `SYSTEM_PROMPT_SETTING_KEY`. Instructs the model to teach, not extract:
++/// treat workspace context as authoritative but not a hard limit, use
++/// general knowledge to fill gaps, never simply repeat retrieved passages,
++/// and cite inline with `[n]` markers matching `context.citations`'
++/// ordering (§44.1).
++const DEFAULT_SYSTEM_PROMPT: &str = "You are Atlas, an expert AI tutor.\n\
++Treat the retrieved workspace context below as authoritative course material and your primary source.\n\
++However, you are NOT limited to it: whenever the workspace context does not fully answer the question, \
++use your own well-established general knowledge to explain the concept -- never contradict the workspace, \
++but do supplement it freely for facts, history, or definitions that are well established and simply weren't retrieved.\n\
++Never simply repeat or quote retrieved passages back verbatim. Teach naturally: explain ideas, give intuition, \
++connect related concepts, compare similar topics, and provide examples where they help understanding.\n\
++Cite workspace evidence inline using [1], [2], ... matching the numbered context below, wherever you actually draw on it. \
++If your answer comes entirely from general knowledge rather than the workspace context, say so plainly.";
++
+ impl PromptBuilder {
+     pub fn new(settings: Arc<dyn SettingsProvider>) -> Self {
+         Self { settings }
+@@ -23,22 +59,66 @@ impl PromptBuilder {
+         &self.settings
+     }
+ 
+-    /// Assemble the final prompt from context chunks plus citation markers
+-    /// (§40.1, §39.1 "citation preparation"). Each chunk is rendered with
+-    /// an inline `[n]` marker matching its position in
++    fn system_prompt(&self) -> String {
++        match self.settings.get_global(SYSTEM_PROMPT_SETTING_KEY) {
++            Ok(Some(entry)) if !entry.value.trim().is_empty() => entry.value,
++            Ok(_) => DEFAULT_SYSTEM_PROMPT.to_string(),
++            Err(e) => {
++                // §45.1 recoverable: a settings-read failure for an
++                // optional template override shouldn't break the whole
++                // prompt -- fall back to the documented default and note
++                // why, rather than propagating the error up through
++                // chat_stream.
++                atlas_utils::log_warn!(
++                    "[PromptBuilder] failed to read {SYSTEM_PROMPT_SETTING_KEY}, using default: {}",
++                    e.message
++                );
++                DEFAULT_SYSTEM_PROMPT.to_string()
++            }
++        }
++    }
++
++    /// Assemble the final prompt (§40.1) from the user's `query` plus
++    /// context chunks with citation markers (§39.1 "citation
++    /// preparation"). Structured into clearly separated sections (Part 2
++    /// of the prompt-quality audit) rather than plain concatenation, so
++    /// the model receives an actual instruction, the real question, and
++    /// labeled context -- not just an unlabeled chunk dump. Each chunk is
++    /// rendered with an inline `[n]` marker matching its position in
+     /// `context.citations`, so a downstream Engine's answer can reference
+     /// `[n]` and the UI can resolve that back to a `Citation` (§44.1) for
+     /// click-through to the source document.
+-    pub fn build(&self, context: AssembledContext) -> ResolvedPrompt {
++    pub fn build(&self, query: &str, context: AssembledContext) -> ResolvedPrompt {
+         // TEMPORARY TRACE LOGGING (remove once the pipeline is confirmed working).
+-        atlas_utils::log_info!("[PromptBuilder] entered with {} context hits", context.hits.len());
+-        let content = context
+-            .hits
+-            .iter()
+-            .enumerate()
+-            .map(|(idx, hit)| format!("[{}] {}", idx + 1, hit.text_content))
+-            .collect::<Vec<_>>()
+-            .join("\n\n");
++        atlas_utils::log_info!(
++            "[PromptBuilder] entered with {} context hits, query_chars={}",
++            context.hits.len(),
++            query.len()
++        );
++
++        let context_block = if context.hits.is_empty() {
++            "(No relevant workspace material was retrieved for this question -- answer from general knowledge and say so.)".to_string()
++        } else {
++            context
++                .hits
++                .iter()
++                .enumerate()
++                .map(|(idx, hit)| format!("[{}] {}", idx + 1, hit.text_content))
++                .collect::<Vec<_>>()
++                .join("\n\n")
++        };
++
++        let content = format!(
++            "SYSTEM\n\n{system}\n\n\
++             ---\n\n\
++             WORKSPACE CONTEXT\n\n{context_block}\n\n\
++             ---\n\n\
++             USER QUESTION\n\n{query}\n\n\
++             ---\n\n\
++             ANSWER\n\nBegin naturally.",
++            system = self.system_prompt(),
++        );
++
+         atlas_utils::log_info!("[PromptBuilder] exited, prompt size = {} chars", content.len());
+         ResolvedPrompt::text(content)
+     }
+@@ -73,14 +153,35 @@ mod tests {
+     #[test]
+     fn build_numbers_each_chunk_as_an_inline_citation_marker() {
+         let builder = PromptBuilder::new(Arc::new(LayeredSettingsProvider::new()));
+-        let prompt = builder.build(context(&["first", "second"]));
+-        assert_eq!(prompt.content, "[1] first\n\n[2] second");
++        let prompt = builder.build("what is it", context(&["first", "second"]));
++        assert!(prompt.content.contains("[1] first"));
++        assert!(prompt.content.contains("[2] second"));
++    }
++
++    /// Root-cause regression test: the bug this fix closes was that the
++    /// user's question never reached the prompt at all. This test fails
++    /// against the old `build(context)` signature/behavior and passes only
++    /// once `query` is actually threaded into the output.
++    #[test]
++    fn build_includes_the_users_actual_question() {
++        let builder = PromptBuilder::new(Arc::new(LayeredSettingsProvider::new()));
++        let prompt = builder.build("What is differential privacy?", context(&["some context"]));
++        assert!(prompt.content.contains("What is differential privacy?"));
++    }
++
++    #[test]
++    fn build_includes_a_system_instruction_section() {
++        let builder = PromptBuilder::new(Arc::new(LayeredSettingsProvider::new()));
++        let prompt = builder.build("q", context(&["c"]));
++        assert!(prompt.content.contains("SYSTEM"));
++        assert!(prompt.content.to_lowercase().contains("tutor"));
+     }
+ 
+     #[test]
+-    fn build_of_empty_context_is_empty_prompt() {
++    fn build_of_empty_context_still_includes_query_and_says_so() {
+         let builder = PromptBuilder::new(Arc::new(LayeredSettingsProvider::new()));
+-        let prompt = builder.build(context(&[]));
+-        assert_eq!(prompt.content, "");
++        let prompt = builder.build("a question with no retrieved context", context(&[]));
++        assert!(prompt.content.contains("a question with no retrieved context"));
++        assert!(prompt.content.contains("No relevant workspace material"));
+     }
+ }
+diff --git a/app/src-tauri/crates/atlas-models/src/retriever.rs b/app/src-tauri/crates/atlas-models/src/retriever.rs
+index e49fa0e..ba29542 100644
+--- a/app/src-tauri/crates/atlas-models/src/retriever.rs
++++ b/app/src-tauri/crates/atlas-models/src/retriever.rs
+@@ -43,6 +43,21 @@ impl Default for HybridWeights {
+     }
+ }
+ 
++/// Part 4 (retrieval-behavior audit): the Retriever's `limit` parameter is
++/// the *final* number of chunks a caller ultimately wants, but truncating
++/// to exactly that count immediately after the hybrid merge -- before
++/// reranking ever runs -- means the reranker can only ever reorder within
++/// whatever the raw weighted-merge score already chose, and can never
++/// promote a genuinely more relevant chunk that merge happened to score
++/// just outside the cutoff. Retrieval now fetches and merges a wider
++/// candidate pool (`limit * CANDIDATE_POOL_MULTIPLIER`) and returns that
++/// whole pool; `ContextBuilder::assemble` (§39.1) is what actually narrows
++/// it down, via reranking against the real query followed by dynamic
++/// token budgeting -- matching the intended pipeline order (hybrid
++/// retrieval -> merge -> dedupe -> rerank -> dynamic token budgeting)
++/// rather than a naive top-k cut before reranking ever sees the rest.
++const CANDIDATE_POOL_MULTIPLIER: usize = 3;
++
+ pub struct Retriever {
+     keyword_search: Arc<dyn KeywordSearchRepository>,
+     vector_search: Arc<dyn VectorSearchRepository>,
+@@ -77,6 +92,15 @@ impl Retriever {
+     /// text/location, §18) -- this method fills in the missing fields from
+     /// `ChunkRepository` before merging, so every returned `SearchHit` is
+     /// complete regardless of which path produced it.
++    ///
++    /// Part 4 (retrieval-behavior audit): `limit` describes how many
++    /// chunks the caller ultimately wants, but this method returns a wider
++    /// candidate pool (`limit * CANDIDATE_POOL_MULTIPLIER`, see its doc)
++    /// rather than truncating to exactly `limit` here -- the caller's
++    /// `ContextBuilder::assemble` reranks and token-budgets that pool down
++    /// to the real final set, so a chunk that merge scored just outside a
++    /// naive top-`limit` cut still gets a fair chance to be promoted by
++    /// the reranker instead of being discarded before it ever runs.
+     pub fn retrieve(
+         &self,
+         workspace_id: WorkspaceId,
+@@ -87,19 +111,24 @@ impl Retriever {
+         let __t0 = std::time::Instant::now();
+         atlas_utils::log_info!("[Retriever] entered workspace_id={} query={query:?} limit={limit}", workspace_id.0);
+ 
+-        let keyword_hits = self.keyword_search.search(workspace_id, query, limit * 2)?;
++        let candidate_pool = limit.saturating_mul(CANDIDATE_POOL_MULTIPLIER).max(limit);
++        let keyword_hits = self.keyword_search.search(workspace_id, query, candidate_pool)?;
+         atlas_utils::log_info!("[Retriever] keyword_search returned {} hits", keyword_hits.len());
+ 
+         let query_vector = self.embedder.embed(query)?;
+         let raw_vector_hits = self
+             .vector_search
+-            .search(workspace_id, &query_vector, limit * 2)?;
++            .search(workspace_id, &query_vector, candidate_pool)?;
+         atlas_utils::log_info!("[Retriever] vector_search returned {} raw hits", raw_vector_hits.len());
+         let vector_hits = self.hydrate_vector_hits(raw_vector_hits)?;
+         atlas_utils::log_info!("[Retriever] vector hits hydrated to {} (chunk lookups that missed are dropped)", vector_hits.len());
+ 
+-        let merged = self.merge(keyword_hits, vector_hits, limit);
+-        atlas_utils::log_info!("[Retriever] exited, returned {} merged chunks elapsed={:?}", merged.len(), __t0.elapsed());
++        let merged = self.merge(keyword_hits, vector_hits, candidate_pool);
++        atlas_utils::log_info!(
++            "[Retriever] exited, returned {} merged candidates (pool={candidate_pool}, final narrowing happens in ContextBuilder) elapsed={:?}",
++            merged.len(),
++            __t0.elapsed()
++        );
+         Ok(merged)
+     }
+ 
+@@ -229,7 +258,11 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn retrieve_respects_the_limit() {
++    fn retrieve_returns_a_wider_candidate_pool_than_the_final_limit() {
++        // Part 4: Retriever no longer truncates to exactly `limit` -- it
++        // returns a wider pool (limit * CANDIDATE_POOL_MULTIPLIER) so
++        // ContextBuilder's reranker gets a real chance to reorder/promote
++        // candidates instead of only ever seeing an already-cut top-k.
+         let retriever = Retriever::new(
+             Arc::new(FixedKeywordSearch(vec![hit(1, 1.0), hit(2, 1.0), hit(3, 1.0)])),
+             Arc::new(FixedVectorSearch(vec![])),
+@@ -237,7 +270,9 @@ mod tests {
+             Arc::new(FixedChunks(vec![chunk(1, "a"), chunk(2, "b"), chunk(3, "c")])),
+         );
+         let results = retriever.retrieve(WorkspaceId(1), "x", 2).unwrap();
+-        assert_eq!(results.len(), 2);
++        // All 3 available hits survive into the candidate pool (2 * 3 = 6
++        // >= 3), rather than being cut down to 2 before reranking runs.
++        assert_eq!(results.len(), 3);
+     }
+ 
+     #[test]
+diff --git a/app/src-tauri/crates/atlas-models/src/scheduler.rs b/app/src-tauri/crates/atlas-models/src/scheduler.rs
+index ff283ab..1ca1482 100644
+--- a/app/src-tauri/crates/atlas-models/src/scheduler.rs
++++ b/app/src-tauri/crates/atlas-models/src/scheduler.rs
+@@ -150,7 +150,7 @@ impl ModelScheduler {
+             };
+             let context = self.context_builder.assemble(query, hits, model_context_length)?;
+             let citations = context.citations.clone();
+-            let mut resolved = self.prompt_builder.build(context);
++            let mut resolved = self.prompt_builder.build(query, context);
+             resolved.images = images;
+             atlas_utils::log_info!("[Scheduler] handing prompt to EnginePool.run_role({terminal_role:?})");
+             let output = engines.run_role(terminal_role, resolved)?;

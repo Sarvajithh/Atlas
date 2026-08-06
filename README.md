@@ -20,7 +20,7 @@ construction, Ollama-backed chat/tutoring with streaming, a folder watcher
 with incremental indexing, and a working React/Tauri frontend shell with
 IPC wiring for workspaces, documents, and the assistant.
 
-**Estimated overall completion toward the Atlas v1.0 vision: ~48%.**
+**Estimated overall completion toward the Atlas v1.0 vision: ~55%.**
 See "Completed Features," "Remaining Atlas v1.0 Work," and "Known
 Limitations & Technical Debt" below for the itemized breakdown this
 estimate is based on.
@@ -79,6 +79,12 @@ inferred from comments or prior documentation.
   (`atlas-models::citation`)
 - Background job queue + worker for indexing (`atlas-indexer::job_queue`,
   `atlas-core::worker`)
+- **Global Search** (§9): hybrid keyword+vector search across the active
+  workspace or all workspaces, reusing the existing `Retriever` and
+  `Reranker` as-is (`AppFacade::search_global`), exposed via the
+  `search_global` IPC command and reachable from the running shell (a
+  discoverable "Search everything…" entry in `TopNav`, `Ctrl/Cmd+K`) — see
+  Changelog
 
 ### AI System
 - Model Registry with role-based discovery (`atlas-models::registry`,
@@ -120,10 +126,6 @@ inferred from comments or prior documentation.
 items independently re-verified as already done above.)*
 
 ### High priority
-- **Global Search** — required by the architecture contract's navigation
-  flow (§9); no unified hybrid-search IPC command or frontend surface
-  exists yet, despite the underlying retrieval/reranking machinery being
-  reusable for it.
 - **Concept Graph construction/extraction logic** — the crate currently
   contains only repository interfaces and injected-dependency scaffolding;
   its own code comment explicitly states extraction logic is "deferred to
@@ -206,33 +208,96 @@ items independently re-verified as already done above.)*
 | Document System | ~55% |
 | Knowledge Ingestion | ~60% |
 | AI System (core chat) | ~65% |
-| RAG | ~55% |
+| RAG | ~60% |
 | Learning | ~20% |
 | Research | ~10% |
-| UI (shell + navigation) | ~50% |
+| UI (shell + navigation) | ~55% |
 | Performance | ~45% |
-| **Overall** | **~48%** |
+| **Overall** | **~55%** |
 
 ---
 
 ## Configuration
 
-No new configuration surfaces beyond what already exists in
-`atlas-config`/Settings (e.g. `assistant.system_prompt_template`) have been
-added as part of this audit. See `app/docs/README.md` for the frozen
-settings/configuration model.
+- `search.default_limit` (global, integer, defaults to `20` — see
+  `DEFAULT_SEARCH_LIMIT` in `atlas-core::facade`): the number of Global
+  Search results returned when the `search_global` IPC command's `limit`
+  argument is omitted. Follows the same settings-key-with-documented-
+  fallback pattern as `assistant.system_prompt_template`.
+
+No other new configuration surfaces beyond what already existed in
+`atlas-config`/Settings have been added. See `app/docs/README.md` for the
+frozen settings/configuration model.
 
 ## Benchmarks
 
-No new benchmark numbers were produced by this audit (documentation-only
-pass; no code was modified). See `SUMMARY.md` for the most recent
-prompt-quality/latency benchmark predictions, which have not been
-independently re-verified against a live Ollama instance in this
+No new benchmark numbers were produced by this pass. See `SUMMARY.md` for
+the most recent prompt-quality/latency benchmark predictions, which have
+not been independently re-verified against a live Ollama instance in this
 environment.
 
 ## Changelog
 
-- **[Frontend navigation pass, this entry]** — Wired the 5 previously
+- **[Global Search, this entry]** — Implemented §9's Global Search: hybrid
+  keyword+vector search across the active workspace or all workspaces.
+  - `atlas-core::facade`: added `AppFacade::search_global(query,
+    workspace_id: Option<WorkspaceId>, limit: Option<usize>)`. Distinct
+    from the pre-existing `AppFacade::search` (which builds a RAG prompt
+    for `rag_search` and was left untouched) — this returns a flat,
+    display-ready ranked list instead. Reuses the existing `Retriever`
+    (hybrid keyword+vector merge) and `Reranker` exactly as they already
+    worked; no second scoring mechanism was introduced. `workspace_id =
+    None` means "All": every `Active`/`Indexing` workspace is queried and
+    the combined candidate pool is reranked together (not reranked
+    per-workspace then concatenated, which would leave scores
+    incomparable across workspaces). Added a `documents:
+    Arc<dyn DocumentRepository>` field to `AppFacade` (cloned from the
+    same repository instance `IndexingPipeline` already owns) to resolve
+    each hit's document path for display.
+  - `atlas-types::retrieval`: added the `GlobalSearchResult` DTO
+    (document_id, workspace_id, workspace_name, chunk_id, relative_path,
+    snippet, location_ref, score).
+  - New `app-tauri/src/commands/search.rs` — `search_global` IPC command
+    (thin passthrough to the facade, per §26/§46.4), registered in
+    `main.rs`.
+  - Result-limit default is settings-driven (`search.default_limit`, see
+    "Configuration" above), not hardcoded, per §23.
+  - Frontend: new `ipc/search.ts` (`searchGlobal`), a new
+    `GlobalSearchOverlay` component (debounced query-as-you-type, a
+    Workspace/All-workspaces scope toggle, selecting a result navigates to
+    it as a document tab), a "Search everything…" entry point in `TopNav`
+    per §8.1's Title Bar spec, and a `Ctrl/Cmd+K` shortcut wired in
+    `App.tsx`. `state/store.ts` gained `isGlobalSearchOpen` /
+    `setGlobalSearchOpen`, following the exact pattern already used for
+    `isAssistantPanelOpen`.
+  - Selecting a result reuses the existing `openTab`/`document-view`
+    navigation path — `DocumentView` itself is still the pre-existing stub
+    (§8.2.2, out of scope here) and does not yet read `activeDocumentId`,
+    so opening a result switches to Document View and sets the right
+    workspace/document context, but the reader pane itself doesn't render
+    per-document content yet; that gap is tracked under Document System,
+    not silently implied fixed here.
+  - No mock/sample results anywhere — `GlobalSearchOverlay` only ever
+    renders what `search_global` actually returns.
+  - Added `components/__tests__/GlobalSearchOverlay.test.tsx` (5 tests:
+    closed-by-default, no IPC call until a query is typed, real
+    IPC-round-trip results rendering, result selection navigates + closes
+    the overlay, default scope follows the active workspace). Full
+    existing frontend suite (`npx vitest run`) passes, 38/38, no
+    regressions. `npx tsc --noEmit` is clean.
+  - **Not independently verified**: `cargo build`/`cargo test` for the
+    Rust changes. This sandbox's available `cargo`/`rustc` (installed via
+    `apt`, 1.75) is too old for this workspace's `Cargo.lock` (lockfile
+    v4) and dependency tree (a transitive dependency requires
+    edition2024), and installing a newer toolchain via `rustup` was not
+    possible under this environment's network allowlist (rustup's
+    download domains aren't on it). The original `Cargo.lock` was left
+    untouched. The Rust changes were reviewed carefully by hand
+    (types, imports, struct-literal field wiring, trait bounds) but that
+    is not a substitute for an actual compile — flagging this honestly
+    rather than claiming a build pass that didn't happen.
+
+- **[Frontend navigation pass]** — Wired the 5 previously
   built-but-unreachable views into the shell (`ConceptGraphView`,
   `ResearchMode`, `QuizExamMode`, `MemoryAnalyticsView`, `DocumentView`),
   no new feature logic behind any of them:

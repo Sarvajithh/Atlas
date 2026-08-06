@@ -8,6 +8,7 @@ pub mod memory;
 pub mod graph;
 pub mod settings;
 pub mod rag;
+pub mod search;
 pub mod ocr;
 pub mod document;
 pub mod bookmark;

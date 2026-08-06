@@ -101,6 +101,18 @@ export interface Citation {
   snippet: string;
 }
 
+/** Mirrors backend `GlobalSearchResult` (§9 Global Search, `search.global`). */
+export interface GlobalSearchResult {
+  document_id: number;
+  workspace_id: number;
+  workspace_name: string;
+  chunk_id: number;
+  relative_path: string;
+  snippet: string;
+  location_ref: string;
+  score: number;
+}
+
 /** Mirrors backend `AssistantAnswer` (`assistant.ask` response). */
 export interface AssistantAnswer {
   session_id: number;

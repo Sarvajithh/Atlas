@@ -1,0 +1,907 @@
+diff --git a/README.md b/README.md
+index d673e01..cc68665 100644
+--- a/README.md
++++ b/README.md
+@@ -20,7 +20,7 @@ construction, Ollama-backed chat/tutoring with streaming, a folder watcher
+ with incremental indexing, and a working React/Tauri frontend shell with
+ IPC wiring for workspaces, documents, and the assistant.
+ 
+-**Estimated overall completion toward the Atlas v1.0 vision: ~48%.**
++**Estimated overall completion toward the Atlas v1.0 vision: ~55%.**
+ See "Completed Features," "Remaining Atlas v1.0 Work," and "Known
+ Limitations & Technical Debt" below for the itemized breakdown this
+ estimate is based on.
+@@ -79,6 +79,12 @@ inferred from comments or prior documentation.
+   (`atlas-models::citation`)
+ - Background job queue + worker for indexing (`atlas-indexer::job_queue`,
+   `atlas-core::worker`)
++- **Global Search** (§9): hybrid keyword+vector search across the active
++  workspace or all workspaces, reusing the existing `Retriever` and
++  `Reranker` as-is (`AppFacade::search_global`), exposed via the
++  `search_global` IPC command and reachable from the running shell (a
++  discoverable "Search everything…" entry in `TopNav`, `Ctrl/Cmd+K`) — see
++  Changelog
+ 
+ ### AI System
+ - Model Registry with role-based discovery (`atlas-models::registry`,
+@@ -120,10 +126,6 @@ inferred from comments or prior documentation.
+ items independently re-verified as already done above.)*
+ 
+ ### High priority
+-- **Global Search** — required by the architecture contract's navigation
+-  flow (§9); no unified hybrid-search IPC command or frontend surface
+-  exists yet, despite the underlying retrieval/reranking machinery being
+-  reusable for it.
+ - **Concept Graph construction/extraction logic** — the crate currently
+   contains only repository interfaces and injected-dependency scaffolding;
+   its own code comment explicitly states extraction logic is "deferred to
+@@ -206,33 +208,96 @@ items independently re-verified as already done above.)*
+ | Document System | ~55% |
+ | Knowledge Ingestion | ~60% |
+ | AI System (core chat) | ~65% |
+-| RAG | ~55% |
++| RAG | ~60% |
+ | Learning | ~20% |
+ | Research | ~10% |
+-| UI (shell + navigation) | ~50% |
++| UI (shell + navigation) | ~55% |
+ | Performance | ~45% |
+-| **Overall** | **~48%** |
++| **Overall** | **~55%** |
+ 
+ ---
+ 
+ ## Configuration
+ 
+-No new configuration surfaces beyond what already exists in
+-`atlas-config`/Settings (e.g. `assistant.system_prompt_template`) have been
+-added as part of this audit. See `app/docs/README.md` for the frozen
+-settings/configuration model.
++- `search.default_limit` (global, integer, defaults to `20` — see
++  `DEFAULT_SEARCH_LIMIT` in `atlas-core::facade`): the number of Global
++  Search results returned when the `search_global` IPC command's `limit`
++  argument is omitted. Follows the same settings-key-with-documented-
++  fallback pattern as `assistant.system_prompt_template`.
++
++No other new configuration surfaces beyond what already existed in
++`atlas-config`/Settings have been added. See `app/docs/README.md` for the
++frozen settings/configuration model.
+ 
+ ## Benchmarks
+ 
+-No new benchmark numbers were produced by this audit (documentation-only
+-pass; no code was modified). See `SUMMARY.md` for the most recent
+-prompt-quality/latency benchmark predictions, which have not been
+-independently re-verified against a live Ollama instance in this
++No new benchmark numbers were produced by this pass. See `SUMMARY.md` for
++the most recent prompt-quality/latency benchmark predictions, which have
++not been independently re-verified against a live Ollama instance in this
+ environment.
+ 
+ ## Changelog
+ 
+-- **[Frontend navigation pass, this entry]** — Wired the 5 previously
++- **[Global Search, this entry]** — Implemented §9's Global Search: hybrid
++  keyword+vector search across the active workspace or all workspaces.
++  - `atlas-core::facade`: added `AppFacade::search_global(query,
++    workspace_id: Option<WorkspaceId>, limit: Option<usize>)`. Distinct
++    from the pre-existing `AppFacade::search` (which builds a RAG prompt
++    for `rag_search` and was left untouched) — this returns a flat,
++    display-ready ranked list instead. Reuses the existing `Retriever`
++    (hybrid keyword+vector merge) and `Reranker` exactly as they already
++    worked; no second scoring mechanism was introduced. `workspace_id =
++    None` means "All": every `Active`/`Indexing` workspace is queried and
++    the combined candidate pool is reranked together (not reranked
++    per-workspace then concatenated, which would leave scores
++    incomparable across workspaces). Added a `documents:
++    Arc<dyn DocumentRepository>` field to `AppFacade` (cloned from the
++    same repository instance `IndexingPipeline` already owns) to resolve
++    each hit's document path for display.
++  - `atlas-types::retrieval`: added the `GlobalSearchResult` DTO
++    (document_id, workspace_id, workspace_name, chunk_id, relative_path,
++    snippet, location_ref, score).
++  - New `app-tauri/src/commands/search.rs` — `search_global` IPC command
++    (thin passthrough to the facade, per §26/§46.4), registered in
++    `main.rs`.
++  - Result-limit default is settings-driven (`search.default_limit`, see
++    "Configuration" above), not hardcoded, per §23.
++  - Frontend: new `ipc/search.ts` (`searchGlobal`), a new
++    `GlobalSearchOverlay` component (debounced query-as-you-type, a
++    Workspace/All-workspaces scope toggle, selecting a result navigates to
++    it as a document tab), a "Search everything…" entry point in `TopNav`
++    per §8.1's Title Bar spec, and a `Ctrl/Cmd+K` shortcut wired in
++    `App.tsx`. `state/store.ts` gained `isGlobalSearchOpen` /
++    `setGlobalSearchOpen`, following the exact pattern already used for
++    `isAssistantPanelOpen`.
++  - Selecting a result reuses the existing `openTab`/`document-view`
++    navigation path — `DocumentView` itself is still the pre-existing stub
++    (§8.2.2, out of scope here) and does not yet read `activeDocumentId`,
++    so opening a result switches to Document View and sets the right
++    workspace/document context, but the reader pane itself doesn't render
++    per-document content yet; that gap is tracked under Document System,
++    not silently implied fixed here.
++  - No mock/sample results anywhere — `GlobalSearchOverlay` only ever
++    renders what `search_global` actually returns.
++  - Added `components/__tests__/GlobalSearchOverlay.test.tsx` (5 tests:
++    closed-by-default, no IPC call until a query is typed, real
++    IPC-round-trip results rendering, result selection navigates + closes
++    the overlay, default scope follows the active workspace). Full
++    existing frontend suite (`npx vitest run`) passes, 38/38, no
++    regressions. `npx tsc --noEmit` is clean.
++  - **Not independently verified**: `cargo build`/`cargo test` for the
++    Rust changes. This sandbox's available `cargo`/`rustc` (installed via
++    `apt`, 1.75) is too old for this workspace's `Cargo.lock` (lockfile
++    v4) and dependency tree (a transitive dependency requires
++    edition2024), and installing a newer toolchain via `rustup` was not
++    possible under this environment's network allowlist (rustup's
++    download domains aren't on it). The original `Cargo.lock` was left
++    untouched. The Rust changes were reviewed carefully by hand
++    (types, imports, struct-literal field wiring, trait bounds) but that
++    is not a substitute for an actual compile — flagging this honestly
++    rather than claiming a build pass that didn't happen.
++
++- **[Frontend navigation pass]** — Wired the 5 previously
+   built-but-unreachable views into the shell (`ConceptGraphView`,
+   `ResearchMode`, `QuizExamMode`, `MemoryAnalyticsView`, `DocumentView`),
+   no new feature logic behind any of them:
+diff --git a/app/src-tauri/crates/app-tauri/src/commands/mod.rs b/app/src-tauri/crates/app-tauri/src/commands/mod.rs
+index 7738441..5808d5d 100644
+--- a/app/src-tauri/crates/app-tauri/src/commands/mod.rs
++++ b/app/src-tauri/crates/app-tauri/src/commands/mod.rs
+@@ -8,6 +8,7 @@ pub mod memory;
+ pub mod graph;
+ pub mod settings;
+ pub mod rag;
++pub mod search;
+ pub mod ocr;
+ pub mod document;
+ pub mod bookmark;
+diff --git a/app/src-tauri/crates/app-tauri/src/commands/search.rs b/app/src-tauri/crates/app-tauri/src/commands/search.rs
+new file mode 100644
+index 0000000..036609c
+--- /dev/null
++++ b/app/src-tauri/crates/app-tauri/src/commands/search.rs
+@@ -0,0 +1,28 @@
++//! `search.*` namespace (§9, §43.1): Global Search exposed to the UI.
++//! Handlers only validate/forward/map errors (§26, §46.4) -- hybrid
++//! retrieval, reranking, and cross-workspace merging all live in
++//! `atlas-core`'s `AppFacade::search_global` (via `atlas-models`).
++
++use tauri::State;
++
++use atlas_core::AppFacade;
++use atlas_types::ids::WorkspaceId;
++use atlas_types::retrieval::GlobalSearchResult;
++use atlas_utils::AppError;
++
++/// Run Global Search (§9) for `query`, either scoped to `workspace_id` or,
++/// when `workspace_id` is omitted, across every active workspace. Matches
++/// the architecture doc's `search_global(query, scope: Workspace|All,
++/// limit)` shape -- `scope` is expressed here as `workspace_id: Option<i64>`
++/// (`Some` = Workspace, `None` = All) rather than a separate tagged enum,
++/// since that's the minimum information the facade actually needs and
++/// keeps the IPC argument shape simple or the frontend to construct.
++#[tauri::command]
++pub fn search_global(
++    facade: State<'_, AppFacade>,
++    query: String,
++    workspace_id: Option<i64>,
++    limit: Option<usize>,
++) -> Result<Vec<GlobalSearchResult>, AppError> {
++    facade.search_global(&query, workspace_id.map(WorkspaceId), limit)
++}
+diff --git a/app/src-tauri/crates/app-tauri/src/main.rs b/app/src-tauri/crates/app-tauri/src/main.rs
+index a0ba507..1e9cfb3 100644
+--- a/app/src-tauri/crates/app-tauri/src/main.rs
++++ b/app/src-tauri/crates/app-tauri/src/main.rs
+@@ -43,6 +43,7 @@ fn main() {
+             commands::settings::settings_set,
+             commands::rag::rag_search,
+             commands::rag::rag_get_context,
++            commands::search::search_global,
+             commands::ocr::ocr_reprocess,
+             commands::document::document_list,
+             commands::document::document_get,
+diff --git a/app/src-tauri/crates/atlas-core/src/facade.rs b/app/src-tauri/crates/atlas-core/src/facade.rs
+index 4fe111a..b4f316f 100644
+--- a/app/src-tauri/crates/atlas-core/src/facade.rs
++++ b/app/src-tauri/crates/atlas-core/src/facade.rs
+@@ -24,6 +24,7 @@ use atlas_db::settings_adapter::SqliteSettingsProvider;
+ use atlas_db::workspace_adapter::SqliteWorkspaceRepository;
+ use atlas_events::EventBus;
+ use atlas_graph::GraphEngine;
++use atlas_indexer::document_repository::DocumentRepository;
+ use atlas_indexer::job_queue::JobQueue;
+ use atlas_indexer::ocr::TesseractCliOcrEngine;
+ use atlas_indexer::parser::default_parser_selector;
+@@ -33,12 +34,14 @@ use atlas_memory::{ChatRepository, MemoryEngine};
+ use atlas_models::context_builder::AssembledContext;
+ use atlas_models::{
+     ContextBuilder, EnginePool, Intent, ModelDiscoveryService, ModelRegistryRepository, ModelScheduler,
+-    OllamaConnection, OllamaEmbeddingEngine, OllamaEngine, OllamaProvider, PromptBuilder, Retriever, RoutingTable,
++    OllamaConnection, OllamaEmbeddingEngine, OllamaEngine, OllamaProvider, PromptBuilder, Reranker, Retriever,
++    RoutingTable,
+ };
+ use atlas_types::chat::{ChatMessage, ChatMode, ChatRole, ChatSession};
+ use atlas_types::ids::{ChatSessionId, WorkspaceId};
+ use atlas_types::model::EngineRole;
+-use atlas_types::retrieval::Citation;
++use atlas_types::retrieval::{Citation, GlobalSearchResult};
++use atlas_types::workspace::WorkspaceStatus;
+ use atlas_utils::AppError;
+ use atlas_vector::VectorDbEmbeddingRepository;
+ use atlas_watcher::FolderWatcher;
+@@ -48,6 +51,16 @@ use crate::cancellation::{CancellationRegistry, RegisteredRequest};
+ use crate::state::AppState;
+ use crate::worker::IndexingWorker;
+ 
++/// Settings key for Global Search's default result limit (§9), following
++/// the same named-settings-key pattern as
++/// `PromptBuilder::SYSTEM_PROMPT_SETTING_KEY`.
++const SEARCH_DEFAULT_LIMIT_SETTING_KEY: &str = "search.default_limit";
++/// Documented fallback used when `SEARCH_DEFAULT_LIMIT_SETTING_KEY` is
++/// unset or fails to parse as a `usize`.
++const DEFAULT_SEARCH_LIMIT: usize = 20;
++/// Max characters kept in a Global Search result's display snippet.
++const SEARCH_SNIPPET_MAX_CHARS: usize = 240;
++
+ /// The default Intent -> Engine-role routing table (§15's illustrative
+ /// pipelines). Kept as ordinary constructed data, not a `const`/hardcoded
+ /// match in the Scheduler itself, so a future Settings-driven override
+@@ -103,6 +116,12 @@ pub struct AppFacade {
+     retriever: Arc<Retriever>,
+     context_builder: Arc<ContextBuilder>,
+     prompt_builder: Arc<PromptBuilder>,
++    /// Global Search (§9): resolves `SearchHit.document_id` back to a
++    /// document's `relative_path` for display. The same
++    /// `SqliteDocumentRepository` instance `indexing_pipeline` owns --
++    /// cloned before being moved into `IndexingPipeline::new` below --
++    /// not a second connection or a duplicate implementation.
++    documents: Arc<dyn DocumentRepository>,
+     /// Phase 4 (§14.1 Engines Module, §15 Model Scheduler, §37 Model
+     /// Registry, §37.1 Model Discovery). `engine_pool` holds the concrete
+     /// Ollama-backed Engines for every inference-bearing role the default
+@@ -226,6 +245,7 @@ impl AppFacade {
+             Arc::new(TesseractCliOcrEngine::default()),
+         ));
+ 
++        let documents: Arc<dyn DocumentRepository> = document_repository.clone();
+         let indexing_pipeline = Arc::new(IndexingPipeline::new(
+             document_repository,
+             chunk_repository.clone(),
+@@ -279,6 +299,7 @@ impl AppFacade {
+             retriever,
+             context_builder,
+             prompt_builder,
++            documents,
+             ollama,
+             engine_pool,
+             scheduler,
+@@ -390,6 +411,122 @@ impl AppFacade {
+         Ok((prompt.content, citations))
+     }
+ 
++    /// Global Search (architecture doc §9): hybrid keyword + vector search
++    /// scoped to either one workspace or all of them, exposed to the UI as
++    /// a flat ranked list of results rather than an assembled RAG prompt
++    /// (that's `search` above, which stays untouched -- this is a
++    /// deliberately separate method, not an extension of it, since the two
++    /// have different return shapes and different callers: `rag.*` wants a
++    /// prompt + citations, Global Search wants display-ready hits).
++    ///
++    /// Reuses the existing `Retriever` (hybrid keyword+vector merge, §18)
++    /// and `Reranker` (§18) exactly as `search` does -- no second scoring
++    /// mechanism is introduced. `workspace_id = None` means "All"
++    /// (cross-workspace, §9): every `Active` or `Indexing` workspace (has
++    /// real, at-least-partially-indexed content; `Unlinked`/`Linking`/
++    /// `Archived` do not) is queried and the results are merged into one
++    /// combined ranking.
++    pub fn search_global(
++        &self,
++        query: &str,
++        workspace_id: Option<WorkspaceId>,
++        limit: Option<usize>,
++    ) -> Result<Vec<GlobalSearchResult>, AppError> {
++        let limit = limit.unwrap_or_else(|| self.default_search_limit());
++
++        let workspaces = match workspace_id {
++            Some(id) => match self.workspace_engine.get(id)? {
++                Some(workspace) => vec![workspace],
++                None => Vec::new(),
++            },
++            None => self
++                .workspace_engine
++                .list()?
++                .into_iter()
++                .filter(|w| matches!(w.status, WorkspaceStatus::Active | WorkspaceStatus::Indexing))
++                .collect(),
++        };
++
++        // Run retrieval per-workspace (Retriever's hybrid merge, §18, is
++        // scoped to a single workspace -- there is no cross-workspace
++        // index to query directly), tracking which workspace/name each hit
++        // came from since that's lost once everything is flattened into
++        // one list for reranking below.
++        let mut origin: HashMap<i64, (WorkspaceId, String)> = HashMap::new();
++        let mut candidates: Vec<atlas_types::retrieval::SearchHit> = Vec::new();
++        for workspace in &workspaces {
++            let hits = self.retriever.retrieve(workspace.id, query, limit)?;
++            for hit in hits {
++                origin.insert(hit.chunk_id.0, (workspace.id, workspace.display_name.clone()));
++                candidates.push(hit);
++            }
++        }
++
++        // One shared Reranker (§18) scores the whole cross-workspace
++        // candidate pool against the query -- not a per-workspace rerank
++        // followed by a naive score concatenation, which would leave
++        // workspace-relative scores incomparable against each other.
++        let reranked = Reranker::new().rerank(query, candidates);
++
++        let mut results = Vec::with_capacity(reranked.len().min(limit));
++        for hit in reranked.into_iter().take(limit) {
++            let Some((workspace_id, workspace_name)) = origin.get(&hit.chunk_id.0).cloned() else {
++                continue;
++            };
++            let relative_path = self
++                .documents
++                .find_by_id(hit.document_id)?
++                .map(|document| document.relative_path)
++                .unwrap_or_else(|| "(document not found)".to_string());
++            results.push(GlobalSearchResult {
++                document_id: hit.document_id,
++                workspace_id,
++                workspace_name,
++                chunk_id: hit.chunk_id,
++                relative_path,
++                snippet: Self::search_snippet(&hit.text_content),
++                location_ref: hit.page_or_location_ref,
++                score: hit.score,
++            });
++        }
++        Ok(results)
++    }
++
++    /// Settings-driven default for `search_global`'s `limit` when the
++    /// caller doesn't pass one explicitly (§23: "never a hardcoded...
++    /// anything the user might reasonably want to change") -- same
++    /// resolve-from-settings-with-a-named-fallback pattern
++    /// `PromptBuilder::system_prompt` uses for
++    /// `SYSTEM_PROMPT_SETTING_KEY`/`DEFAULT_SYSTEM_PROMPT`.
++    fn default_search_limit(&self) -> usize {
++        match self.settings.get_global(SEARCH_DEFAULT_LIMIT_SETTING_KEY) {
++            Ok(Some(entry)) => entry.value.parse::<usize>().unwrap_or(DEFAULT_SEARCH_LIMIT),
++            Ok(None) => DEFAULT_SEARCH_LIMIT,
++            Err(e) => {
++                // §45.1 recoverable, same reasoning as
++                // `PromptBuilder::system_prompt`: an optional-setting read
++                // failure shouldn't fail the whole search.
++                atlas_utils::log_warn!(
++                    "[AppFacade::search_global] failed to read {SEARCH_DEFAULT_LIMIT_SETTING_KEY}, using default: {}",
++                    e.message
++                );
++                DEFAULT_SEARCH_LIMIT
++            }
++        }
++    }
++
++    /// Trims a chunk's full text down to a short display snippet for
++    /// search results (full chunk text is meant for RAG context, not a
++    /// results-list row). Truncates on a char boundary so multi-byte UTF-8
++    /// text is never split mid-character.
++    fn search_snippet(text: &str) -> String {
++        if text.chars().count() <= SEARCH_SNIPPET_MAX_CHARS {
++            return text.to_string();
++        }
++        let truncated: String = text.chars().take(SEARCH_SNIPPET_MAX_CHARS).collect();
++        format!("{truncated}…")
++    }
++
+     /// Link a folder (§6) and start watching it (§21: initial scan +
+     /// incremental watch), all through the facade so `app-tauri` never
+     /// reaches past this single surface (§46.3, §46.4). This is the
+diff --git a/app/src-tauri/crates/atlas-types/src/retrieval.rs b/app/src-tauri/crates/atlas-types/src/retrieval.rs
+index c51f70f..e6c705c 100644
+--- a/app/src-tauri/crates/atlas-types/src/retrieval.rs
++++ b/app/src-tauri/crates/atlas-types/src/retrieval.rs
+@@ -20,6 +20,24 @@ pub struct SearchHit {
+     pub score: f32,
+ }
+ 
++/// One ranked result from Global Search (§9, §43.1 `search.global`): unlike
++/// `SearchHit` (an internal retrieval candidate scoped to a single
++/// workspace), this is the display-ready shape the frontend renders and
++/// navigates from -- it carries which workspace the hit came from (needed
++/// for cross-workspace "All" scope, §9) and the document's `relative_path`
++/// so a result can be shown/opened without a second round-trip.
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct GlobalSearchResult {
++    pub document_id: DocumentId,
++    pub workspace_id: crate::ids::WorkspaceId,
++    pub workspace_name: String,
++    pub chunk_id: ChunkId,
++    pub relative_path: String,
++    pub snippet: String,
++    pub location_ref: String,
++    pub score: f32,
++}
++
+ /// A citation pointing back into a source document (§39.1, §44.1), attached
+ /// to assembled context so an eventual answer can cite its sources.
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+diff --git a/app/src/App.tsx b/app/src/App.tsx
+index fa5ed76..fdf7a69 100644
+--- a/app/src/App.tsx
++++ b/app/src/App.tsx
+@@ -6,6 +6,7 @@ import { TopNav } from "@/components/TopNav";
+ import { Tabs } from "@/components/Tabs";
+ import { SplitView } from "@/components/SplitView";
+ import { Toaster } from "@/components/Toaster";
++import { GlobalSearchOverlay } from "@/components/GlobalSearchOverlay";
+ import { ErrorBoundary } from "@/components/ErrorBoundary";
+ import { StatusBar } from "@/panels/StatusBar";
+ import { AssistantPanel } from "@/panels/AssistantPanel";
+@@ -29,10 +30,12 @@ import { useThemeStore } from "@/state/theme";
+  * Keyboard Shortcuts (partial, scoped to what this milestone implements):
+  *   Ctrl/Cmd+B        toggle sidebar-adjacent assistant panel
+  *   Ctrl/Cmd+\        toggle split view
++ *   Ctrl/Cmd+K        open Global Search (§9)
+  * A full Command Palette (Ctrl+Shift+P) is out of scope for this pass --
+  * it needs a registry of real, wired commands to be meaningful, and most
+- * of the commands it would list (search, document actions) depend on IPC
+- * surfaces (`document.*`, global search) that don't exist yet.
++ * of the commands it would list (document actions, etc.) depend on IPC
++ * surfaces (`document.*`) that don't exist yet. Global Search itself is
++ * now wired (§9), separately from that palette.
+  */
+ export function App() {
+   const currentView = useAppStore((s) => s.currentView);
+@@ -41,6 +44,7 @@ export function App() {
+   const setAssistantPanelOpen = useAppStore((s) => s.setAssistantPanelOpen);
+   const isSplitViewOpen = useAppStore((s) => s.isSplitViewOpen);
+   const setSplitViewOpen = useAppStore((s) => s.setSplitViewOpen);
++  const setGlobalSearchOpen = useAppStore((s) => s.setGlobalSearchOpen);
+   const hydrateTheme = useThemeStore((s) => s.hydrate);
+   const setWorkspaces = useAppStore((s) => s.setWorkspaces);
+   const setWorkspacesLoading = useAppStore((s) => s.setWorkspacesLoading);
+@@ -72,11 +76,14 @@ export function App() {
+       } else if (e.key === "\\") {
+         e.preventDefault();
+         setSplitViewOpen(!isSplitViewOpen);
++      } else if (e.key === "k") {
++        e.preventDefault();
++        setGlobalSearchOpen(true);
+       }
+     }
+     window.addEventListener("keydown", onKeyDown);
+     return () => window.removeEventListener("keydown", onKeyDown);
+-  }, [isAssistantPanelOpen, isSplitViewOpen, setAssistantPanelOpen, setSplitViewOpen]);
++  }, [isAssistantPanelOpen, isSplitViewOpen, setAssistantPanelOpen, setSplitViewOpen, setGlobalSearchOpen]);
+ 
+   let mainContent;
+   if (currentView === "settings") {
+@@ -115,6 +122,7 @@ export function App() {
+       </div>
+       <StatusBar />
+       <Toaster />
++      <GlobalSearchOverlay />
+     </div>
+   );
+ }
+diff --git a/app/src/components/GlobalSearchOverlay.tsx b/app/src/components/GlobalSearchOverlay.tsx
+new file mode 100644
+index 0000000..09d3bf9
+--- /dev/null
++++ b/app/src/components/GlobalSearchOverlay.tsx
+@@ -0,0 +1,192 @@
++import { useEffect, useMemo, useState } from "react";
++
++import { searchGlobal } from "@/ipc/search";
++import type { GlobalSearchResult } from "@/ipc/types";
++import { useAppStore } from "@/state/store";
++
++/**
++ * Global Search overlay (§9, §8.1's Title Bar "search"). Hybrid
++ * keyword+vector search, reranked, over either the active workspace or
++ * every workspace -- every result comes from a real `search_global` IPC
++ * round-trip against real indexed data, no mock/sample results (§9).
++ *
++ * Debounced query-as-you-type, like the rest of the app's IPC-backed
++ * lists (§13): this is a thin view over backend state, not a second
++ * source of truth.
++ */
++export function GlobalSearchOverlay() {
++  const isOpen = useAppStore((s) => s.isGlobalSearchOpen);
++  const setOpen = useAppStore((s) => s.setGlobalSearchOpen);
++  const activeWorkspaceId = useAppStore((s) => s.activeWorkspaceId);
++  const workspaces = useAppStore((s) => s.workspaces);
++  const setActiveWorkspaceId = useAppStore((s) => s.setActiveWorkspaceId);
++  const setActiveDocumentId = useAppStore((s) => s.setActiveDocumentId);
++  const openTab = useAppStore((s) => s.openTab);
++
++  const [query, setQuery] = useState("");
++  const [scope, setScope] = useState<"workspace" | "all">(activeWorkspaceId !== null ? "workspace" : "all");
++  const [results, setResults] = useState<GlobalSearchResult[]>([]);
++  const [isSearching, setIsSearching] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++
++  const activeWorkspace = useMemo(
++    () => workspaces.find((w) => w.id === activeWorkspaceId) ?? null,
++    [workspaces, activeWorkspaceId],
++  );
++
++  // Reset transient state each time the overlay is (re)opened, so a
++  // previous search doesn't linger stale behind a fresh Ctrl/Cmd+K.
++  useEffect(() => {
++    if (isOpen) {
++      setQuery("");
++      setResults([]);
++      setError(null);
++      setScope(activeWorkspaceId !== null ? "workspace" : "all");
++    }
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [isOpen]);
++
++  useEffect(() => {
++    if (!isOpen) return;
++    const trimmed = query.trim();
++    if (trimmed.length === 0) {
++      setResults([]);
++      setError(null);
++      return;
++    }
++    const workspaceId = scope === "workspace" ? (activeWorkspaceId ?? undefined) : undefined;
++    let cancelled = false;
++    setIsSearching(true);
++    const handle = window.setTimeout(() => {
++      searchGlobal({ query: trimmed, workspaceId })
++        .then((hits) => {
++          if (cancelled) return;
++          setResults(hits);
++          setError(null);
++        })
++        .catch((err) => {
++          if (cancelled) return;
++          setError(err instanceof Error ? err.message : String(err));
++        })
++        .finally(() => {
++          if (!cancelled) setIsSearching(false);
++        });
++    }, 250);
++    return () => {
++      cancelled = true;
++      window.clearTimeout(handle);
++    };
++  }, [isOpen, query, scope, activeWorkspaceId]);
++
++  useEffect(() => {
++    if (!isOpen) return;
++    function onKeyDown(e: KeyboardEvent) {
++      if (e.key === "Escape") {
++        e.preventDefault();
++        setOpen(false);
++      }
++    }
++    window.addEventListener("keydown", onKeyDown);
++    return () => window.removeEventListener("keydown", onKeyDown);
++  }, [isOpen, setOpen]);
++
++  if (!isOpen) return null;
++
++  function openResult(result: GlobalSearchResult) {
++    setActiveWorkspaceId(result.workspace_id);
++    setActiveDocumentId(result.document_id);
++    openTab({
++      id: `document:${result.document_id}`,
++      title: result.relative_path,
++      view: "document-view",
++      workspaceId: result.workspace_id,
++    });
++    setOpen(false);
++  }
++
++  return (
++    <div
++      role="dialog"
++      aria-modal="true"
++      aria-label="Global search"
++      className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 pt-24"
++      onClick={() => setOpen(false)}
++    >
++      <div
++        className="w-full max-w-xl rounded-lg border bg-card shadow-lg"
++        onClick={(e) => e.stopPropagation()}
++      >
++        <div className="flex items-center gap-2 border-b p-3">
++          <input
++            autoFocus
++            type="text"
++            value={query}
++            onChange={(e) => setQuery(e.target.value)}
++            placeholder="Search documents..."
++            aria-label="Search query"
++            className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
++          />
++          <div className="flex items-center gap-1 text-xs">
++            <button
++              type="button"
++              aria-pressed={scope === "workspace"}
++              disabled={activeWorkspaceId === null}
++              onClick={() => setScope("workspace")}
++              title={
++                activeWorkspaceId === null
++                  ? "Open a workspace to search just that workspace"
++                  : `Search only ${activeWorkspace?.display_name ?? "this workspace"}`
++              }
++              className="rounded px-2 py-1 hover:bg-accent aria-[pressed=true]:bg-accent disabled:opacity-40"
++            >
++              This workspace
++            </button>
++            <button
++              type="button"
++              aria-pressed={scope === "all"}
++              onClick={() => setScope("all")}
++              title="Search every workspace"
++              className="rounded px-2 py-1 hover:bg-accent aria-[pressed=true]:bg-accent"
++            >
++              All workspaces
++            </button>
++          </div>
++        </div>
++
++        <div className="max-h-96 overflow-auto p-1">
++          {error ? (
++            <p className="p-3 text-sm text-destructive">{error}</p>
++          ) : query.trim().length === 0 ? (
++            <p className="p-3 text-sm text-muted-foreground">Type to search indexed documents.</p>
++          ) : isSearching && results.length === 0 ? (
++            <p className="p-3 text-sm text-muted-foreground">Searching…</p>
++          ) : results.length === 0 ? (
++            <p className="p-3 text-sm text-muted-foreground">No results for "{query.trim()}".</p>
++          ) : (
++            <ul>
++              {results.map((result) => (
++                <li key={`${result.document_id}-${result.chunk_id}`}>
++                  <button
++                    type="button"
++                    onClick={() => openResult(result)}
++                    className="flex w-full flex-col items-start gap-0.5 rounded px-3 py-2 text-left hover:bg-accent"
++                  >
++                    <span className="flex w-full items-center justify-between gap-2 text-sm font-medium">
++                      <span className="truncate">{result.relative_path}</span>
++                      {scope === "all" ? (
++                        <span className="shrink-0 text-xs font-normal text-muted-foreground">
++                          {result.workspace_name}
++                        </span>
++                      ) : null}
++                    </span>
++                    <span className="line-clamp-2 text-xs text-muted-foreground">{result.snippet}</span>
++                  </button>
++                </li>
++              ))}
++            </ul>
++          )}
++        </div>
++      </div>
++    </div>
++  );
++}
+diff --git a/app/src/components/TopNav.tsx b/app/src/components/TopNav.tsx
+index f554dfe..5eab61c 100644
+--- a/app/src/components/TopNav.tsx
++++ b/app/src/components/TopNav.tsx
+@@ -35,6 +35,7 @@ export function TopNav() {
+   const setAssistantPanelOpen = useAppStore((s) => s.setAssistantPanelOpen);
+   const isSplitViewOpen = useAppStore((s) => s.isSplitViewOpen);
+   const setSplitViewOpen = useAppStore((s) => s.setSplitViewOpen);
++  const setGlobalSearchOpen = useAppStore((s) => s.setGlobalSearchOpen);
+   const theme = useThemeStore((s) => s.theme);
+   const setTheme = useThemeStore((s) => s.setTheme);
+ 
+@@ -58,6 +59,16 @@ export function TopNav() {
+         <span aria-hidden>/</span>
+         <span className="text-foreground">{crumb}</span>
+       </div>
++      <button
++        type="button"
++        onClick={() => setGlobalSearchOpen(true)}
++        title="Search (Ctrl/Cmd+K)"
++        className="flex items-center gap-2 rounded border px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
++      >
++        <span aria-hidden>🔍</span>
++        <span>Search everything…</span>
++        <kbd className="rounded border px-1 text-[10px]">⌘K</kbd>
++      </button>
+       {showModeSwitcher ? (
+         <nav aria-label="Workspace modes" className="flex items-center gap-1">
+           <button
+diff --git a/app/src/components/__tests__/GlobalSearchOverlay.test.tsx b/app/src/components/__tests__/GlobalSearchOverlay.test.tsx
+new file mode 100644
+index 0000000..cad0b8c
+--- /dev/null
++++ b/app/src/components/__tests__/GlobalSearchOverlay.test.tsx
+@@ -0,0 +1,93 @@
++import { describe, expect, it, vi, beforeEach } from "vitest";
++import { render, screen, waitFor } from "@testing-library/react";
++import userEvent from "@testing-library/user-event";
++
++vi.mock("@tauri-apps/api/core", () => ({
++  invoke: vi.fn(),
++}));
++
++import { invoke } from "@tauri-apps/api/core";
++import { GlobalSearchOverlay } from "@/components/GlobalSearchOverlay";
++import { useAppStore } from "@/state/store";
++import type { GlobalSearchResult } from "@/ipc/types";
++
++function makeResult(overrides: Partial<GlobalSearchResult> = {}): GlobalSearchResult {
++  return {
++    document_id: 1,
++    workspace_id: 1,
++    workspace_name: "Test Workspace",
++    chunk_id: 10,
++    relative_path: "notes/chapter1.md",
++    snippet: "...matching text...",
++    location_ref: "p.1",
++    score: 0.9,
++    ...overrides,
++  };
++}
++
++describe("GlobalSearchOverlay", () => {
++  beforeEach(() => {
++    vi.mocked(invoke).mockReset();
++    useAppStore.setState({
++      isGlobalSearchOpen: false,
++      activeWorkspaceId: null,
++      activeDocumentId: null,
++      workspaces: [],
++      tabs: [],
++      activeTabId: null,
++      currentView: "dashboard",
++    });
++  });
++
++  it("renders nothing when closed", () => {
++    render(<GlobalSearchOverlay />);
++    expect(screen.queryByLabelText("Global search")).toBeNull();
++  });
++
++  it("does not call search_global until the user types a query", () => {
++    useAppStore.setState({ isGlobalSearchOpen: true });
++    render(<GlobalSearchOverlay />);
++    expect(screen.getByLabelText("Global search")).toBeTruthy();
++    expect(invoke).not.toHaveBeenCalled();
++  });
++
++  it("searches and renders real results from the IPC round-trip, no mock data baked into the component", async () => {
++    useAppStore.setState({ isGlobalSearchOpen: true });
++    vi.mocked(invoke).mockResolvedValueOnce([makeResult()]);
++    const user = userEvent.setup();
++    render(<GlobalSearchOverlay />);
++
++    await user.type(screen.getByLabelText("Search query"), "photosynthesis");
++
++    await waitFor(() => expect(invoke).toHaveBeenCalledWith("search_global", expect.objectContaining({ query: "photosynthesis" })));
++    await waitFor(() => expect(screen.getByText("notes/chapter1.md")).toBeTruthy());
++  });
++
++  it("navigates to the selected result's document and closes the overlay", async () => {
++    useAppStore.setState({ isGlobalSearchOpen: true });
++    vi.mocked(invoke).mockResolvedValueOnce([makeResult()]);
++    const user = userEvent.setup();
++    render(<GlobalSearchOverlay />);
++
++    await user.type(screen.getByLabelText("Search query"), "photosynthesis");
++    await waitFor(() => expect(screen.getByText("notes/chapter1.md")).toBeTruthy());
++    await user.click(screen.getByText("notes/chapter1.md"));
++
++    expect(useAppStore.getState().activeDocumentId).toBe(1);
++    expect(useAppStore.getState().activeWorkspaceId).toBe(1);
++    expect(useAppStore.getState().isGlobalSearchOpen).toBe(false);
++  });
++
++  it("scopes the query to the active workspace by default when one is open", async () => {
++    useAppStore.setState({ isGlobalSearchOpen: true, activeWorkspaceId: 7 });
++    vi.mocked(invoke).mockResolvedValueOnce([]);
++    const user = userEvent.setup();
++    render(<GlobalSearchOverlay />);
++
++    await user.type(screen.getByLabelText("Search query"), "notes");
++
++    await waitFor(() =>
++      expect(invoke).toHaveBeenCalledWith("search_global", expect.objectContaining({ workspaceId: 7 })),
++    );
++  });
++});
+diff --git a/app/src/ipc/search.ts b/app/src/ipc/search.ts
+new file mode 100644
+index 0000000..a1140f7
+--- /dev/null
++++ b/app/src/ipc/search.ts
+@@ -0,0 +1,26 @@
++import { ipcInvoke } from "@/ipc/client";
++import type { GlobalSearchResult } from "@/ipc/types";
++
++/**
++ * `search.*` namespace (§9 Global Search, §43.1). Thin typed wrapper over
++ * the backend `search_global` Tauri command
++ * (`app-tauri/src/commands/search.rs`), which forwards straight to
++ * `AppFacade::search_global` -- hybrid keyword+vector retrieval, reranked,
++ * scoped to one workspace or all of them.
++ */
++
++export interface SearchGlobalArgs {
++  query: string;
++  /** Omit (or pass `null`) for "All workspaces" scope, per §9. */
++  workspaceId?: number | null;
++  /** Omit to use the backend's configured default (`search.default_limit`, §9). */
++  limit?: number;
++}
++
++export function searchGlobal(args: SearchGlobalArgs): Promise<GlobalSearchResult[]> {
++  return ipcInvoke<GlobalSearchResult[]>("search_global", {
++    query: args.query,
++    workspaceId: args.workspaceId ?? null,
++    limit: args.limit ?? null,
++  });
++}
+diff --git a/app/src/ipc/types.ts b/app/src/ipc/types.ts
+index d335215..7c0f4c0 100644
+--- a/app/src/ipc/types.ts
++++ b/app/src/ipc/types.ts
+@@ -101,6 +101,18 @@ export interface Citation {
+   snippet: string;
+ }
+ 
++/** Mirrors backend `GlobalSearchResult` (§9 Global Search, `search.global`). */
++export interface GlobalSearchResult {
++  document_id: number;
++  workspace_id: number;
++  workspace_name: string;
++  chunk_id: number;
++  relative_path: string;
++  snippet: string;
++  location_ref: string;
++  score: number;
++}
++
+ /** Mirrors backend `AssistantAnswer` (`assistant.ask` response). */
+ export interface AssistantAnswer {
+   session_id: number;
+diff --git a/app/src/state/store.ts b/app/src/state/store.ts
+index 102736c..eaf4181 100644
+--- a/app/src/state/store.ts
++++ b/app/src/state/store.ts
+@@ -61,6 +61,7 @@ export interface AppState {
+   activeDocumentId: number | null;
+   isAssistantPanelOpen: boolean;
+   isSplitViewOpen: boolean;
++  isGlobalSearchOpen: boolean;
+   currentView: AppView;
+   workspaces: Workspace[];
+   workspacesLoading: boolean;
+@@ -73,6 +74,7 @@ export interface AppState {
+   setActiveDocumentId: (id: number | null) => void;
+   setAssistantPanelOpen: (open: boolean) => void;
+   setSplitViewOpen: (open: boolean) => void;
++  setGlobalSearchOpen: (open: boolean) => void;
+   setCurrentView: (view: AppView) => void;
+   setWorkspaces: (workspaces: Workspace[]) => void;
+   setWorkspacesLoading: (loading: boolean) => void;
+@@ -93,6 +95,7 @@ export const useAppStore = create<AppState>((set, get) => ({
+   activeDocumentId: null,
+   isAssistantPanelOpen: true,
+   isSplitViewOpen: false,
++  isGlobalSearchOpen: false,
+   currentView: "dashboard",
+   workspaces: [],
+   workspacesLoading: false,
+@@ -105,6 +108,7 @@ export const useAppStore = create<AppState>((set, get) => ({
+   setActiveDocumentId: (id) => set({ activeDocumentId: id }),
+   setAssistantPanelOpen: (open) => set({ isAssistantPanelOpen: open }),
+   setSplitViewOpen: (open) => set({ isSplitViewOpen: open }),
++  setGlobalSearchOpen: (open) => set({ isGlobalSearchOpen: open }),
+   setCurrentView: (view) => set({ currentView: view }),
+   setWorkspaces: (workspaces) => set({ workspaces }),
+   setWorkspacesLoading: (loading) => set({ workspacesLoading: loading }),

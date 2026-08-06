@@ -35,6 +35,7 @@ export function TopNav() {
   const setAssistantPanelOpen = useAppStore((s) => s.setAssistantPanelOpen);
   const isSplitViewOpen = useAppStore((s) => s.isSplitViewOpen);
   const setSplitViewOpen = useAppStore((s) => s.setSplitViewOpen);
+  const setGlobalSearchOpen = useAppStore((s) => s.setGlobalSearchOpen);
   const theme = useThemeStore((s) => s.theme);
   const setTheme = useThemeStore((s) => s.setTheme);
 
@@ -58,6 +59,16 @@ export function TopNav() {
         <span aria-hidden>/</span>
         <span className="text-foreground">{crumb}</span>
       </div>
+      <button
+        type="button"
+        onClick={() => setGlobalSearchOpen(true)}
+        title="Search (Ctrl/Cmd+K)"
+        className="flex items-center gap-2 rounded border px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
+      >
+        <span aria-hidden>🔍</span>
+        <span>Search everything…</span>
+        <kbd className="rounded border px-1 text-[10px]">⌘K</kbd>
+      </button>
       {showModeSwitcher ? (
         <nav aria-label="Workspace modes" className="flex items-center gap-1">
           <button

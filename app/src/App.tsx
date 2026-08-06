@@ -6,6 +6,7 @@ import { TopNav } from "@/components/TopNav";
 import { Tabs } from "@/components/Tabs";
 import { SplitView } from "@/components/SplitView";
 import { Toaster } from "@/components/Toaster";
+import { GlobalSearchOverlay } from "@/components/GlobalSearchOverlay";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { StatusBar } from "@/panels/StatusBar";
 import { AssistantPanel } from "@/panels/AssistantPanel";
@@ -29,10 +30,12 @@ import { useThemeStore } from "@/state/theme";
  * Keyboard Shortcuts (partial, scoped to what this milestone implements):
  *   Ctrl/Cmd+B        toggle sidebar-adjacent assistant panel
  *   Ctrl/Cmd+\        toggle split view
+ *   Ctrl/Cmd+K        open Global Search (§9)
  * A full Command Palette (Ctrl+Shift+P) is out of scope for this pass --
  * it needs a registry of real, wired commands to be meaningful, and most
- * of the commands it would list (search, document actions) depend on IPC
- * surfaces (`document.*`, global search) that don't exist yet.
+ * of the commands it would list (document actions, etc.) depend on IPC
+ * surfaces (`document.*`) that don't exist yet. Global Search itself is
+ * now wired (§9), separately from that palette.
  */
 export function App() {
   const currentView = useAppStore((s) => s.currentView);
@@ -41,6 +44,7 @@ export function App() {
   const setAssistantPanelOpen = useAppStore((s) => s.setAssistantPanelOpen);
   const isSplitViewOpen = useAppStore((s) => s.isSplitViewOpen);
   const setSplitViewOpen = useAppStore((s) => s.setSplitViewOpen);
+  const setGlobalSearchOpen = useAppStore((s) => s.setGlobalSearchOpen);
   const hydrateTheme = useThemeStore((s) => s.hydrate);
   const setWorkspaces = useAppStore((s) => s.setWorkspaces);
   const setWorkspacesLoading = useAppStore((s) => s.setWorkspacesLoading);
@@ -72,11 +76,14 @@ export function App() {
       } else if (e.key === "\\") {
         e.preventDefault();
         setSplitViewOpen(!isSplitViewOpen);
+      } else if (e.key === "k") {
+        e.preventDefault();
+        setGlobalSearchOpen(true);
       }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [isAssistantPanelOpen, isSplitViewOpen, setAssistantPanelOpen, setSplitViewOpen]);
+  }, [isAssistantPanelOpen, isSplitViewOpen, setAssistantPanelOpen, setSplitViewOpen, setGlobalSearchOpen]);
 
   let mainContent;
   if (currentView === "settings") {
@@ -115,6 +122,7 @@ export function App() {
       </div>
       <StatusBar />
       <Toaster />
+      <GlobalSearchOverlay />
     </div>
   );
 }

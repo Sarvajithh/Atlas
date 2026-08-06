@@ -43,6 +43,7 @@ fn main() {
             commands::settings::settings_set,
             commands::rag::rag_search,
             commands::rag::rag_get_context,
+            commands::search::search_global,
             commands::ocr::ocr_reprocess,
             commands::document::document_list,
             commands::document::document_get,

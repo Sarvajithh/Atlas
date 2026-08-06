@@ -24,6 +24,7 @@ use atlas_db::settings_adapter::SqliteSettingsProvider;
 use atlas_db::workspace_adapter::SqliteWorkspaceRepository;
 use atlas_events::EventBus;
 use atlas_graph::GraphEngine;
+use atlas_indexer::document_repository::DocumentRepository;
 use atlas_indexer::job_queue::JobQueue;
 use atlas_indexer::ocr::TesseractCliOcrEngine;
 use atlas_indexer::parser::default_parser_selector;
@@ -33,12 +34,14 @@ use atlas_memory::{ChatRepository, MemoryEngine};
 use atlas_models::context_builder::AssembledContext;
 use atlas_models::{
     ContextBuilder, EnginePool, Intent, ModelDiscoveryService, ModelRegistryRepository, ModelScheduler,
-    OllamaConnection, OllamaEmbeddingEngine, OllamaEngine, OllamaProvider, PromptBuilder, Retriever, RoutingTable,
+    OllamaConnection, OllamaEmbeddingEngine, OllamaEngine, OllamaProvider, PromptBuilder, Reranker, Retriever,
+    RoutingTable,
 };
 use atlas_types::chat::{ChatMessage, ChatMode, ChatRole, ChatSession};
 use atlas_types::ids::{ChatSessionId, WorkspaceId};
 use atlas_types::model::EngineRole;
-use atlas_types::retrieval::Citation;
+use atlas_types::retrieval::{Citation, GlobalSearchResult};
+use atlas_types::workspace::WorkspaceStatus;
 use atlas_utils::AppError;
 use atlas_vector::VectorDbEmbeddingRepository;
 use atlas_watcher::FolderWatcher;
@@ -47,6 +50,16 @@ use atlas_workspace::lifecycle::WorkspaceEngine;
 use crate::cancellation::{CancellationRegistry, RegisteredRequest};
 use crate::state::AppState;
 use crate::worker::IndexingWorker;
+
+/// Settings key for Global Search's default result limit (§9), following
+/// the same named-settings-key pattern as
+/// `PromptBuilder::SYSTEM_PROMPT_SETTING_KEY`.
+const SEARCH_DEFAULT_LIMIT_SETTING_KEY: &str = "search.default_limit";
+/// Documented fallback used when `SEARCH_DEFAULT_LIMIT_SETTING_KEY` is
+/// unset or fails to parse as a `usize`.
+const DEFAULT_SEARCH_LIMIT: usize = 20;
+/// Max characters kept in a Global Search result's display snippet.
+const SEARCH_SNIPPET_MAX_CHARS: usize = 240;
 
 /// The default Intent -> Engine-role routing table (§15's illustrative
 /// pipelines). Kept as ordinary constructed data, not a `const`/hardcoded
@@ -103,6 +116,12 @@ pub struct AppFacade {
     retriever: Arc<Retriever>,
     context_builder: Arc<ContextBuilder>,
     prompt_builder: Arc<PromptBuilder>,
+    /// Global Search (§9): resolves `SearchHit.document_id` back to a
+    /// document's `relative_path` for display. The same
+    /// `SqliteDocumentRepository` instance `indexing_pipeline` owns --
+    /// cloned before being moved into `IndexingPipeline::new` below --
+    /// not a second connection or a duplicate implementation.
+    documents: Arc<dyn DocumentRepository>,
     /// Phase 4 (§14.1 Engines Module, §15 Model Scheduler, §37 Model
     /// Registry, §37.1 Model Discovery). `engine_pool` holds the concrete
     /// Ollama-backed Engines for every inference-bearing role the default
@@ -226,6 +245,7 @@ impl AppFacade {
             Arc::new(TesseractCliOcrEngine::default()),
         ));
 
+        let documents: Arc<dyn DocumentRepository> = document_repository.clone();
         let indexing_pipeline = Arc::new(IndexingPipeline::new(
             document_repository,
             chunk_repository.clone(),
@@ -279,6 +299,7 @@ impl AppFacade {
             retriever,
             context_builder,
             prompt_builder,
+            documents,
             ollama,
             engine_pool,
             scheduler,
@@ -388,6 +409,122 @@ impl AppFacade {
         let citations = context.citations.clone();
         let prompt = self.prompt_builder.build(query, context);
         Ok((prompt.content, citations))
+    }
+
+    /// Global Search (architecture doc §9): hybrid keyword + vector search
+    /// scoped to either one workspace or all of them, exposed to the UI as
+    /// a flat ranked list of results rather than an assembled RAG prompt
+    /// (that's `search` above, which stays untouched -- this is a
+    /// deliberately separate method, not an extension of it, since the two
+    /// have different return shapes and different callers: `rag.*` wants a
+    /// prompt + citations, Global Search wants display-ready hits).
+    ///
+    /// Reuses the existing `Retriever` (hybrid keyword+vector merge, §18)
+    /// and `Reranker` (§18) exactly as `search` does -- no second scoring
+    /// mechanism is introduced. `workspace_id = None` means "All"
+    /// (cross-workspace, §9): every `Active` or `Indexing` workspace (has
+    /// real, at-least-partially-indexed content; `Unlinked`/`Linking`/
+    /// `Archived` do not) is queried and the results are merged into one
+    /// combined ranking.
+    pub fn search_global(
+        &self,
+        query: &str,
+        workspace_id: Option<WorkspaceId>,
+        limit: Option<usize>,
+    ) -> Result<Vec<GlobalSearchResult>, AppError> {
+        let limit = limit.unwrap_or_else(|| self.default_search_limit());
+
+        let workspaces = match workspace_id {
+            Some(id) => match self.workspace_engine.get(id)? {
+                Some(workspace) => vec![workspace],
+                None => Vec::new(),
+            },
+            None => self
+                .workspace_engine
+                .list()?
+                .into_iter()
+                .filter(|w| matches!(w.status, WorkspaceStatus::Active | WorkspaceStatus::Indexing))
+                .collect(),
+        };
+
+        // Run retrieval per-workspace (Retriever's hybrid merge, §18, is
+        // scoped to a single workspace -- there is no cross-workspace
+        // index to query directly), tracking which workspace/name each hit
+        // came from since that's lost once everything is flattened into
+        // one list for reranking below.
+        let mut origin: HashMap<i64, (WorkspaceId, String)> = HashMap::new();
+        let mut candidates: Vec<atlas_types::retrieval::SearchHit> = Vec::new();
+        for workspace in &workspaces {
+            let hits = self.retriever.retrieve(workspace.id, query, limit)?;
+            for hit in hits {
+                origin.insert(hit.chunk_id.0, (workspace.id, workspace.display_name.clone()));
+                candidates.push(hit);
+            }
+        }
+
+        // One shared Reranker (§18) scores the whole cross-workspace
+        // candidate pool against the query -- not a per-workspace rerank
+        // followed by a naive score concatenation, which would leave
+        // workspace-relative scores incomparable against each other.
+        let reranked = Reranker::new().rerank(query, candidates);
+
+        let mut results = Vec::with_capacity(reranked.len().min(limit));
+        for hit in reranked.into_iter().take(limit) {
+            let Some((workspace_id, workspace_name)) = origin.get(&hit.chunk_id.0).cloned() else {
+                continue;
+            };
+            let relative_path = self
+                .documents
+                .find_by_id(hit.document_id)?
+                .map(|document| document.relative_path)
+                .unwrap_or_else(|| "(document not found)".to_string());
+            results.push(GlobalSearchResult {
+                document_id: hit.document_id,
+                workspace_id,
+                workspace_name,
+                chunk_id: hit.chunk_id,
+                relative_path,
+                snippet: Self::search_snippet(&hit.text_content),
+                location_ref: hit.page_or_location_ref,
+                score: hit.score,
+            });
+        }
+        Ok(results)
+    }
+
+    /// Settings-driven default for `search_global`'s `limit` when the
+    /// caller doesn't pass one explicitly (§23: "never a hardcoded...
+    /// anything the user might reasonably want to change") -- same
+    /// resolve-from-settings-with-a-named-fallback pattern
+    /// `PromptBuilder::system_prompt` uses for
+    /// `SYSTEM_PROMPT_SETTING_KEY`/`DEFAULT_SYSTEM_PROMPT`.
+    fn default_search_limit(&self) -> usize {
+        match self.settings.get_global(SEARCH_DEFAULT_LIMIT_SETTING_KEY) {
+            Ok(Some(entry)) => entry.value.parse::<usize>().unwrap_or(DEFAULT_SEARCH_LIMIT),
+            Ok(None) => DEFAULT_SEARCH_LIMIT,
+            Err(e) => {
+                // §45.1 recoverable, same reasoning as
+                // `PromptBuilder::system_prompt`: an optional-setting read
+                // failure shouldn't fail the whole search.
+                atlas_utils::log_warn!(
+                    "[AppFacade::search_global] failed to read {SEARCH_DEFAULT_LIMIT_SETTING_KEY}, using default: {}",
+                    e.message
+                );
+                DEFAULT_SEARCH_LIMIT
+            }
+        }
+    }
+
+    /// Trims a chunk's full text down to a short display snippet for
+    /// search results (full chunk text is meant for RAG context, not a
+    /// results-list row). Truncates on a char boundary so multi-byte UTF-8
+    /// text is never split mid-character.
+    fn search_snippet(text: &str) -> String {
+        if text.chars().count() <= SEARCH_SNIPPET_MAX_CHARS {
+            return text.to_string();
+        }
+        let truncated: String = text.chars().take(SEARCH_SNIPPET_MAX_CHARS).collect();
+        format!("{truncated}…")
     }
 
     /// Link a folder (§6) and start watching it (§21: initial scan +

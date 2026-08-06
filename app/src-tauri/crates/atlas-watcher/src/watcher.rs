@@ -99,6 +99,19 @@ impl FolderWatcher {
         let (raw_tx, raw_rx) = channel::<RawChange>();
         let (stop_tx, stop_rx) = channel::<()>();
 
+        // Shared clock origin: both the `notify` callback (which stamps
+        // `observed_at_ms` on each raw change) and the debounce thread
+        // (which compares those timestamps against `now_ms()`) must
+        // measure elapsed time from the *same* `Instant`. Previously the
+        // callback computed `Instant::now().elapsed()` on a freshly
+        // constructed `Instant` (always ~0), while the debounce thread
+        // measured elapsed time from its own `start` fixed at thread
+        // spawn -- two different clocks being compared, which caused the
+        // debounce window to silently collapse to the ~50ms poll interval
+        // once the watcher had been running longer than `window_ms`.
+        let start = Instant::now();
+
+        let callback_start = start;
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             if let Ok(event) = res {
                 let kind = match event.kind {
@@ -108,7 +121,7 @@ impl FolderWatcher {
                     _ => None,
                 };
                 if let Some(kind) = kind {
-                    let observed_at_ms = Instant::now().elapsed().as_millis() as u64;
+                    let observed_at_ms = callback_start.elapsed().as_millis() as u64;
                     for path in event.paths {
                         let _ = raw_tx.send(RawChange {
                             path,
@@ -132,7 +145,6 @@ impl FolderWatcher {
 
         std::thread::spawn(move || {
             let mut debouncer = Debouncer::new(debounce_window_ms);
-            let start = Instant::now();
             let now_ms = || start.elapsed().as_millis() as u64;
 
             loop {
@@ -312,6 +324,55 @@ mod tests {
             }
         }
         assert!(found, "expected at least one published event after file creation");
+
+        watcher.stop();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn events_after_first_window_ms_of_uptime_still_coalesce_within_the_debounce_window() {
+        // Regression test for the two-clocks bug (see `watch`'s comment on
+        // `start`/`callback_start`): before the fix, `observed_at_ms` was
+        // always ~0 (measured from a freshly-constructed `Instant`) while
+        // `now_ms()` grew from the debounce thread's own `start`. Once the
+        // watcher had been running longer than its own debounce window,
+        // every new change looked "ready" on the very next ~50ms poll
+        // tick instead of being coalesced. This test runs the watcher past
+        // its debounce window *first*, then fires a rapid burst of writes
+        // spread across several poll ticks, and asserts they still
+        // collapse into exactly one enqueued job.
+        let (mut watcher, _events, jobs) = watcher();
+        let root = temp_dir("watch-debounce-after-uptime");
+        let window_ms: u64 = 300;
+        watcher.with_debounce_window_for_test(window_ms);
+        watcher.watch(WorkspaceId(9), root.to_str().unwrap()).unwrap();
+
+        // Let the watcher run well past its own debounce window before
+        // the burst -- this is the exact condition under which the old
+        // code silently degraded to firing on every poll tick.
+        std::thread::sleep(Duration::from_millis(window_ms + 150));
+
+        // Burst: several writes to the same file, each well within one
+        // debounce window of the next, but spread across multiple ~50ms
+        // poll ticks.
+        std::fs::write(root.join("burst.pdf"), b"v1").unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        std::fs::write(root.join("burst.pdf"), b"v2").unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        std::fs::write(root.join("burst.pdf"), b"v3").unwrap();
+
+        // Give the debounce window time to elapse and the coalesced
+        // change to drain. If the bug is present, each write would
+        // already have fired on its own poll tick well before this.
+        std::thread::sleep(Duration::from_millis(window_ms + 400));
+
+        let queued = jobs.repository().list_by_status(JobStatus::Queued).unwrap();
+        assert_eq!(
+            queued.len(),
+            1,
+            "expected the rapid burst to coalesce into exactly one indexing job, got {}",
+            queued.len()
+        );
 
         watcher.stop();
         let _ = std::fs::remove_dir_all(&root);

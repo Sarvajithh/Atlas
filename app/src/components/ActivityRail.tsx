@@ -2,16 +2,21 @@ import { useAppStore } from "@/state/store";
 import { cn } from "@/state/utils";
 
 /**
- * Activity Rail (§8.1): far-left icon strip. This milestone wires the two
- * destinations backed by real functionality (Dashboard/Workspaces,
- * Settings). Search/Concept Graph/Memory rails are visible but disabled --
- * §20's graph persistence and the memory-analytics IPC surface are
- * separate, larger pieces of work not claimed as done here.
+ * Activity Rail (§8.1): far-left icon strip. Dashboard/Workspaces, Concept
+ * Graph, Memory & Analytics, and Settings are all reachable here. Concept
+ * Graph and Memory & Analytics route to their views, which render honestly
+ * against whatever backend surface currently exists for them (mostly none
+ * yet -- see each view's own doc comment); this only makes them reachable,
+ * it doesn't claim their underlying feature logic is complete. A Global
+ * Search rail entry is intentionally not added here: §8.1 calls for one,
+ * but no unified hybrid-search IPC command or frontend surface exists at
+ * all yet, so there is nothing for it to route to (out of this phase's
+ * scope, see README's "Remaining Atlas v1.0 Work").
  */
 const RAIL_ITEMS = [
   { id: "dashboard", label: "Workspaces", view: "dashboard" as const, enabled: true, glyph: "▤" },
-  { id: "graph", label: "Concept Graph (not yet available)", view: null, enabled: false, glyph: "◇" },
-  { id: "memory", label: "Memory & Analytics (not yet available)", view: null, enabled: false, glyph: "◎" },
+  { id: "graph", label: "Concept Graph", view: "concept-graph" as const, enabled: true, glyph: "◇" },
+  { id: "memory", label: "Memory & Analytics", view: "memory-analytics" as const, enabled: true, glyph: "◎" },
   { id: "settings", label: "Settings", view: "settings" as const, enabled: true, glyph: "⚙" },
 ];
 

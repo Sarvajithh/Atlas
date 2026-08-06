@@ -12,6 +12,11 @@ import { AssistantPanel } from "@/panels/AssistantPanel";
 import { WorkspaceHome } from "@/views/WorkspaceHome";
 import { WorkspaceDetail } from "@/views/WorkspaceDetail";
 import { SettingsView } from "@/views/SettingsView";
+import { ConceptGraphView } from "@/views/ConceptGraphView";
+import { ResearchMode } from "@/views/ResearchMode";
+import { QuizExamMode } from "@/views/QuizExamMode";
+import { MemoryAnalyticsView } from "@/views/MemoryAnalyticsView";
+import { DocumentView } from "@/views/DocumentView";
 import { workspaceList } from "@/ipc/workspace";
 import { useAppStore } from "@/state/store";
 import { useThemeStore } from "@/state/theme";
@@ -78,6 +83,16 @@ export function App() {
     mainContent = <SettingsView />;
   } else if (currentView === "workspace-detail" && activeWorkspaceId !== null) {
     mainContent = <WorkspaceDetail workspaceId={activeWorkspaceId} />;
+  } else if (currentView === "concept-graph") {
+    mainContent = <ConceptGraphView />;
+  } else if (currentView === "research-mode") {
+    mainContent = <ResearchMode />;
+  } else if (currentView === "quiz-exam") {
+    mainContent = <QuizExamMode />;
+  } else if (currentView === "memory-analytics") {
+    mainContent = <MemoryAnalyticsView />;
+  } else if (currentView === "document-view") {
+    mainContent = <DocumentView />;
   } else {
     mainContent = <WorkspaceHome />;
   }

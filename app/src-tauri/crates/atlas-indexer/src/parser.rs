@@ -827,13 +827,22 @@ pub mod docx {
         results
     }
 
-    /// Locate the raw (assumed-uncompressed) bytes of `word/document.xml`
-    /// inside a `.docx` ZIP container by scanning for its local file header
-    /// signature and reading `compressed_size` bytes verbatim. This only
-    /// succeeds when that entry's compression method is `0` (stored); most
-    /// other cases fall back gracefully in [`parse_docx_bytes`].
-    fn find_stored_document_xml(bytes: &[u8]) -> Option<String> {
+    /// Locate the bytes of `word/document.xml` inside a `.docx` ZIP
+    /// container by scanning for its local file header signature and
+    /// reading `compressed_size` bytes. Supports both compression method
+    /// `0` (stored, verbatim) and method `8` (DEFLATE, the method used by
+    /// real Word/LibreOffice/python-docx output) via
+    /// [`flate2::read::DeflateDecoder`] (raw deflate, i.e. no zlib/gzip
+    /// header — matches the ZIP local-file-data format). Any other
+    /// compression method, or a DEFLATE stream that fails to inflate,
+    /// falls back gracefully in [`parse_docx_bytes`].
+    fn find_document_xml(bytes: &[u8]) -> Option<String> {
+        use std::io::Read;
+
         const LOCAL_HEADER_SIG: [u8; 4] = [0x50, 0x4B, 0x03, 0x04];
+        const STORED: u16 = 0;
+        const DEFLATE: u16 = 8;
+
         let mut i = 0usize;
         while i + 30 <= bytes.len() {
             if bytes[i..i + 4] == LOCAL_HEADER_SIG {
@@ -851,8 +860,24 @@ pub mod docx {
                 let name = String::from_utf8_lossy(&bytes[name_start..name_end]);
                 let data_start = name_end + extra_len;
                 let data_end = data_start + compressed_size;
-                if name == "word/document.xml" && compression == 0 && data_end <= bytes.len() {
-                    return Some(String::from_utf8_lossy(&bytes[data_start..data_end]).to_string());
+                if name == "word/document.xml" && data_end <= bytes.len() {
+                    let raw = &bytes[data_start..data_end];
+                    match compression {
+                        STORED => {
+                            return Some(String::from_utf8_lossy(raw).to_string());
+                        }
+                        DEFLATE => {
+                            let mut decoder = flate2::read::DeflateDecoder::new(raw);
+                            let mut out = String::new();
+                            if decoder.read_to_string(&mut out).is_ok() {
+                                return Some(out);
+                            }
+                            // Fall through to graceful degradation if the
+                            // stream doesn't inflate cleanly.
+                            return None;
+                        }
+                        _ => return None,
+                    }
                 }
                 i = data_start.max(i + 1);
             } else {
@@ -863,7 +888,7 @@ pub mod docx {
     }
 
     pub fn parse_docx_bytes(path: &str, bytes: &[u8]) -> ParsedDocument {
-        let paragraphs = find_stored_document_xml(bytes)
+        let paragraphs = find_document_xml(bytes)
             .map(|xml| extract_paragraphs(&xml))
             .unwrap_or_default();
 
@@ -929,6 +954,82 @@ pub mod docx {
             let doc = parse_docx_bytes("weird.docx", b"not a zip at all");
             assert_eq!(doc.blocks.len(), 1);
             assert_eq!(doc.blocks[0].block_type, BlockType::Image);
+        }
+
+        /// Build a minimal single-entry ZIP local-file record for
+        /// `word/document.xml`, compressed with real DEFLATE (via
+        /// `flate2::write::DeflateEncoder`), mirroring what real
+        /// Word/LibreOffice/python-docx output actually looks like on
+        /// disk (method 8, not method 0/stored). This is deliberately not
+        /// just a raw XML string with the STORED method flipped -- it
+        /// exercises the actual inflate path, matching the repro method
+        /// described in `docs/fix7_audit_report.md`.
+        fn build_deflate_docx_fixture(xml: &str) -> Vec<u8> {
+            use flate2::write::DeflateEncoder;
+            use flate2::Compression;
+            use std::io::Write;
+
+            let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(xml.as_bytes()).unwrap();
+            let compressed = encoder.finish().unwrap();
+
+            let name = b"word/document.xml";
+            let mut entry = Vec::new();
+            entry.extend_from_slice(&[0x50, 0x4B, 0x03, 0x04]); // local file header sig
+            entry.extend_from_slice(&[20, 0]); // version needed
+            entry.extend_from_slice(&[0, 0]); // flags
+            entry.extend_from_slice(&[8, 0]); // compression method = DEFLATE
+            entry.extend_from_slice(&[0, 0]); // mod time
+            entry.extend_from_slice(&[0, 0]); // mod date
+            entry.extend_from_slice(&[0, 0, 0, 0]); // crc32 (unused by parser)
+            entry.extend_from_slice(&(compressed.len() as u32).to_le_bytes()); // compressed size
+            entry.extend_from_slice(&(xml.len() as u32).to_le_bytes()); // uncompressed size
+            entry.extend_from_slice(&(name.len() as u16).to_le_bytes()); // name length
+            entry.extend_from_slice(&[0, 0]); // extra length
+            entry.extend_from_slice(name);
+            entry.extend_from_slice(&compressed);
+            entry
+        }
+
+        #[test]
+        fn deflate_compressed_document_xml_is_decompressed_and_parsed() {
+            let xml = "<w:p><w:r><w:t>Real DEFLATE-compressed Word content</w:t></w:r></w:p>";
+            let fixture = build_deflate_docx_fixture(xml);
+
+            let doc = parse_docx_bytes("real.docx", &fixture);
+
+            assert_eq!(doc.blocks.len(), 1);
+            assert_eq!(doc.blocks[0].block_type, BlockType::Paragraph);
+            assert_eq!(
+                doc.blocks[0].text_content,
+                "Real DEFLATE-compressed Word content"
+            );
+        }
+
+        #[test]
+        fn stored_fast_path_still_works_alongside_deflate_support() {
+            // Guards against a regression where adding DEFLATE support
+            // accidentally drops the pre-existing STORED (method 0) path.
+            let xml = "<w:p><w:t>Stored content</w:t></w:p>";
+            let name = b"word/document.xml";
+            let mut entry = Vec::new();
+            entry.extend_from_slice(&[0x50, 0x4B, 0x03, 0x04]);
+            entry.extend_from_slice(&[20, 0]);
+            entry.extend_from_slice(&[0, 0]);
+            entry.extend_from_slice(&[0, 0]); // compression method = STORED
+            entry.extend_from_slice(&[0, 0]);
+            entry.extend_from_slice(&[0, 0]);
+            entry.extend_from_slice(&[0, 0, 0, 0]);
+            entry.extend_from_slice(&(xml.len() as u32).to_le_bytes());
+            entry.extend_from_slice(&(xml.len() as u32).to_le_bytes());
+            entry.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            entry.extend_from_slice(&[0, 0]);
+            entry.extend_from_slice(name);
+            entry.extend_from_slice(xml.as_bytes());
+
+            let doc = parse_docx_bytes("stored.docx", &entry);
+            assert_eq!(doc.blocks.len(), 1);
+            assert_eq!(doc.blocks[0].text_content, "Stored content");
         }
     }
 }

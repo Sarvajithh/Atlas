@@ -15,8 +15,23 @@ import type { Workspace } from "@/ipc/types";
  * tree of documents *within* a workspace needs a `document.*` IPC
  * namespace that does not exist yet in `app-tauri/src/commands` -- that
  * is out of scope here, not silently faked.
+ *
+ * "concept-graph", "research-mode", "quiz-exam", "memory-analytics", and
+ * "document-view" (§8.2.3-§8.2.6, §8.2.2) route to the previously-built
+ * but unmounted views. They render honestly against whatever backend
+ * surface currently exists for them (which for most is still nothing --
+ * see each view's own doc comment); wiring them into the shell here does
+ * not imply their underlying feature logic is complete.
  */
-export type AppView = "dashboard" | "workspace-detail" | "settings";
+export type AppView =
+  | "dashboard"
+  | "workspace-detail"
+  | "settings"
+  | "concept-graph"
+  | "research-mode"
+  | "quiz-exam"
+  | "memory-analytics"
+  | "document-view";
 
 export interface Toast {
   id: string;

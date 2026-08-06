@@ -20,7 +20,7 @@ construction, Ollama-backed chat/tutoring with streaming, a folder watcher
 with incremental indexing, and a working React/Tauri frontend shell with
 IPC wiring for workspaces, documents, and the assistant.
 
-**Estimated overall completion toward the Atlas v1.0 vision: ~35–40%.**
+**Estimated overall completion toward the Atlas v1.0 vision: ~48%.**
 See "Completed Features," "Remaining Atlas v1.0 Work," and "Known
 Limitations & Technical Debt" below for the itemized breakdown this
 estimate is based on.
@@ -40,8 +40,9 @@ inferred from comments or prior documentation.
 - Multi-workspace support (backend + `WorkspaceHome` list view)
 - Folder linking (`WorkspaceCreationWizard` + IPC)
 - Folder watching with incremental indexing (`atlas-watcher`,
-  `atlas-core::worker`) — **functional, with a known debounce bug, see
-  Technical Debt**
+  `atlas-core::worker`) — functional; the debounce window now correctly
+  coalesces bursts across the watcher's whole uptime (see Changelog), fixing
+  a prior known bug
 - Workspace explorer / file tree with indexing-status badges (`Sidebar`,
   `DocumentExplorer`)
 - Workspace dashboard (`WorkspaceHome`, `WorkspaceDetail`)
@@ -54,8 +55,10 @@ inferred from comments or prior documentation.
 - Image OCR (Tesseract CLI, `atlas-indexer::ocr`)
 - Markdown viewing (tested)
 - Document metadata (`atlas-types::document`, `document_adapter`)
-- DOCX parsing — **present but only for uncompressed (STORED) ZIP entries;
-  see Known Limitations, this fails on real Word/LibreOffice output**
+- DOCX parsing (DEFLATE-compressed, real Word output) — reads both STORED
+  and DEFLATE-compressed `word/document.xml` entries, so real
+  Word/LibreOffice/python-docx exports (not just uncompressed ZIPs) now
+  extract text correctly; see Changelog
 
 ### Knowledge Ingestion & RAG
 - Chunking (`atlas-indexer::chunker`)
@@ -97,6 +100,17 @@ inferred from comments or prior documentation.
 - PDF viewer, Markdown viewer, document tabs, split view
   (Ctrl/Cmd+\\), assistant panel toggle (Ctrl/Cmd+B)
 - Theme support, Settings view
+- **Frontend navigation wiring** — `ConceptGraphView`, `ResearchMode`,
+  `QuizExamMode`, `MemoryAnalyticsView`, and `DocumentView` are now routed
+  and reachable from the running shell (`ActivityRail` for Concept Graph
+  and Memory & Analytics; a workspace-scoped mode switcher in `TopNav` for
+  Document View, Research Mode, and Quiz/Exam Mode) — see Changelog. This
+  only wires navigation; it does not claim the underlying feature logic
+  behind each view is complete. Most still render an honest empty/loading
+  state pending their own backend surfaces (Concept Graph extraction,
+  Research Mode's cross-document linking, Quiz/Flashcard generation depth,
+  Memory & Analytics' aggregation queries) — each remains tracked below
+  under its own item, not silently marked done here.
 
 ---
 
@@ -106,13 +120,6 @@ inferred from comments or prior documentation.
 items independently re-verified as already done above.)*
 
 ### High priority
-- **Frontend navigation wiring** — `ConceptGraphView`, `ResearchMode`,
-  `QuizExamMode`, `MemoryAnalyticsView`, and a dedicated `DocumentView` all
-  exist as built components but are not reachable from the running app;
-  `App.tsx`'s router only ever renders Workspace Home, Workspace Detail, or
-  Settings.
-- **DOCX parser correctness** — cannot read real (DEFLATE-compressed)
-  Word/LibreOffice/Google-Docs-exported files; degrades to an empty block.
 - **Global Search** — required by the architecture contract's navigation
   flow (§9); no unified hybrid-search IPC command or frontend surface
   exists yet, despite the underlying retrieval/reranking machinery being
@@ -123,10 +130,6 @@ items independently re-verified as already done above.)*
   a future milestone." No nodes/edges are ever produced today.
 
 ### Medium priority
-- **Folder watcher debounce bug** — the debounce window collapses to
-  roughly the ~50ms poll interval after the watcher's first ~500ms of
-  uptime, due to two different clock references being compared; defeats
-  real-world debouncing of rapid-save bursts.
 - **Quiz / Flashcard / Revision Planner generation depth** — currently
   one-line wrappers around a generic LLM call with no structured output
   schema, no persisted structured records, and no real weak-topic-detection
@@ -162,24 +165,32 @@ items independently re-verified as already done above.)*
 
 ## Known Limitations & Technical Debt
 
-- **DOCX parser** silently produces an empty result for real-world Word
-  files (see above); this is a correctness defect, not a missing feature.
-- **Folder watcher debounce** degrades after startup (see above);
-  functional but not reliable under rapid file-change bursts.
 - **Reranker is a lightweight heuristic** (term overlap + phrase bonus),
   not a cross-encoder model — documented as an intentional scope choice in
   the source, not a hidden gap.
 - **Test coverage gap pattern**: prior internal audits of this repository
   identified specific reasons existing unit tests didn't catch the DOCX and
-  watcher bugs above (fixtures that bypass the real compressed/ZIP path;
-  timing-independent debounce tests). These gap-closing tests have not yet
-  been added even where the underlying bug (dropped user query from
-  prompts) was separately fixed — any future fix to the DOCX/watcher bugs
-  should add tests of the same shape the prior audit specified, not just
-  fixture-level tests that would pass either way.
+  watcher bugs (fixtures that bypass the real compressed/ZIP path;
+  timing-independent debounce tests). This phase closed both gaps for the
+  DOCX and watcher fixes — a real DEFLATE-compressed ZIP fixture (built via
+  an actual `flate2` encoder, not a raw XML string) and a watcher-level test
+  that runs the debounce window to completion before firing a multi-tick
+  burst — see Changelog. The same "isolated tests pass, real path silently
+  degrades" pattern is still unaddressed for the previously-identified
+  dropped-user-query-from-prompts issue (see Finding 1 in
+  `docs/fix7_audit_report.md`), which remains out of this phase's scope.
 - **Architecture contract deviation**: custom vector store instead of the
   mandated Qdrant/LanceDB (§5 of `app/docs/README.md`) — unresolved,
   unamended as of this writing.
+- **Missing devDependency**: `tailwind.config.js` imports
+  `@tailwindcss/typography`, but it was absent from `package.json`/
+  `package-lock.json` (pre-existing gap, not introduced by any phase's
+  changes) — this silently broke `npm test`/`npm run build` in any
+  environment without it already present in `node_modules` some other way.
+  Added as a devDependency in the frontend-navigation phase since it
+  blocked verifying that phase's own acceptance criteria; flagged here as
+  a deviation from that phase's stated file scope, since `package.json`
+  wasn't on its allowed-to-change list.
 - Two internal audit artifacts (`SUMMARY.md`, `docs/fix7_audit_report.md`,
   `CHANGES.diff`) exist at/near the repository root from prior fix passes;
   useful history, but should eventually be consolidated into a single
@@ -191,16 +202,16 @@ items independently re-verified as already done above.)*
 
 | Subsystem | Estimated completion |
 |---|---|
-| Workspaces | ~65% |
-| Document System | ~50% |
+| Workspaces | ~68% |
+| Document System | ~55% |
 | Knowledge Ingestion | ~60% |
 | AI System (core chat) | ~65% |
 | RAG | ~55% |
 | Learning | ~20% |
 | Research | ~10% |
-| UI (shell + navigation) | ~40% |
+| UI (shell + navigation) | ~50% |
 | Performance | ~45% |
-| **Overall** | **~35–40%** |
+| **Overall** | **~48%** |
 
 ---
 
@@ -221,7 +232,63 @@ environment.
 
 ## Changelog
 
-- **[Audit pass, this entry]** — Full source-level engineering audit
+- **[Frontend navigation pass, this entry]** — Wired the 5 previously
+  built-but-unreachable views into the shell (`ConceptGraphView`,
+  `ResearchMode`, `QuizExamMode`, `MemoryAnalyticsView`, `DocumentView`),
+  no new feature logic behind any of them:
+  - `state/store.ts`'s `AppView` union gained `"concept-graph"`,
+    `"research-mode"`, `"quiz-exam"`, `"memory-analytics"`, and
+    `"document-view"`.
+  - `App.tsx`'s `mainContent` conditional now renders each, following the
+    exact same pattern already used for `"settings"`/`"workspace-detail"`.
+  - `ActivityRail.tsx`: the previously-disabled Concept Graph and Memory &
+    Analytics rail buttons are now enabled and route to their views. A
+    Global Search rail entry was deliberately not added — no backend
+    surface exists for it yet (see "Remaining Atlas v1.0 Work").
+  - `TopNav.tsx`: added a workspace-scoped mode switcher (Explorer /
+    Document View / Research Mode / Quiz-Exam) shown once a workspace is
+    open, per §8.1's "Main Document Area ... shows the current document or
+    the current mode" — this is the reachable entry point for the 3
+    workspace-context views.
+  - No router library was introduced; view switching stayed on the
+    existing `currentView` state-based approach, which was structurally
+    sufficient for this.
+  - None of the 5 views' internal logic was touched — each still renders
+    its pre-existing honest empty/stub state (no backing IPC calls exist
+    yet for any of them), which is expected for this phase, not a defect.
+  - Added `App.test.tsx` (navigation-level tests covering all 5 new routes
+    plus a no-regression check on Settings/Dashboard) and confirmed no
+    existing view regressed.
+
+- **[Bugfix pass, prior entry]** — Fixed the two P0/P1 backend defects
+  identified by the prior engineering audit:
+  - **DOCX parser**: `find_document_xml` (formerly
+    `find_stored_document_xml`) in `atlas-indexer::parser::docx` now
+    decompresses `word/document.xml` ZIP entries using DEFLATE (compression
+    method 8, via `flate2::read::DeflateDecoder`), in addition to the
+    pre-existing STORED (method 0) fast path. Real Word/LibreOffice/
+    python-docx output — which is DEFLATE-compressed — now extracts real
+    paragraph text instead of degrading to an empty `Image` block. Added a
+    unit test that builds a genuinely DEFLATE-compressed synthetic `.docx`
+
+    fixture (via `flate2::write::DeflateEncoder`, not a raw XML string) and
+    asserts real text comes back, plus a regression test confirming the
+    STORED fast path still works.
+  - **Folder watcher debounce**: `FolderWatcher::watch` in
+    `atlas-watcher::watcher` previously computed `observed_at_ms` from a
+    freshly-constructed `Instant::now().elapsed()` (always ≈0) in the
+    `notify` callback, while the debounce thread's `now_ms()` measured
+    elapsed time from its own `start: Instant` fixed at thread spawn — two
+    different clocks being compared, causing the debounce window to
+    silently collapse to the ~50ms poll interval once the watcher had run
+    longer than `window_ms`. Fixed by sharing one `Instant` origin between
+    the callback and the debounce thread. Added a test that runs the
+    watcher past its own debounce window, then fires a rapid multi-tick
+    burst of writes to the same file, and asserts they still coalesce into
+    exactly one enqueued indexing job.
+  - `Debouncer::drain_ready`'s comparison logic itself was not touched —
+    only how the two timestamps it compares are computed.
+- **[Audit pass, prior entry]** — Full source-level engineering audit
   performed across all crates and the frontend. No code changed. This
   README rewritten to replace the previous inaccurate "skeleton only, no
   business logic" framing with a verified, itemized status. Findings:

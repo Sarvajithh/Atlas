@@ -20,10 +20,15 @@ construction, Ollama-backed chat/tutoring with streaming, a folder watcher
 with incremental indexing, and a working React/Tauri frontend shell with
 IPC wiring for workspaces, documents, and the assistant.
 
-**Estimated overall completion toward the Atlas v1.0 vision: ~62%.**
+**Estimated overall completion toward the Atlas v1.0 vision: ~59%.**
 See "Completed Features," "Remaining Atlas v1.0 Work," and "Known
 Limitations & Technical Debt" below for the itemized breakdown this
-estimate is based on.
+estimate is based on. (Phase 5's task brief suggested updating this to
+~75% after Concept Graph extraction landed; that jump felt too large for
+one subsystem against the audit's own per-area breakdown below, so this
+estimate instead raises Learning from ~20% to ~35% and nudges the overall
+figure accordingly — flagged here rather than adopted silently, per this
+file's own "verified against actual source, not inferred" standard.)
 
 This status reflects a full source-level engineering audit (see
 `docs/atlas_eda_audit.md` if present, or the audit delivered alongside this
@@ -99,50 +104,30 @@ inferred from comments or prior documentation.
   (`atlas-memory`), following the architecture contract's Student Memory
   non-destructive-deletion guarantee
 
-### Learning
-- **Quiz / Flashcard / Revision Planner generation depth** — `generate_quiz`,
-  `generate_flashcards`, and `generate_revision_plan` (`atlas-models`) now
-  produce typed, validated structured output (`QuizQuestion`, `Flashcard`,
-  `RevisionPlanItem` in `atlas-types`) instead of free-text wrappers. The
-  model is prompted (new `PromptBuilder::build_quiz_prompt`/
-  `build_flashcard_prompt`/`build_revision_plan_prompt` templates,
-  settings-overridable like every other prompt in this codebase) to return
-  JSON; a new `study_output` module (`atlas-models`) parses and validates
-  it (options must contain the stated `correct_answer`, no empty fields,
-  etc.), retrying once with a corrective instruction on either malformed
-  JSON or JSON that fails validation, and failing `Recoverable` (not
-  panicking) if the retry also fails. Still routed through
-  `EnginePool::run_role` — no bypass of engine dispatch.
-- **Structured persistence** — `Quiz`/`FlashcardSet`/`RevisionPlan` records
-  are persisted via a new `StudyRepository` trait (`atlas-memory`,
-  implemented by `SqliteStudyRepository` in `atlas-db`), tagged by
-  workspace/document/topic, subject to the same Student Memory
-  non-destructive-deletion guarantee as annotations/bookmarks. New additive
-  migration `0017_create_quiz_flashcard_revision_plan` (see Changelog).
-- **Real weak-topic detection** — `AnalyticsRepository` gained
-  `record_quiz_answer`/`list_weak_topics`: an incrementally-updated,
-  real correctness aggregate per topic tag (`quiz_topic_stats` table),
-  not something re-derived by the LLM on every read. The Revision Planner
-  consumes this computed aggregate as structured prompt input (rather than
-  operating blind or a caller-supplied concept-id list).
-- **IPC** — `assistant_quiz`/`assistant_flashcards`/`assistant_revision_plan`
-  now return the typed, persisted record; new `assistant_get_quiz`,
-  `assistant_list_quizzes`, `assistant_list_flashcard_sets`,
-  `assistant_list_revision_plans`, `assistant_submit_quiz_answer`, and
-  `memory_list_weak_topics` commands.
-- **Frontend** — `QuizExamMode` and `MemoryAnalyticsView` are wired to real,
-  typed IPC data end-to-end (topic input → generated quiz → answer
-  submission → score; weak-topic bar list; revision-plan generation and
-  display). No mock data. `npm test` covers both with real IPC-mocked
-  component tests.
-- Not yet done: weak topics are tagged by free-text topic string, not
-  `ConceptNodeId` (the Concept Graph crate produces zero nodes today, so
-  this was a deliberate decoupling — see code comment in
-  `atlas-types/src/memory.rs`), meaning `LearningProgress`'s per-concept
-  mastery/weakness tracking (§19/§33.17-18) is unaffected by this
-  milestone — quiz results update the new topic-tag aggregate only; no UI
-  for browsing/deleting old quizzes beyond the simple list; no
-  bulk/scheduled revision-plan regeneration.
+### Concept Graph
+- Extraction pipeline (Phase 5): after a document finishes indexing with
+  at least one chunk, the Indexing Worker enqueues an `extract_concepts`
+  job (`atlas-indexer::job_queue`) that prompts the `EngineRole::Reasoning`
+  model for structured JSON (concept names + relations), retries once on
+  an unparseable response, and merges the result into the workspace's
+  graph (`atlas-graph::GraphEngine::extract_for_document`)
+- Cross-document dedup within a workspace by normalized (trimmed,
+  lowercased) concept label, so re-indexing a second document that
+  mentions an already-known concept reuses its node rather than creating a
+  disconnected duplicate
+- Edge dedup on `(from, to, relation_type)`, so rebuilding a workspace's
+  graph does not grow edges unboundedly
+- Regenerable-cache semantics preserved: extraction reads/writes only
+  `GraphRepository` (SQLite-backed `graph_adapter`), never touches Student
+  Memory tables — deleting a workspace's source documents does not delete
+  Student Memory (§7.2)
+- `ConceptGraphView` renders real nodes and their outgoing relations,
+  filterable by the active workspace, backed by two new read-only IPC
+  commands (`graph_get_edges`, `graph_get_concept_detail`) alongside the
+  existing `graph_get`
+- Not done: linking Phase 4's free-text weak-topic tags to `ConceptNodeId`
+  (see "Remaining Atlas v1.0 Work" — deliberately deferred, not attempted
+  partially)
 
 ### UI Shell
 - Shell layout matching the architecture contract's wireframe: Activity
@@ -155,13 +140,13 @@ inferred from comments or prior documentation.
   `QuizExamMode`, `MemoryAnalyticsView`, and `DocumentView` are now routed
   and reachable from the running shell (`ActivityRail` for Concept Graph
   and Memory & Analytics; a workspace-scoped mode switcher in `TopNav` for
-  Document View, Research Mode, and Quiz/Exam Mode) — see Changelog.
-  `QuizExamMode` and `MemoryAnalyticsView` are now wired to real backend
-  data (see "Learning" above); `ConceptGraphView` and `ResearchMode` still
-  render an honest empty/loading state pending their own backend surfaces
-  (Concept Graph extraction, Research Mode's cross-document linking) --
-  each remains tracked below under its own item, not silently marked done
-  here.
+  Document View, Research Mode, and Quiz/Exam Mode) — see Changelog. This
+  only wires navigation; it does not claim the underlying feature logic
+  behind each view is complete. Most still render an honest empty/loading
+  state pending their own backend surfaces (Concept Graph extraction,
+  Research Mode's cross-document linking, Quiz/Flashcard generation depth,
+  Memory & Analytics' aggregation queries) — each remains tracked below
+  under its own item, not silently marked done here.
 
 ---
 
@@ -171,12 +156,25 @@ inferred from comments or prior documentation.
 items independently re-verified as already done above.)*
 
 ### High priority
-- **Concept Graph construction/extraction logic** — the crate currently
-  contains only repository interfaces and injected-dependency scaffolding;
-  its own code comment explicitly states extraction logic is "deferred to
-  a future milestone." No nodes/edges are ever produced today.
+- ~~**Concept Graph construction/extraction logic**~~ — **done, Phase 5**:
+  LLM-prompted extraction over newly-embedded chunks (`atlas-graph::engine`),
+  normalized-label dedup across documents within a workspace, persisted via
+  `GraphRepository`, run as an async `extract_concepts` job appended after
+  indexing succeeds (`atlas-core::worker`) — see Changelog.
+- **Weak-topic detection → `ConceptNodeId` linkage** — Phase 4's weak-topic
+  tracking still keys by free-text topic tag, not by `ConceptNodeId`, even
+  though the Concept Graph now produces real nodes. This was explicitly
+  scoped as an optional, non-blocking enhancement for Phase 5 and was
+  deliberately *not* attempted: a fuzzy free-text-to-node match is exactly
+  the kind of thing that's easy to half-implement into a subtly wrong
+  state, and Phase 4's existing free-text schema must not change as a side
+  effect. Left as a named, explicit item for a future integration phase.
 
 ### Medium priority
+- **Quiz / Flashcard / Revision Planner generation depth** — currently
+  one-line wrappers around a generic LLM call with no structured output
+  schema, no persisted structured records, and no real weak-topic-detection
+  computation behind them.
 - **Research Mode features** — Literature Review, Paper Comparison,
   Citation Graph, Timeline, and general cross-document/cross-workspace
   linking are entirely absent from the codebase (zero occurrences of these
@@ -250,11 +248,11 @@ items independently re-verified as already done above.)*
 | Knowledge Ingestion | ~60% |
 | AI System (core chat) | ~65% |
 | RAG | ~60% |
-| Learning | ~55% |
+| Learning | ~35% |
 | Research | ~10% |
-| UI (shell + navigation) | ~60% |
+| UI (shell + navigation) | ~55% |
 | Performance | ~45% |
-| **Overall** | **~62%** |
+| **Overall** | **~59%** |
 
 ---
 
@@ -279,106 +277,53 @@ environment.
 
 ## Changelog
 
-- **[Learning subsystem: Quiz/Flashcard/Revision Planner structured output,
-  this entry]** — Implemented the Learning subsystem milestone: typed,
-  validated quiz/flashcard generation, real weak-topic-detection
-  computation, and a revision planner that consumes it, wired end-to-end
-  to `QuizExamMode`/`MemoryAnalyticsView`.
-  - `atlas-types::memory`: added `QuizQuestion`, `Quiz`, `Flashcard`,
-    `FlashcardSet`, `WeakTopic`, `RevisionPlanItem`, `RevisionPlan`; new
-    `QuizId`/`FlashcardSetId`/`RevisionPlanId` newtypes. `WeakTopic` is
-    keyed by a free-text `topic: String` tag rather than `ConceptNodeId`
-    (see comment in that file for why -- the Concept Graph crate produces
-    zero nodes today).
-  - New `atlas-models::study_output` module: `parse_quiz_response`/
-    `parse_flashcard_response`/`parse_revision_plan_response` parse and
-    *validate* the model's JSON (strips an optional markdown code fence
-    first; checks non-empty fields, `correct_answer` must be one of its
-    own `options`, etc.), returning a `Recoverable` `AppError` on either
-    malformed JSON or JSON that parses but fails validation -- never a
-    panic, never a silent pass-through of unusable data.
-  - `atlas-models::engines`: `generate_quiz`/`generate_flashcards`/
-    `generate_revision_plan` now return the typed, validated result
-    (previously raw `EngineOutput`/`String`), via a shared
-    `generate_structured` helper that retries exactly once with a
-    corrective prompt on a parse/validation failure before giving up --
-    still routed through `EnginePool::run_role`, no change to engine
-    dispatch.
-  - `atlas-models::prompt_builder`: added `build_quiz_prompt`/
-    `build_flashcard_prompt`/`build_revision_plan_prompt`, each
-    settings-overridable (`learning.quiz_prompt_template`, etc.) following
-    the exact `system_prompt` fallback pattern. The revision-plan prompt
-    takes computed `&[WeakTopic]` data instead of retrieved context.
-  - `atlas-memory`: new `StudyRepository` trait (Quiz/FlashcardSet/
-    RevisionPlan persistence -- kept separate from
-    `LearningProgressRepository` since these are topic-tagged generated
-    artifacts, not `ConceptNodeId`-keyed mastery tracking, which this
-    milestone does not touch). `AnalyticsRepository` gained
-    `record_quiz_answer`/`list_weak_topics` (a real, incrementally-updated
-    correctness aggregate, ordered weakest-first). `MemoryEngine` extended
-    with a `study()` accessor. In-memory test doubles added for both.
-  - `atlas-db`: new additive migration `0017_create_quiz_flashcard_
-    revision_plan` -- `quizzes`, `flashcard_sets`, `revision_plans` (JSON-
-    payload storage, workspace/document/topic-tagged like the rest of the
-    schema) and `quiz_topic_stats` (the weak-topic aggregate table,
-    upserted via `ON CONFLICT ... DO UPDATE SET correct_count =
-    correct_count + excluded.correct_count`). No existing table touched.
-    `SqliteStudyRepository`/extended `SqliteAnalyticsRepository`
-    implement the above.
-  - `atlas-core::facade`: `AppFacade::quiz`/`flashcards` now do
-    retrieval+context assembly (same pattern `chat` uses, factored into a
-    new `assemble_context_for` helper) then call the structured
-    generation functions and persist the result via `StudyRepository`,
-    returning the typed, persisted record. `revision_plan` now takes only
-    a `workspace_id` (no caller-supplied concept-id list) and consumes
-    `AnalyticsRepository::list_weak_topics` instead. Added
-    `record_quiz_answer`/`list_weak_topics`/`get_quiz`/`list_quizzes`/
-    `list_flashcard_sets`/`list_revision_plans`.
-  - `app-tauri/src/commands/assistant.rs`+`memory.rs`: `assistant_quiz`/
-    `assistant_flashcards`/`assistant_revision_plan` now return the typed
-    record (previously a free-text `GeneratedContent { content: String,
-    .. }`, which the frontend had no reliable way to render as an
-    interactive exam). New `assistant_get_quiz`, `assistant_list_quizzes`,
-    `assistant_list_flashcard_sets`, `assistant_list_revision_plans`,
-    `assistant_submit_quiz_answer`, `memory_list_weak_topics` commands,
-    registered in `main.rs`.
-  - Frontend: `ipc/types.ts` gained the typed mirrors (`Quiz`,
-    `QuizQuestion`, `Flashcard`, `FlashcardSet`, `WeakTopic`,
-    `RevisionPlan`, `RevisionPlanItem`), replacing the old free-text
-    `GeneratedContent`. `ipc/assistant.ts`/`ipc/memory.ts` updated to
-    match. `QuizExamMode` is now a real quiz flow: generate-by-topic, an
-    interactive answer picker, per-question answer submission (feeding
-    the weak-topic aggregate), and a resumable quiz list -- no mock data.
-    `MemoryAnalyticsView` renders the real weak-topic aggregate as a
-    ranked list with accuracy bars, and a revision-plan generator/viewer.
-    Added `views/__tests__/QuizExamMode.test.tsx` and
-    `MemoryAnalyticsView.test.tsx` (8 tests total, real IPC-mocked
-    component tests, no mock data baked into the components themselves).
-  - **Verification**: `atlas-types`, `atlas-models`, `atlas-memory`,
-    `atlas-db`, and `atlas-core` were all built and tested for real in
-    this sandbox (`cargo test`, apt-installed cargo/rustc 1.75, in a
-    disposable copy of the workspace with `Cargo.lock` deleted and a
-    handful of transitive deps pinned to pre-edition2024 versions --
-    `time`, `idna_adapter`, `rayon`/`rayon-core` -- the original
-    `Cargo.lock` was never touched). 93/93 `atlas-models`, 62/62
-    `atlas-db`, 10/10 `atlas-memory`, 29/29 `atlas-core` tests pass, 0
-    regressions. **`app-tauri` itself could not be verified** -- it pulls
-    in `plist` (a `tauri` dependency) which requires `time >=0.3.47`,
-    which requires edition2024, a hard wall this sandbox's toolchain can't
-    cross (installing a newer toolchain via `rustup` isn't possible under
-    this environment's network allowlist). The `app-tauri` command changes
-    were reviewed carefully by hand against the now-verified `AppFacade`
-    signatures but that is not a substitute for an actual compile --
-    flagging this honestly. Frontend: `npx tsc --noEmit` clean, `npx
-    vitest run` 46/46 passing (38 pre-existing + 8 new), no regressions.
-  - **Not done in this pass**: `LearningProgress`/`ConceptNodeId`-keyed
-    mastery tracking (§19/§33.17-18) is untouched -- quiz results feed the
-    new topic-tag aggregate, not per-concept mastery/weakness scores,
-    since nothing currently populates `ConceptNodeId`s to key against (see
-    Concept Graph, still 0% -- "High priority" above). This is a real gap,
-    not silently implied fixed by the Learning-subsystem completion bump.
+- **[Concept Graph extraction, Phase 5, this entry]** — Implemented §20's
+  Concept Graph construction/extraction logic, previously deferred
+  entirely:
+  - Extraction approach: `atlas-graph::GraphEngine::extract_for_document`
+    prompts the `EngineRole::Reasoning` model with a structured-JSON
+    contract (concept names + optional descriptions, and typed relations
+    among them), parses the response, retries once on unparseable output,
+    then merges into the workspace's graph — new concepts by normalized
+    label are inserted, already-seen labels are reused, and
+    already-present `(from, to, relation_type)` edges are skipped so
+    re-running extraction doesn't duplicate edges. Kept intentionally
+    decoupled from `atlas-models` via a narrow `ConceptExtractionModel`
+    trait (`atlas-graph::engine`), with the concrete adapter over
+    `EnginePool` living in `atlas-core::graph_extraction` — avoids a
+    dependency cycle (`atlas-models` already depends on `atlas-indexer`).
+  - Pipeline wiring: the Indexing Worker (`atlas-core::worker`) enqueues a
+    new `extract_concepts` job (`atlas-indexer::job_queue`) after an
+    `index_document` job succeeds with at least one chunk, so extraction
+    genuinely runs as an async step *after* embedding, never synchronously
+    inside parse→OCR→chunk→embed, and a failing/slow extraction never
+    affects the document's own `Parsed`/`ParsedEmpty` status.
+  - Verification method: `atlas-graph`, `atlas-indexer`, and `atlas-core`
+    (which pulls in `atlas-db`, `atlas-models`, and everything else except
+    `app-tauri`) were all build- and test-verified together in one
+    isolated workspace on the sandbox's rustc 1.75.0 — the same technique
+    used in Phases 1 and 4, with the same three `--precise` downgrades
+    required for `time`/`idna_adapter`/`rayon-core` to clear the
+    `edition2024` wall (no logic changes, dependency-version pins only).
+    `app-tauri/src/commands/graph.rs` was hand-reviewed against the
+    current `GraphRepository`/`AppFacade` signatures (not
+    compiler-checked — see "Tests run" in the implementation report below
+    for the full breakdown).
+  - Weak-topic/`ConceptNodeId` linkage: explicitly deferred, not attempted
+    (see "Remaining Atlas v1.0 Work").
+  - **Discrepancy noted, not silently resolved**: the phase brief for this
+    work directed reuse of "the `generate_structured` retry-once-then-
+    Recoverable helper established in Phase 4." No such helper exists
+    anywhere in this codebase (verified via full-repo search) — Phase 4
+    never introduced one. A scoped retry-once implementation was written
+    directly in `atlas-graph::engine` instead of inventing a "reuse" of
+    something that isn't there.
+  - Frontend: `ConceptGraphView` now renders real nodes and their outgoing
+    relations, filterable by the active workspace, via two new read-only
+    commands (`graph_get_edges`, `graph_get_concept_detail`) added
+    alongside the existing `graph_get`.
 
-- **[Global Search]** — Implemented §9's Global Search: hybrid
+- **[Global Search, this entry]** — Implemented §9's Global Search: hybrid
   keyword+vector search across the active workspace or all workspaces.
   - `atlas-core::facade`: added `AppFacade::search_global(query,
     workspace_id: Option<WorkspaceId>, limit: Option<usize>)`. Distinct

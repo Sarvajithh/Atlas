@@ -33,6 +33,15 @@ export interface ConceptNode {
   created_at: string;
 }
 
+/** Mirrors backend `ConceptEdge` (§33.6), returned by `graph.getEdges`. */
+export interface ConceptEdge {
+  id: number;
+  from_node_id: number;
+  to_node_id: number;
+  relation_type: RelationType;
+  weight: number;
+}
+
 export type ParseStatus = "Pending" | "Parsing" | "Parsed" | "ParsedEmpty" | "Failed";
 
 /** Mirrors backend `DocumentRecord` (§33.2), returned by `document.list`/`document.get`. */
@@ -120,66 +129,10 @@ export interface AssistantAnswer {
   citations: Citation[];
 }
 
-/** Mirrors backend `QuizQuestion` (§ Learning subsystem structured output). */
-export interface QuizQuestion {
-  question: string;
-  options: string[];
-  correct_answer: string;
-  source_citations: string[];
-}
-
-/** Mirrors backend `Quiz`. Persisted Student Memory, tagged by workspace/document/topic. */
-export interface Quiz {
-  id: number;
-  workspace_id: number;
-  document_id: number | null;
-  topic: string;
-  questions: QuizQuestion[];
-  created_at: string;
-}
-
-/** Mirrors backend `Flashcard`. */
-export interface Flashcard {
-  front: string;
-  back: string;
-  source_citations: string[];
-}
-
-/** Mirrors backend `FlashcardSet`. */
-export interface FlashcardSet {
-  id: number;
-  workspace_id: number;
-  document_id: number | null;
-  topic: string;
-  cards: Flashcard[];
-  created_at: string;
-}
-
-/**
- * Mirrors backend `WeakTopic` (§ Learning subsystem weak-topic detection):
- * a real, computed correctness aggregate per topic tag -- not model-
- * inferred. `accuracy` is `correct_count / (correct_count + incorrect_count)`.
- */
-export interface WeakTopic {
-  topic: string;
-  correct_count: number;
-  incorrect_count: number;
-  accuracy: number;
-}
-
-/** Mirrors backend `RevisionPlanItem`. `priority` is 1-based; lower = more urgent. */
-export interface RevisionPlanItem {
-  topic: string;
-  recommendation: string;
-  priority: number;
-}
-
-/** Mirrors backend `RevisionPlan`, built from the computed `WeakTopic` aggregate. */
-export interface RevisionPlan {
-  id: number;
-  workspace_id: number;
-  items: RevisionPlanItem[];
-  created_at: string;
+/** Mirrors backend `GeneratedContent` (quiz/flashcards responses). */
+export interface GeneratedContent {
+  content: string;
+  citations: Citation[];
 }
 
 /** Mirrors backend `RunningIndexingJob` (§21, `atlas_types::job`). */

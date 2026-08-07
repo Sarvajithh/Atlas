@@ -17,13 +17,14 @@ use atlas_db::jobs_adapter::SqliteJobRepository;
 use atlas_db::keyword_search_adapter::SqliteKeywordSearchRepository;
 use atlas_db::memory_adapter::{
     SqliteAnalyticsRepository, SqliteAnnotationRepository, SqliteBookmarkRepository,
-    SqliteChatRepository, SqliteLearningProgressRepository, SqliteStudyRepository,
+    SqliteChatRepository, SqliteLearningProgressRepository,
 };
 use atlas_db::model_registry_adapter::SqliteModelRegistryRepository;
 use atlas_db::settings_adapter::SqliteSettingsProvider;
 use atlas_db::workspace_adapter::SqliteWorkspaceRepository;
 use atlas_events::EventBus;
 use atlas_graph::GraphEngine;
+use crate::graph_extraction::EnginePoolConceptExtractor;
 use atlas_indexer::document_repository::DocumentRepository;
 use atlas_indexer::job_queue::JobQueue;
 use atlas_indexer::ocr::TesseractCliOcrEngine;
@@ -33,13 +34,12 @@ use atlas_types::job::IndexingStatus;
 use atlas_memory::{ChatRepository, MemoryEngine};
 use atlas_models::context_builder::AssembledContext;
 use atlas_models::{
-    generate_flashcards, generate_quiz, generate_revision_plan, ContextBuilder, EnginePool, Intent,
-    ModelDiscoveryService, ModelRegistryRepository, ModelScheduler, OllamaConnection, OllamaEmbeddingEngine,
-    OllamaEngine, OllamaProvider, PromptBuilder, Reranker, Retriever, RoutingTable,
+    ContextBuilder, EnginePool, Intent, ModelDiscoveryService, ModelRegistryRepository, ModelScheduler,
+    OllamaConnection, OllamaEmbeddingEngine, OllamaEngine, OllamaProvider, PromptBuilder, Reranker, Retriever,
+    RoutingTable,
 };
 use atlas_types::chat::{ChatMessage, ChatMode, ChatRole, ChatSession};
-use atlas_types::ids::{ChatSessionId, DocumentId, FlashcardSetId, QuizId, RevisionPlanId, WorkspaceId};
-use atlas_types::memory::{FlashcardSet, Quiz, RevisionPlan, WeakTopic};
+use atlas_types::ids::{ChatSessionId, WorkspaceId};
 use atlas_types::model::EngineRole;
 use atlas_types::retrieval::{Citation, GlobalSearchResult};
 use atlas_types::workspace::WorkspaceStatus;
@@ -193,19 +193,16 @@ impl AppFacade {
         let chat = Arc::new(SqliteChatRepository::new(connection.clone()));
         let progress = Arc::new(SqliteLearningProgressRepository::new(connection.clone()));
         let analytics = Arc::new(SqliteAnalyticsRepository::new(connection.clone()));
-        let study = Arc::new(SqliteStudyRepository::new(connection.clone()));
         let memory_engine = Arc::new(MemoryEngine::new(
             annotations,
             bookmarks,
             chat.clone(),
             progress,
             analytics,
-            study,
             events.clone(),
         ));
 
         let graph_repository = Arc::new(SqliteGraphRepository::new(connection.clone()));
-        let graph_engine = Arc::new(GraphEngine::new(graph_repository, events.clone()));
 
         let job_repository = Arc::new(SqliteJobRepository::new(connection.clone()));
         let job_queue = Arc::new(JobQueue::new(job_repository));
@@ -287,6 +284,15 @@ impl AppFacade {
 
         let model_discovery = Arc::new(ModelDiscoveryService::new(ollama.clone(), model_registry.clone(), events.clone()));
 
+        // Concept Graph extraction (§20, Phase 5) is wired here, after
+        // `engine_pool` exists, since it reuses the pool's
+        // `EngineRole::Reasoning` engine rather than owning a model
+        // connection of its own (see `graph_extraction::EnginePoolConceptExtractor`).
+        let graph_engine = Arc::new(
+            GraphEngine::new(graph_repository, events.clone())
+                .with_model(Arc::new(EnginePoolConceptExtractor::new(engine_pool.clone()))),
+        );
+
         Self {
             workspace_engine,
             memory_engine,
@@ -339,6 +345,7 @@ impl AppFacade {
                 self.job_queue.clone(),
                 self.events.clone(),
             )
+            .with_graph_engine(self.graph_engine.clone())
         });
         worker.start();
         Ok(())
@@ -1052,127 +1059,70 @@ impl AppFacade {
 
     /// Quiz Generator feature (§14.1 Reasoning Engine composition; see
     /// `atlas_models::engines` module doc for why this is not a new Engine
-    /// role). Retrieval + context assembly (§39/§40) runs the same way
-    /// `chat`'s pipeline does, but the prompt is
-    /// `PromptBuilder::build_quiz_prompt` (a structured-JSON contract) and
-    /// the response is parsed/validated/retried by
-    /// `atlas_models::generate_quiz` rather than treated as free text --
-    /// this bypasses `ModelScheduler::execute` (which is hardwired to the
-    /// general chat-style `PromptBuilder::build`) but still goes through
-    /// `EnginePool::run_role` exactly as the Scheduler itself does, so
-    /// engine routing/dispatch is unchanged. The result is persisted via
-    /// `StudyRepository` before being returned, tagged by
-    /// workspace/document/topic.
-    pub fn quiz(
-        &self,
-        workspace_id: WorkspaceId,
-        topic: &str,
-        document_id: Option<DocumentId>,
-        question_count: u8,
-    ) -> Result<Quiz, AppError> {
-        let context = self.assemble_context_for(workspace_id, topic, EngineRole::Reasoning)?;
-        let prompt = self.prompt_builder.build_quiz_prompt(topic, context, question_count as u32);
-        let generated = generate_quiz(&self.engine_pool, prompt)?;
-        self.memory_engine.study().insert_quiz(Quiz {
-            id: QuizId(0),
-            workspace_id,
-            document_id,
-            topic: generated.topic,
-            questions: generated.questions,
-            created_at: atlas_utils::time::now_iso8601(),
-        })
+    /// role). `topic` is folded into the retrieval query and the
+    /// instruction sent to the Reasoning Engine in one pass -- the Model
+    /// Scheduler pipeline for `Intent::Quiz` already routes through
+    /// Retriever -> Reranker -> Reasoning (§15).
+    pub fn quiz(&self, workspace_id: WorkspaceId, topic: &str, question_count: u8) -> Result<(String, Vec<Citation>), AppError> {
+        let instruction = format!(
+            "Generate {question_count} quiz questions (with answers) about: {topic}. Base every question strictly on the provided context."
+        );
+        let (output, citations) = self
+            .scheduler
+            .execute(&self.engine_pool, &self.retriever, workspace_id, &Intent::Quiz, &instruction, 8, None)?;
+        Ok((output.content, citations))
     }
 
-    /// Flashcard Generator feature, composed on the Tutor Engine. Same
-    /// structured-output/retry/persistence pattern as [`Self::quiz`].
-    pub fn flashcards(
-        &self,
-        workspace_id: WorkspaceId,
-        topic: &str,
-        document_id: Option<DocumentId>,
-        card_count: u8,
-    ) -> Result<FlashcardSet, AppError> {
-        let context = self.assemble_context_for(workspace_id, topic, EngineRole::Tutor)?;
-        let prompt = self.prompt_builder.build_flashcard_prompt(topic, context, card_count as u32);
-        let generated = generate_flashcards(&self.engine_pool, prompt)?;
-        self.memory_engine.study().insert_flashcard_set(FlashcardSet {
-            id: FlashcardSetId(0),
+    /// Flashcard Generator feature, composed on the Tutor Engine (via
+    /// `Intent::Tutoring`'s existing routing) rather than a new role.
+    pub fn flashcards(&self, workspace_id: WorkspaceId, topic: &str, card_count: u8) -> Result<(String, Vec<Citation>), AppError> {
+        let instruction = format!(
+            "Create {card_count} flashcards (front/back pairs) covering the key facts about: {topic}. Base every card strictly on the provided context."
+        );
+        let (output, citations) = self.scheduler.execute(
+            &self.engine_pool,
+            &self.retriever,
             workspace_id,
-            document_id,
-            topic: generated.topic,
-            cards: generated.cards,
-            created_at: atlas_utils::time::now_iso8601(),
-        })
+            &Intent::Tutoring,
+            &instruction,
+            8,
+            None,
+        )?;
+        Ok((output.content, citations))
     }
 
-    /// Revision Planner feature, composed on the Planner Engine. Consumes
-    /// the *computed* weak-topic aggregate (§ Learning subsystem weak-topic
-    /// detection, `AnalyticsRepository::list_weak_topics`) rather than
-    /// operating blind or re-deriving weakness via the model -- matching
-    /// the implementation plan's explicit requirement. No retrieval step:
-    /// the planner's input is Student Memory data, not document context.
-    pub fn revision_plan(&self, workspace_id: WorkspaceId) -> Result<RevisionPlan, AppError> {
-        let weak_topics = self.memory_engine.analytics().list_weak_topics(workspace_id)?;
-        let prompt = self.prompt_builder.build_revision_plan_prompt(&weak_topics);
-        let generated = generate_revision_plan(&self.engine_pool, prompt)?;
-        self.memory_engine.study().insert_revision_plan(RevisionPlan {
-            id: RevisionPlanId(0),
-            workspace_id,
-            items: generated.items,
-            created_at: atlas_utils::time::now_iso8601(),
-        })
-    }
-
-    /// Retrieve + rerank + assemble context for `query`, sized against the
-    /// real context window of whichever model currently backs `role` --
-    /// the same "resolve the terminal role's model before sizing context"
-    /// approach `ModelScheduler::execute` uses (Fix 4, P0 audit), extracted
-    /// here so `quiz`/`flashcards` don't each re-duplicate it while still
-    /// not going through the Scheduler's `Intent`-routed pipeline (which
-    /// is hardwired to the general chat prompt template, not the
-    /// structured-output ones).
-    fn assemble_context_for(&self, workspace_id: WorkspaceId, query: &str, role: EngineRole) -> Result<AssembledContext, AppError> {
-        let hits = self.retriever.retrieve(workspace_id, query, 8)?;
-        let model_context_length = match self.model_provider.current_model_for(role) {
-            Ok(entry) => entry.context_length,
-            Err(err) => {
-                atlas_utils::log_warn!(
-                    "[Facade] could not resolve a model for {role:?} while sizing the context budget ({}), falling back to the context builder's configured ceiling",
-                    err.message
-                );
-                self.context_builder.max_context_tokens()
+    /// Revision Planner feature, composed on the Planner Engine
+    /// (`Intent::Planning`, which -- per §15 -- skips retrieval and instead
+    /// consumes Student Memory's weakness data directly, assembled here
+    /// into the instruction the Planner Engine receives).
+    pub fn revision_plan(&self, workspace_id: WorkspaceId, concept_node_ids: &[atlas_types::ids::ConceptNodeId]) -> Result<String, AppError> {
+        let mut weaknesses = Vec::new();
+        for &id in concept_node_ids {
+            if let Some(progress) = self.memory_engine.progress().get_progress(id)? {
+                weaknesses.push(format!(
+                    "concept {}: mastery {:.2}, weakness {:.2}, attempts {}",
+                    id.0, progress.mastery_score, progress.weakness_score, progress.attempt_count
+                ));
             }
+        }
+        let instruction = if weaknesses.is_empty() {
+            "Produce a general study revision schedule for the next 7 days.".to_string()
+        } else {
+            format!(
+                "Produce a prioritized revision schedule for the next 7 days, focusing more time on weaker concepts. Student progress:\n{}",
+                weaknesses.join("\n")
+            )
         };
-        self.context_builder.assemble(query, hits, model_context_length)
-    }
-
-    /// Record one quiz-question outcome against a topic tag (§ Learning
-    /// subsystem weak-topic detection) -- called when the frontend submits
-    /// a quiz attempt's answers. Updates the real, incrementally-computed
-    /// aggregate `revision_plan` above reads from.
-    pub fn record_quiz_answer(&self, workspace_id: WorkspaceId, topic: &str, correct: bool) -> Result<(), AppError> {
-        self.memory_engine.analytics().record_quiz_answer(workspace_id, topic, correct)
-    }
-
-    /// The computed weak-topic aggregate for a workspace (§ `MemoryAnalyticsView`).
-    pub fn list_weak_topics(&self, workspace_id: WorkspaceId) -> Result<Vec<WeakTopic>, AppError> {
-        self.memory_engine.analytics().list_weak_topics(workspace_id)
-    }
-
-    pub fn get_quiz(&self, id: QuizId) -> Result<Option<Quiz>, AppError> {
-        self.memory_engine.study().get_quiz(id)
-    }
-
-    pub fn list_quizzes(&self, workspace_id: WorkspaceId) -> Result<Vec<Quiz>, AppError> {
-        self.memory_engine.study().list_quizzes_for_workspace(workspace_id)
-    }
-
-    pub fn list_flashcard_sets(&self, workspace_id: WorkspaceId) -> Result<Vec<FlashcardSet>, AppError> {
-        self.memory_engine.study().list_flashcard_sets_for_workspace(workspace_id)
-    }
-
-    pub fn list_revision_plans(&self, workspace_id: WorkspaceId) -> Result<Vec<RevisionPlan>, AppError> {
-        self.memory_engine.study().list_revision_plans_for_workspace(workspace_id)
+        let (output, _citations) = self.scheduler.execute(
+            &self.engine_pool,
+            &self.retriever,
+            workspace_id,
+            &Intent::Planning,
+            &instruction,
+            0,
+            None,
+        )?;
+        Ok(output.content)
     }
 }
 
@@ -1257,7 +1207,7 @@ mod tests {
         use atlas_graph::testing::InMemoryGraphRepository;
         use atlas_memory::testing::{
             InMemoryAnalyticsRepository, InMemoryAnnotationRepository, InMemoryBookmarkRepository,
-            InMemoryChatRepository, InMemoryLearningProgressRepository, InMemoryStudyRepository,
+            InMemoryChatRepository, InMemoryLearningProgressRepository,
         };
         use atlas_workspace::testing::InMemoryWorkspaceRepository;
 
@@ -1273,7 +1223,6 @@ mod tests {
             Arc::new(InMemoryChatRepository::new()),
             Arc::new(InMemoryLearningProgressRepository::new()),
             Arc::new(InMemoryAnalyticsRepository::new()),
-            Arc::new(InMemoryStudyRepository::new()),
             events.clone(),
         );
         assert!(memory_engine
@@ -1523,44 +1472,17 @@ mod tests {
         let facade = AppFacade::new(SqliteConnection::open(":memory:"));
 
         assert_eq!(
-            facade.quiz(WorkspaceId(1), "gradient descent", None, 3).unwrap_err().category,
+            facade.quiz(WorkspaceId(1), "gradient descent", 3).unwrap_err().category,
             atlas_utils::ErrorCategory::ModelError
         );
         assert_eq!(
-            facade.flashcards(WorkspaceId(1), "gradient descent", None, 5).unwrap_err().category,
+            facade.flashcards(WorkspaceId(1), "gradient descent", 5).unwrap_err().category,
             atlas_utils::ErrorCategory::ModelError
         );
         assert_eq!(
-            facade.revision_plan(WorkspaceId(1)).unwrap_err().category,
+            facade.revision_plan(WorkspaceId(1), &[]).unwrap_err().category,
             atlas_utils::ErrorCategory::ModelError
         );
-    }
-
-    #[test]
-    fn record_quiz_answer_and_list_weak_topics_work_without_a_live_model() {
-        // Unlike quiz/flashcards/revision_plan generation, recording an
-        // answer and reading the aggregate never touch the Engine Pool --
-        // they must work even with no Ollama/model configured at all.
-        let facade = AppFacade::new(SqliteConnection::open(":memory:"));
-        facade.record_quiz_answer(WorkspaceId(1), "Thermodynamics", false).unwrap();
-        facade.record_quiz_answer(WorkspaceId(1), "Thermodynamics", false).unwrap();
-        facade.record_quiz_answer(WorkspaceId(1), "Thermodynamics", true).unwrap();
-
-        let weak = facade.list_weak_topics(WorkspaceId(1)).unwrap();
-        assert_eq!(weak.len(), 1);
-        assert_eq!(weak[0].topic, "Thermodynamics");
-        assert_eq!(weak[0].correct_count, 1);
-        assert_eq!(weak[0].incorrect_count, 2);
-    }
-
-    #[test]
-    fn quiz_generation_failure_does_not_persist_a_partial_quiz() {
-        // Fix-verifying test: without a live model, `quiz()` must fail
-        // before `StudyRepository::insert_quiz` is ever reached, not leave
-        // a half-formed record behind.
-        let facade = AppFacade::new(SqliteConnection::open(":memory:"));
-        let _ = facade.quiz(WorkspaceId(1), "gradient descent", None, 3);
-        assert!(facade.list_quizzes(WorkspaceId(1)).unwrap().is_empty());
     }
 
     #[test]

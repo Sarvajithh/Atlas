@@ -1,0 +1,16 @@
+[package]
+name = "atlas-graph"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# atlas-graph: Concept Graph construction and querying (§14, §20). Stored
+# relationally in SQLite (nodes/edges tables, §33.5, §33.6) -- no dedicated
+# graph database, per §5/§20. Defines the repository interface only.
+
+[dependencies]
+atlas-types = { path = "../atlas-types" }
+atlas-utils = { path = "../atlas-utils" }
+atlas-events = { path = "../atlas-events" }
+serde = { workspace = true }
+serde_json = { workspace = true }

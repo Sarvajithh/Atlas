@@ -33,6 +33,34 @@ export interface ConceptNode {
   created_at: string;
 }
 
+/** Mirrors backend `ConceptEdge` (§20). */
+export interface ConceptEdge {
+  id: number;
+  from_node_id: number;
+  to_node_id: number;
+  relation_type: RelationType;
+  weight: number;
+}
+
+/**
+ * Mirrors backend `commands::graph::CitationGraphEdge` (Research Mode
+ * phase, `graph.citationGraph`): a real Concept Graph edge whose
+ * endpoints are, between them, sourced from more than one document.
+ */
+export interface CitationGraphEdge {
+  edge: ConceptEdge;
+  from_label: string;
+  to_label: string;
+  source_document_ids: number[];
+}
+
+/** Mirrors backend `commands::rag::SearchResult`, also reused by `rag.researchQuery`. */
+export interface SearchResult {
+  content: string;
+  citations: Citation[];
+}
+
+
 export type ParseStatus = "Pending" | "Parsing" | "Parsed" | "ParsedEmpty" | "Failed";
 
 /** Mirrors backend `DocumentRecord` (§33.2), returned by `document.list`/`document.get`. */

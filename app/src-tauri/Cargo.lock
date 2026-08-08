@@ -159,6 +159,8 @@ dependencies = [
  "atlas-events",
  "atlas-types",
  "atlas-utils",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

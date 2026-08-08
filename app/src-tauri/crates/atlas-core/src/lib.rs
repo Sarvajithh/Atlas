@@ -27,6 +27,7 @@
 
 pub mod cancellation;
 pub mod facade;
+pub mod graph_extraction;
 mod paths;
 pub mod shutdown;
 pub mod startup;

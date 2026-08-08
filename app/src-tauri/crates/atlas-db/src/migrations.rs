@@ -300,6 +300,32 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_concept_edges_to ON concept_edges(to_node_id);
         ",
     },
+    // Concept node provenance (§20 Research Mode phase): which document(s)
+    // a given concept node was actually extracted from. Added because
+    // Research Mode's Citation Graph needs to tell a *cross-document*
+    // relationship (the same concept, or a related pair of concepts,
+    // showing up in more than one source document) apart from a purely
+    // within-one-document relationship -- and `concept_nodes` itself is
+    // workspace-scoped, not document-scoped (a node is one concept shared
+    // across however many documents mention it, by design, so extraction
+    // can dedup a concept re-mentioned across sources instead of creating
+    // a duplicate node per document). This is a new join table recording
+    // provenance, not a restructuring of the existing node/edge schema --
+    // `concept_nodes`/`concept_edges` themselves are unchanged (per the
+    // architecture contract's node/edge model being frozen for this
+    // phase).
+    Migration {
+        id: "0017_create_concept_node_sources",
+        sql: "
+            CREATE TABLE IF NOT EXISTS concept_node_sources (
+                node_id INTEGER NOT NULL,
+                document_id INTEGER NOT NULL,
+                PRIMARY KEY (node_id, document_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_concept_node_sources_node ON concept_node_sources(node_id);
+            CREATE INDEX IF NOT EXISTS idx_concept_node_sources_document ON concept_node_sources(document_id);
+        ",
+    },
 ];
 
 pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {

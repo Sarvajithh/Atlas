@@ -4,8 +4,8 @@
 
 use std::sync::Mutex;
 
-use atlas_types::concept::{ConceptEdge, ConceptNode};
-use atlas_types::ids::{ConceptEdgeId, ConceptNodeId, WorkspaceId};
+use atlas_types::concept::{ConceptEdge, ConceptNode, RelationType};
+use atlas_types::ids::{ConceptEdgeId, ConceptNodeId, DocumentId, WorkspaceId};
 use atlas_utils::AppError;
 
 use crate::repository::GraphRepository;
@@ -13,6 +13,11 @@ use crate::repository::GraphRepository;
 pub struct InMemoryGraphRepository {
     nodes: Mutex<Vec<ConceptNode>>,
     edges: Mutex<Vec<ConceptEdge>>,
+    next_node_id: std::sync::atomic::AtomicI64,
+    next_edge_id: std::sync::atomic::AtomicI64,
+    /// (node_id, document_id) provenance pairs recorded via
+    /// `record_node_source`.
+    sources: Mutex<Vec<(ConceptNodeId, DocumentId)>>,
 }
 
 impl InMemoryGraphRepository {
@@ -20,6 +25,9 @@ impl InMemoryGraphRepository {
         Self {
             nodes: Mutex::new(Vec::new()),
             edges: Mutex::new(Vec::new()),
+            next_node_id: std::sync::atomic::AtomicI64::new(1),
+            next_edge_id: std::sync::atomic::AtomicI64::new(1),
+            sources: Mutex::new(Vec::new()),
         }
     }
 }
@@ -51,6 +59,17 @@ impl GraphRepository for InMemoryGraphRepository {
             .nodes
             .lock()
             .map_err(|_| AppError::user("graph node lock poisoned"))?;
+        // Mirrors `SqliteGraphRepository`'s auto-increment rowid behavior:
+        // an id of 0 (the "not yet persisted" sentinel every caller in this
+        // codebase uses) is assigned a fresh id here; a caller-supplied
+        // non-zero id (existing tests construct nodes with explicit ids
+        // directly) is respected as-is.
+        let node = if node.id.0 == 0 {
+            let id = self.next_node_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ConceptNode { id: ConceptNodeId(id), ..node }
+        } else {
+            node
+        };
         nodes.push(node.clone());
         Ok(node)
     }
@@ -61,6 +80,21 @@ impl GraphRepository for InMemoryGraphRepository {
             .lock()
             .map_err(|_| AppError::user("graph node lock poisoned"))?;
         Ok(nodes.iter().find(|n| n.id == id).cloned())
+    }
+
+    fn find_node_by_label(
+        &self,
+        workspace_id: WorkspaceId,
+        label: &str,
+    ) -> Result<Option<ConceptNode>, AppError> {
+        let nodes = self
+            .nodes
+            .lock()
+            .map_err(|_| AppError::user("graph node lock poisoned"))?;
+        Ok(nodes
+            .iter()
+            .find(|n| n.workspace_id == workspace_id && n.label.eq_ignore_ascii_case(label))
+            .cloned())
     }
 
     fn list_edges_for_node(&self, node_id: ConceptNodeId) -> Result<Vec<ConceptEdge>, AppError> {
@@ -80,6 +114,12 @@ impl GraphRepository for InMemoryGraphRepository {
             .edges
             .lock()
             .map_err(|_| AppError::user("graph edge lock poisoned"))?;
+        let edge = if edge.id.0 == 0 {
+            let id = self.next_edge_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ConceptEdge { id: ConceptEdgeId(id), ..edge }
+        } else {
+            edge
+        };
         edges.push(edge.clone());
         Ok(edge)
     }
@@ -91,6 +131,45 @@ impl GraphRepository for InMemoryGraphRepository {
             .map_err(|_| AppError::user("graph edge lock poisoned"))?;
         edges.retain(|e| e.id != id);
         Ok(())
+    }
+
+    fn find_edge(
+        &self,
+        from_node_id: ConceptNodeId,
+        to_node_id: ConceptNodeId,
+        relation_type: &RelationType,
+    ) -> Result<Option<ConceptEdge>, AppError> {
+        let edges = self
+            .edges
+            .lock()
+            .map_err(|_| AppError::user("graph edge lock poisoned"))?;
+        Ok(edges
+            .iter()
+            .find(|e| {
+                e.from_node_id == from_node_id
+                    && e.to_node_id == to_node_id
+                    && &e.relation_type == relation_type
+            })
+            .cloned())
+    }
+
+    fn record_node_source(&self, node_id: ConceptNodeId, document_id: DocumentId) -> Result<(), AppError> {
+        let mut sources = self
+            .sources
+            .lock()
+            .map_err(|_| AppError::user("graph source lock poisoned"))?;
+        if !sources.iter().any(|(n, d)| *n == node_id && *d == document_id) {
+            sources.push((node_id, document_id));
+        }
+        Ok(())
+    }
+
+    fn list_source_documents(&self, node_id: ConceptNodeId) -> Result<Vec<DocumentId>, AppError> {
+        let sources = self
+            .sources
+            .lock()
+            .map_err(|_| AppError::user("graph source lock poisoned"))?;
+        Ok(sources.iter().filter(|(n, _)| *n == node_id).map(|(_, d)| *d).collect())
     }
 }
 

@@ -132,6 +132,37 @@ impl Retriever {
         Ok(merged)
     }
 
+    /// Research Mode's cross-workspace retrieval (§ objective "cross-
+    /// document/cross-workspace context"). Additive: default single-
+    /// workspace `retrieve` above is completely unchanged and remains
+    /// what ordinary chat/tutoring uses. This runs the *same* hybrid
+    /// retrieval (each call still keyword/vector-searches exactly one
+    /// workspace at a time -- no query ever crosses a workspace boundary
+    /// inside `KeywordSearchRepository`/`VectorSearchRepository` itself,
+    /// preserving per-workspace data scoping) and then merges the
+    /// resulting candidate pools from every requested workspace into one
+    /// ranked list.
+    ///
+    /// Chunk ids are globally unique across the whole SQLite database (one
+    /// shared `chunks` table, not one per workspace), so merging by
+    /// `chunk_id` here -- and later in `ContextBuilder::assemble`, which
+    /// this feeds straight into unmodified -- can never accidentally
+    /// collide two different workspaces' chunks under the same id.
+    pub fn retrieve_multi_workspace(
+        &self,
+        workspace_ids: &[WorkspaceId],
+        query: &str,
+        limit_per_workspace: usize,
+    ) -> Result<Vec<SearchHit>, AppError> {
+        let mut combined: Vec<SearchHit> = Vec::new();
+        for &workspace_id in workspace_ids {
+            let hits = self.retrieve(workspace_id, query, limit_per_workspace)?;
+            combined.extend(hits);
+        }
+        combined.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(combined)
+    }
+
     /// Fill in `document_id`/`text_content`/`page_or_location_ref` on
     /// vector hits, which only carry a `chunk_id` and score at the
     /// vector-store layer.
@@ -290,5 +321,53 @@ mod tests {
 
         let results = retriever.retrieve(WorkspaceId(1), "x", 5).unwrap();
         assert_eq!(results[0].chunk_id, ChunkId(1));
+    }
+
+    // ---- Research Mode: cross-workspace retrieval ----
+
+    struct WorkspaceKeyedKeywordSearch(HashMap<i64, Vec<SearchHit>>);
+    impl KeywordSearchRepository for WorkspaceKeyedKeywordSearch {
+        fn search(&self, workspace_id: WorkspaceId, _query: &str, _limit: usize) -> Result<Vec<SearchHit>, AppError> {
+            Ok(self.0.get(&workspace_id.0).cloned().unwrap_or_default())
+        }
+    }
+
+    #[test]
+    fn retrieve_multi_workspace_merges_hits_from_every_requested_workspace() {
+        let mut per_workspace = HashMap::new();
+        per_workspace.insert(1, vec![hit(1, 0.9)]);
+        per_workspace.insert(2, vec![hit(2, 0.8)]);
+
+        let retriever = Retriever::new(
+            Arc::new(WorkspaceKeyedKeywordSearch(per_workspace)),
+            Arc::new(FixedVectorSearch(vec![])),
+            Arc::new(HashEmbeddingEngine::default()),
+            Arc::new(FixedChunks(vec![chunk(1, "a"), chunk(2, "b")])),
+        );
+
+        let results = retriever
+            .retrieve_multi_workspace(&[WorkspaceId(1), WorkspaceId(2)], "x", 5)
+            .unwrap();
+
+        let chunk_ids: Vec<i64> = results.iter().map(|h| h.chunk_id.0).collect();
+        assert!(chunk_ids.contains(&1));
+        assert!(chunk_ids.contains(&2));
+    }
+
+    #[test]
+    fn retrieve_multi_workspace_of_a_single_workspace_matches_plain_retrieve() {
+        // Sanity: spanning just one workspace shouldn't behave differently
+        // from the existing single-workspace path -- same underlying call.
+        let retriever = Retriever::new(
+            Arc::new(FixedKeywordSearch(vec![hit(1, 1.0), hit(2, 0.2)])),
+            Arc::new(FixedVectorSearch(vec![hit(2, 1.0)])),
+            Arc::new(HashEmbeddingEngine::default()),
+            Arc::new(FixedChunks(vec![chunk(1, "one"), chunk(2, "two")])),
+        );
+
+        let single = retriever.retrieve(WorkspaceId(1), "anything", 5).unwrap();
+        let multi = retriever.retrieve_multi_workspace(&[WorkspaceId(1)], "anything", 5).unwrap();
+        assert_eq!(single.len(), multi.len());
+        assert_eq!(single[0].chunk_id, multi[0].chunk_id);
     }
 }

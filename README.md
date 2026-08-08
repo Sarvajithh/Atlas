@@ -20,7 +20,7 @@ construction, Ollama-backed chat/tutoring with streaming, a folder watcher
 with incremental indexing, and a working React/Tauri frontend shell with
 IPC wiring for workspaces, documents, and the assistant.
 
-**Estimated overall completion toward the Atlas v1.0 vision: ~55%.**
+**Estimated overall completion toward the Atlas v1.0 vision: ~65%.**
 See "Completed Features," "Remaining Atlas v1.0 Work," and "Known
 Limitations & Technical Debt" below for the itemized breakdown this
 estimate is based on.
@@ -94,6 +94,88 @@ inferred from comments or prior documentation.
 - Engine role dispatch (`EnginePool`, `EngineRole`) for
   Tutor/Reasoning/Vision/Planner routing
 
+### Concept Graph
+- **Extraction is real, not scaffolding.** `atlas-graph::extraction`
+  (`ConceptExtractor`) runs a Reasoning-role prompt over each freshly
+  (re)indexed document's chunk text, parses a small structured JSON shape
+  (`{"concepts": [...], "relations": [...]}`), and persists it through the
+  existing `GraphRepository` (`SqliteGraphRepository`, §33.5/§33.6 tables
+  that already existed). No new inference stack — reuses the same
+  `EnginePool`/`EngineRole::Reasoning` role every other AI feature runs
+  through (`atlas-core::graph_extraction::EnginePoolConceptExtractor`).
+- **Dedup, not duplication.** Re-extracting the same or overlapping
+  content reuses existing nodes by case-insensitive label match
+  (`GraphRepository::find_node_by_label`) and skips already-present edges
+  (`GraphRepository::find_edge`) rather than growing the graph unbounded
+  on every re-index.
+- **Wired into the real indexing path**, not a separate manual trigger:
+  `IndexingWorker` (§21) runs extraction immediately after a document
+  actually indexes (`IndexOutcome::Indexed`, never on `Skipped`/unchanged
+  files), via the additive `IndexingWorker::with_concept_extractor`
+  builder; `AppFacade::new` constructs and attaches it in
+  `start_indexing_worker`, so this happens automatically for every linked
+  workspace, not just in tests.
+- Extraction failures (model unreachable, malformed JSON) are logged and
+  swallowed — they never fail the indexing job itself (§45.1/§45.2
+  Recoverable), matching every other best-effort enrichment step in the
+  pipeline.
+- Not yet done: no UI trigger to force re-extraction on demand;
+  extraction runs per-document, not incrementally deduped within a single
+  very long document beyond the ~12k-character text cap sent to the
+  model. (Frontend now does read real graph data — see Research Mode,
+  below.)
+
+### Research Mode
+- **Literature review & paper comparison are real**, not scaffolding:
+  `Retriever::retrieve_multi_workspace` (additive; existing single-
+  workspace `retrieve` is completely unchanged) runs the same hybrid
+  retrieval per requested workspace and merges results by score —
+  `ContextBuilder::assemble` itself needed no changes, since chunk ids
+  are globally unique across the shared SQLite database, so a merged
+  multi-workspace pool flows through it safely. `PromptBuilder::
+  build_research` labels every numbered context block with its actual
+  source (`"[2] (source: Workspace B / paper2.pdf)"`), with two system-
+  prompt framings (`ResearchPromptMode::LiteratureReview` synthesizes
+  across sources; `PaperComparison` explicitly structures the answer
+  around agreement/disagreement/gaps) — both routed through
+  `EngineRole::Reasoning`, same role Concept Extraction uses (§14.1's
+  role table isn't extended). IPC: `rag.researchQuery`
+  (`commands::rag::rag_research_query`).
+- **Citation Graph is real**, not a mock relationship list: a new
+  `concept_node_sources` join table (migration `0017`) records which
+  document(s) each Concept Graph node was actually extracted from
+  (populated by `ConceptExtractor`, which now takes a `document_id`);
+  `atlas_graph::citation_graph::list_cross_document_edges` finds real
+  `concept_edges` rows whose endpoints are, between them, sourced from
+  more than one document — a within-one-document relation is
+  intentionally excluded, since that isn't a cross-document citation.
+  IPC: `graph.citationGraph` (`commands::graph::graph_citation_graph`).
+- **Frontend is wired to real data**, not placeholders:
+  `ResearchMode.tsx` composes `ResearchQueryPanel.tsx` (workspace multi-
+  select + literature-review/paper-comparison toggle + real
+  `rag.researchQuery` call + rendered citations) and
+  `CitationGraphView.tsx` (real `graph.citationGraph` call, honest empty
+  state when no cross-document edges exist yet — never fabricated). `npx
+  tsc --noEmit` passes clean; 7 new tests in
+  `ResearchMode.test.tsx` cover the empty-workspaces state, both query
+  modes actually sending the right `mode` over IPC, real citations
+  rendering, the citation graph's populated and empty states, the
+  Timeline deferred-state message, and an IPC-failure error state — all
+  passing.
+- **Timeline is explicitly deferred, not silently skipped**:
+  `DocumentRecord` (§33.2) has no publication/authored-date field, only
+  filesystem `mtime` — surfacing that as a "timeline" would be actively
+  misleading (a re-saved older document would sort as recent). Needs
+  parser-level date extraction, out of this phase's scope; the
+  `ResearchMode.tsx` Timeline tab says this plainly rather than showing
+  empty or fake content.
+- Not yet done: no visual node-link graph rendering for Citation Graph
+  (currently a grouped list — the query being real and correct was this
+  phase's focus, not graph layout); no combined "search across
+  literature review + citation graph" view; Paper Comparison and
+  Literature Review currently differ only in system-prompt framing, not
+  in a structurally different UI (e.g. side-by-side per-source columns).
+
 ### Student Memory
 - Annotations, bookmarks, chat history, and progress/analytics repositories
   (`atlas-memory`), following the architecture contract's Student Memory
@@ -125,21 +207,29 @@ inferred from comments or prior documentation.
 *(Copied forward from the full engineering audit; nothing removed except
 items independently re-verified as already done above.)*
 
-### High priority
-- **Concept Graph construction/extraction logic** — the crate currently
-  contains only repository interfaces and injected-dependency scaffolding;
-  its own code comment explicitly states extraction logic is "deferred to
-  a future milestone." No nodes/edges are ever produced today.
-
 ### Medium priority
 - **Quiz / Flashcard / Revision Planner generation depth** — currently
   one-line wrappers around a generic LLM call with no structured output
   schema, no persisted structured records, and no real weak-topic-detection
   computation behind them.
-- **Research Mode features** — Literature Review, Paper Comparison,
-  Citation Graph, Timeline, and general cross-document/cross-workspace
-  linking are entirely absent from the codebase (zero occurrences of these
-  terms anywhere in source).
+- **Research Mode: Timeline** — explicitly deferred (not silently
+  skipped): `DocumentRecord` (§33.2) carries only a filesystem `mtime`,
+  not a publication/authored date, so there's no genuine chronological
+  metadata to surface. Needs parser-level date extraction (a PDF's
+  metadata date, or a document's own "Published on ..." text) — deeper
+  parser work than the Research Mode phase's scope. Flagged in
+  `ResearchMode.tsx`'s own doc comment and its Timeline tab, not hidden.
+- **Concept Graph View / Quiz-Exam Mode / Memory Analytics frontend
+  wiring** — `ConceptGraphView.tsx`, `QuizExamMode.tsx`, and
+  `MemoryAnalyticsView.tsx` are still stub components
+  (`<section aria-label="..." />`). A stray `app/app/` directory
+  previously contained test files apparently written against fuller
+  implementations of exactly these three components; that directory has
+  now been deleted (see Changelog) since it was never wired into the
+  real build and was polluting `npx vitest run`. Those tests are gone
+  along with it — if a fuller implementation of these three views is
+  still wanted, it needs to be written for real against the actual
+  `app/src` components, not recovered from the stray copy.
 - **Vector store vs. architecture contract** — the current implementation
   is a custom in-house `EmbeddedVectorStore`, not Qdrant or LanceDB as
   mandated by the frozen architecture contract §5. This needs either a
@@ -197,6 +287,24 @@ items independently re-verified as already done above.)*
   `CHANGES.diff`) exist at/near the repository root from prior fix passes;
   useful history, but should eventually be consolidated into a single
   changelog rather than left as standalone documents.
+- ~~Stray untracked-by-the-build directory `app/app/`~~ — **resolved this
+  phase**: it contained a second, more complete copy of several backend
+  crates (e.g. an `atlas-graph`/`atlas-core` variant with real extraction
+  logic, found during the Concept Graph extraction phase) and several
+  frontend test files (`app/app/src/views/__tests__/{ConceptGraphView,
+  QuizExamMode,MemoryAnalyticsView}.test.tsx`, found during the Research
+  Mode phase while verifying `npx vitest run`). Neither half was wired
+  into the real build: the Rust side wasn't a member of `app/src-tauri/
+  Cargo.toml`'s workspace, and the frontend side wasn't under `app/src`,
+  so its test files imported the *real* (still-stub) components via the
+  `@` alias and failed rather than testing the shadow implementation they
+  were presumably written against — `npx vitest run` with no exclusion
+  used to report 3 failing test files unrelated to whatever phase was
+  running. Deleted outright (`git rm -r app/app`) rather than integrated,
+  since neither half was ever referenced by any real config, and its
+  presence had already caused two phases in a row to have to re-diagnose
+  the same false failures. `npx vitest run` now passes clean (9/9 test
+  files, 45/45 tests) with no exclusion needed.
 
 ---
 
@@ -238,6 +346,214 @@ environment.
 
 ## Changelog
 
+- **[`app/app/` cleanup, this entry]** — Deleted the stray,
+  untracked-by-the-build `app/app/` directory (35 tracked files: a
+  partial duplicate/shadow copy of several backend crates and 3 frontend
+  test files), flagged across the two previous phases as a source of
+  false test failures and dead weight. `git rm -r app/app`. Confirmed
+  `npx vitest run` (no exclusion) now passes clean: 9/9 test files, 45/45
+  tests. See Known Limitations above for what it contained and why it
+  wasn't simply integrated instead.
+- **[Research Mode, this entry]** — Implemented Literature Review, Paper
+  Comparison, and Citation Graph on top of the Concept Graph extraction
+  landed in the previous phase; Timeline explicitly deferred (see
+  Completed Features > Research Mode and Remaining Work above for why).
+  - `atlas-models::retriever::Retriever::retrieve_multi_workspace` (new,
+    additive): runs the existing single-workspace `retrieve` once per
+    requested workspace and merges by score. `retrieve` itself is
+    unchanged — every query still keyword/vector-searches exactly one
+    workspace at a time, preserving per-workspace data scoping; only the
+    merge is new. `ContextBuilder::assemble` needed **no code changes**
+    to consume the merged pool, since chunk ids are already globally
+    unique across the app's single shared SQLite database.
+  - `atlas-models::prompt_builder::PromptBuilder::build_research` (new):
+    Research Mode's variant of `build`, with `ResearchPromptMode::{
+    LiteratureReview, PaperComparison}` selecting between a synthesize-
+    across-sources system prompt and an explicit-comparison one. Each
+    numbered context block is labeled with its real source (`"[2]
+    (source: Workspace B / paper2.pdf)"` — resolved via a new
+    `AppFacade::research_source_labels` helper), not left anonymous.
+  - `atlas-db` migration `0017_create_concept_node_sources` (new table,
+    additive — `concept_nodes`/`concept_edges` themselves untouched):
+    records which document(s) each concept node was actually extracted
+    from. `atlas_graph::repository::GraphRepository` gained
+    `record_node_source`/`list_source_documents`; `ConceptExtractor::
+    extract_and_store` (from the previous phase) now takes a
+    `document_id` and records provenance for every node it creates or
+    reuses — its one real caller (`atlas-core::worker`) and all its unit
+    tests were updated to pass the document's actual id.
+  - `atlas-graph::citation_graph::list_cross_document_edges` (new
+    module): finds real `concept_edges` rows whose endpoints are,
+    between them, sourced from more than one document (via the new
+    provenance table) — a within-one-document relation is excluded on
+    purpose, matching "citation graph" rather than the full Concept
+    Graph. No mock/fabricated relationships: every edge and every
+    `source_documents` entry traces to a real stored row.
+  - IPC: `commands::rag::rag_research_query` (`rag.researchQuery`) and
+    `commands::graph::graph_citation_graph` (`graph.citationGraph`),
+    registered in `main.rs`. `AppFacade::research_query` deliberately
+    bypasses the Intent/Scheduler pipeline `chat`/`chat_stream` use
+    (that pipeline's routing is scoped to one workspace's `Intent`,
+    which is on this and the prior phase's MUST-NOT-change list) —
+    Research Mode calls Retriever/ContextBuilder/PromptBuilder/
+    EnginePool directly instead, through the same `EngineRole::
+    Reasoning` role Concept Extraction already uses.
+  - Frontend: `ipc/rag.ts` (new), `ipc/graph.ts` extended with
+    `graphCitationGraph`, new types in `ipc/types.ts`
+    (`ConceptEdge`, `CitationGraphEdge`, `SearchResult`).
+    `ResearchMode.tsx` now composes real subcomponents under
+    `views/research/`: `WorkspaceMultiSelect.tsx`, `ResearchQueryPanel.tsx`
+    (literature review / paper comparison, real IPC round-trip, rendered
+    citations), `CitationGraphView.tsx` (real IPC round-trip, honest
+    empty state — "no cross-document relationships found yet", never
+    fabricated content to fill the space). The Timeline tab states
+    plainly why it isn't implemented rather than showing an empty or
+    fake view.
+  - Tests: 6 new backend unit tests (`retriever.rs`: 2 for
+    `retrieve_multi_workspace`; `prompt_builder.rs`: 4 for
+    `build_research`) plus 5 in `atlas-graph::citation_graph` and 3 in
+    `atlas-db::graph_adapter`/`atlas-graph::testing` for the provenance
+    methods (all counted in the `atlas-graph` totals below) — the
+    `atlas-graph` crate's own test count is now **18 passing** (see prior
+    entry's 13, plus this phase's 5 citation-graph tests). 7 new frontend
+    tests in `src/views/__tests__/ResearchMode.test.tsx`, covering the
+    no-workspaces state, a real literature-review round-trip with
+    rendered citations, the paper-comparison mode actually sending that
+    mode over IPC, the citation graph's populated and empty states, the
+    Timeline deferred message, and an IPC-failure error state. **All
+    frontend tests verified passing in this environment**: `npx vitest
+    run --exclude "**/app/**"` — 9/9 real test files, 45/45 tests — and
+    `npx tsc --noEmit` clean, both run against a real `npm install` in
+    this sandbox (unlike the Rust side, Node/npm were available here).
+  - **Discovery, not caused by this phase**: running the frontend suite
+    without excluding anything showed 3 failing test files
+    (`ConceptGraphView.test.tsx`, `QuizExamMode.test.tsx`,
+    `MemoryAnalyticsView.test.tsx`). Traced this to the stray
+    `app/app/` directory flagged in the previous phase's report: it
+    contains its own copies of exactly these 3 test files, which import
+    the real (still-stub) components via the `@` alias and so fail
+    against them. Confirmed by re-running with `--exclude "**/app/**"`:
+    clean, 9/9/45/45. Documented under Known Limitations above so future
+    phases don't have to rediscover this; not fixed here since `app/app/`
+    cleanup is outside this phase's scope.
+  - **Deviation from this phase's originally-stated file scope, flagged
+    rather than silently done**: the task instructions for this phase
+    listed `context_builder.rs` as an allowed-to-change file
+    ("extend to support cross-workspace/multi-document context
+    assembly"). It ended up **not needing any changes** — the existing
+    `assemble` already merges an arbitrary `Vec<SearchHit>` regardless of
+    which workspace(s) produced it, since chunk ids are globally unique.
+    Noted explicitly rather than silently skipping a listed file, per
+    this project's own "report deviations and why" convention.
+  - **Known verification limitation, same as the previous phase**: the
+    Rust changes in this entry (`atlas-models`, `atlas-core`,
+    `atlas-db`, `app-tauri`) are hand-reviewed against the real
+    trait/struct signatures but **not compiler-verified** — this
+    sandbox's only available toolchain (apt's rustc/cargo 1.75) still
+    can't resolve the full workspace's dependency graph (`atlas-indexer
+    -> lopdf -> time`/`idna_adapter` need edition2024). I got further
+    than last time (managed to downgrade `time` itself via `cargo update
+    --precise`) but hit the same wall one dependency layer deeper
+    (`idna_adapter`, pulled in transitively via `ureq`'s URL-parsing
+    stack) and stopped rather than continue whack-a-mole-downgrading
+    unrelated dependencies with no network access to a newer toolchain.
+    `atlas-graph` (the crate with the actual provenance/citation-graph
+    logic) **is** compiler-verified — 18/18 tests passing. The frontend
+    changes in this entry, unlike last phase, **are** fully verified
+    (`tsc` + `vitest`, both real). Whoever picks this up next should run
+    `cargo build && cargo test` for `atlas-models`, `atlas-core`,
+    `atlas-db`, and `app-tauri` with a proper toolchain before merging.
+- **[Concept Graph extraction, this entry]** — Closed the previously
+  self-disclosed gap: `atlas-graph`'s `engine.rs` said extraction was
+  "deferred to a future milestone" and no code path ever produced a node
+  or edge from real content. It now does.
+  - `atlas-graph::extraction` (new module): `ConceptExtractor` runs a
+    caller-supplied `ConceptExtractionModel` (a narrow seam — this crate
+    still doesn't depend on `atlas-models`, avoiding the
+    `atlas-models -> atlas-indexer` cycle) over source text via
+    `build_extraction_prompt`, parses a small JSON
+    `{"concepts": [...], "relations": [...]}` shape, and persists it
+    through `GraphRepository`. Tolerates a markdown code fence around the
+    JSON if the model adds one despite being told not to. A relation
+    referencing a label not present in `concepts` is skipped rather than
+    fabricating a node for it (no mock/fabricated relationships).
+  - `atlas-graph::repository::GraphRepository`: added
+    `find_node_by_label` (case-insensitive, workspace-scoped) and
+    `find_edge` (exact from/to/type) so re-extraction reuses existing
+    nodes/edges instead of duplicating them on every re-index. Implemented
+    for both `SqliteGraphRepository` (`atlas-db`) and the crate's own
+    `InMemoryGraphRepository` test double, which was also given real
+    auto-incrementing ids on insert (it previously only stored whatever id
+    the caller passed in, which is fine for its original hand-authored
+    fixture tests but not for a dedup workflow that needs distinct ids
+    assigned by the repository itself, matching how `SqliteGraphRepository`
+    already behaved via SQLite's own rowid).
+  - `atlas-core::graph_extraction` (new module): `EnginePoolConceptExtractor`
+    is the concrete adapter from `ConceptExtractionModel` to
+    `atlas_models::EnginePool`, routed through `EngineRole::Reasoning` —
+    the same "feature built on an existing role" pattern
+    `atlas-models::engines` already uses for Quiz/Flashcard/Revision
+    Planner, so §14.1's frozen Engine-role table isn't touched.
+  - `atlas-core::worker::IndexingWorker`: added an additive
+    `with_concept_extractor` builder (existing call sites/tests that never
+    call it keep today's indexing-only behavior unchanged). After a
+    document actually indexes (`IndexOutcome::Indexed`, never on a
+    cache-hit `Skipped`), the worker loads that document's chunks (via the
+    same `ChunkRepository` the indexing pipeline already populated),
+    concatenates up to ~12k characters of their text, and runs extraction.
+    A failure here (model unreachable, malformed JSON) is logged and
+    otherwise swallowed — it never un-succeeds the already-recorded
+    indexing job (§45.1/§45.2 Recoverable; extraction is a best-effort
+    enrichment layered on top of indexing, not a condition of it).
+  - `atlas-core::facade::AppFacade`: constructs one `ConceptExtractor`
+    (backed by the real `SqliteGraphRepository` and the real
+    `EnginePool`) in `new`, and attaches it in `start_indexing_worker` —
+    so this runs automatically for every linked workspace, not just in
+    tests.
+  - Tests: 8 new unit tests in `atlas-graph::extraction` (well-formed
+    extraction, code-fence stripping, label-based dedup on re-extraction,
+    duplicate-edge skipping, orphan-relation skipping, malformed-JSON as a
+    recoverable error not a panic, empty-text short-circuit that never
+    even calls the model, prompt-content assertion) plus one new
+    `atlas-core::worker` end-to-end test
+    (`worker_runs_concept_extraction_after_a_real_index`) that drives a
+    real `IndexingWorker` against a real temp-directory file through to
+    persisted graph nodes, not just the extractor in isolation.
+  - **Deviation from this phase's stated scope, flagged rather than
+    silently done**: the task instructions for this phase named
+    `context_builder.rs`, `retriever.rs`, `atlas-graph`'s citation/
+    relation *queries*, `commands/rag.rs`/`graph.rs`, and
+    `ResearchMode.tsx` as the allowed-to-change surface, for building
+    Research Mode's literature review/citation graph/timeline UI on top
+    of an already-populated Concept Graph. Investigation found that
+    prerequisite false — Concept Graph extraction itself was the missing
+    piece, not present anywhere in the codebase, contradicting this
+    phase's own stated dependency ("depends on Phase 5's Concept Graph
+    being in place"). Per this phase's own instruction to "stop and
+    report that dependency gap rather than building on sand," Research
+    Mode's UI/IPC layer was intentionally *not* built this pass; this
+    entry lands the actual missing dependency (extraction) instead so a
+    subsequent Research Mode phase has real data to build on.
+  - **Known verification limitation**: I could only get a full `cargo
+    build`/`cargo test` for the crate I added the core logic to,
+    `atlas-graph`, run in this environment (13/13 tests passing, using
+    apt's rustc/cargo 1.75.0 — the only Rust toolchain installable here).
+    The rest of the workspace (`atlas-db`, `atlas-core`, `app-tauri`)
+    could not be compiled in this sandbox: the committed `Cargo.lock` is
+    lockfile-format-v4, which requires cargo ≥1.78, and regenerating a
+    fresh lock hits a transitive dependency (`atlas-indexer -> lopdf ->
+    time`) whose latest version requires edition2024, which 1.75 can't
+    parse even to select an older compatible version without a working
+    lockfile already pinning one. rustup's install domain isn't in this
+    environment's network allowlist, so upgrading wasn't possible either.
+    The `atlas-core`/`atlas-db` changes were written and hand-reviewed
+    carefully against the real trait/struct signatures in the codebase
+    (not guessed), but are **not yet compiler-verified** the way the
+    project's own acceptance criteria (`cargo build`/`cargo test` for
+    touched crates) require. Whoever picks this up next should run
+    `cargo build && cargo test` for `atlas-core`, `atlas-db`, and
+    `app-tauri` with a proper toolchain before merging, and fix anything
+    a real compiler catches that this review didn't.
 - **[Global Search, this entry]** — Implemented §9's Global Search: hybrid
   keyword+vector search across the active workspace or all workspaces.
   - `atlas-core::facade`: added `AppFacade::search_global(query,

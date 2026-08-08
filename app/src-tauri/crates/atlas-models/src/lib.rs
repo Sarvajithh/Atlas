@@ -29,7 +29,7 @@ pub use embedding::OllamaEmbeddingEngine;
 pub use engine::Engine;
 pub use engines::{EnginePool, OllamaEngine};
 pub use ollama::{DiscoveredModel, GenerationChunk, ModelCapability, OllamaConnection, OllamaProvider};
-pub use prompt_builder::PromptBuilder;
+pub use prompt_builder::{PromptBuilder, ResearchPromptMode};
 pub use registry::{InMemoryModelRegistry, ModelProvider, ModelRegistryRepository};
 pub use vision_ocr::OllamaVisionOcrEngine;
 pub use reranker::Reranker;

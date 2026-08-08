@@ -47,8 +47,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use atlas_events::EventBus;
+use atlas_graph::ConceptExtractor;
 use atlas_indexer::job_queue::{JobQueue, JOB_TYPE_INDEX_DOCUMENT};
-use atlas_indexer::pipeline::IndexingPipeline;
+use atlas_indexer::pipeline::{IndexOutcome, IndexingPipeline};
 use atlas_types::ids::WorkspaceId;
 use atlas_types::job::{Job, JobStatus};
 use atlas_utils::{log_info, log_warn, AppError};
@@ -72,6 +73,12 @@ pub struct IndexingWorker {
     job_queue: Arc<JobQueue>,
     events: Arc<dyn EventBus>,
     poll_interval_ms: u64,
+    /// Concept Graph extraction (§20) run after a document successfully
+    /// (re)indexes. `None` is a valid, supported configuration (e.g. tests
+    /// that only care about the indexing half of the pipeline) -- a worker
+    /// without an extractor simply skips the extraction step, it never
+    /// fails the indexing job over it.
+    concept_extractor: Option<Arc<ConceptExtractor>>,
     handle: Option<WorkerHandle>,
 }
 
@@ -93,8 +100,19 @@ impl IndexingWorker {
             job_queue,
             events,
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
+            concept_extractor: None,
             handle: None,
         }
+    }
+
+    /// Attach Concept Graph extraction (§20). Additive/optional builder
+    /// (existing callers that never call this keep today's indexing-only
+    /// behavior unchanged) so `AppFacade::new` can wire the real
+    /// `EnginePool`-backed extractor without touching every existing
+    /// `IndexingWorker::new` call site or test.
+    pub fn with_concept_extractor(mut self, extractor: Arc<ConceptExtractor>) -> Self {
+        self.concept_extractor = Some(extractor);
+        self
     }
 
     #[cfg(test)]
@@ -124,6 +142,7 @@ impl IndexingWorker {
         let job_queue = self.job_queue.clone();
         let events = self.events.clone();
         let poll_interval_ms = self.poll_interval_ms;
+        let concept_extractor = self.concept_extractor.clone();
 
         let thread = std::thread::spawn(move || {
             log_info!("indexing worker started");
@@ -135,7 +154,14 @@ impl IndexingWorker {
 
                 match job_queue.next_queued() {
                     Ok(Some(job)) => {
-                        process_job(&workspace_engine, &indexing_pipeline, &job_queue, &events, job);
+                        process_job(
+                            &workspace_engine,
+                            &indexing_pipeline,
+                            &job_queue,
+                            &events,
+                            concept_extractor.as_ref(),
+                            job,
+                        );
                     }
                     Ok(None) => {
                         // Nothing queued right now -- sleep for another
@@ -176,6 +202,76 @@ impl Drop for IndexingWorker {
     }
 }
 
+/// Looks up the just-indexed document's chunks (the pipeline's own
+/// already-chunked, already-cleaned text -- extraction never re-parses a
+/// file itself, §36.3's module-boundary rule) and runs Concept Graph
+/// extraction over their concatenated text. Recoverable failures (no
+/// matching document row, no chunks yet, model/JSON errors) are logged and
+/// otherwise dropped -- this must never affect the indexing job's own
+/// already-recorded success (§45.1/§45.2).
+fn run_concept_extraction(
+    indexing_pipeline: &Arc<IndexingPipeline>,
+    extractor: &Arc<ConceptExtractor>,
+    workspace_id: WorkspaceId,
+    relative_path: &str,
+) {
+    let document = match indexing_pipeline.documents().list_for_workspace(workspace_id) {
+        Ok(docs) => docs.into_iter().find(|d| d.relative_path == relative_path),
+        Err(err) => {
+            log_warn!("concept extraction: failed to look up document '{relative_path}': {err}");
+            return;
+        }
+    };
+    let Some(document) = document else {
+        log_warn!("concept extraction: no document row found for '{relative_path}' after indexing");
+        return;
+    };
+
+    let chunks = match indexing_pipeline.chunks().list_for_document(document.id) {
+        Ok(chunks) => chunks,
+        Err(err) => {
+            log_warn!("concept extraction: failed to load chunks for '{relative_path}': {err}");
+            return;
+        }
+    };
+    if chunks.is_empty() {
+        // §22/ParsedEmpty: a document that produced no chunks has nothing
+        // to extract concepts from -- not an error, just nothing to do.
+        return;
+    }
+
+    // Cap how much text is sent to the Reasoning role in one call --
+    // matches the spirit of `ContextBuilder`'s own token budget rather
+    // than sending an unbounded document straight into a single prompt.
+    const MAX_EXTRACTION_CHARS: usize = 12_000;
+    let mut text = String::new();
+    for chunk in &chunks {
+        if text.len() >= MAX_EXTRACTION_CHARS {
+            break;
+        }
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str(&chunk.text_content);
+    }
+    text.truncate(MAX_EXTRACTION_CHARS);
+
+    match extractor.extract_and_store(workspace_id, document.id, relative_path, &text) {
+        Ok(outcome) => {
+            log_info!(
+                "concept extraction for '{relative_path}': {} nodes created, {} reused, {} edges created, {} skipped",
+                outcome.nodes_created,
+                outcome.nodes_reused,
+                outcome.edges_created,
+                outcome.edges_skipped_existing
+            );
+        }
+        Err(err) => {
+            log_warn!("concept extraction failed for '{relative_path}': {}", err.message);
+        }
+    }
+}
+
 /// Claim and run a single job. A per-file failure here is Recoverable
 /// (§45.1): it is recorded via `mark_failed` (which itself applies the
 /// existing bounded-retry policy, §33.14) and logged, but must never stop
@@ -186,6 +282,7 @@ fn process_job(
     indexing_pipeline: &Arc<IndexingPipeline>,
     job_queue: &Arc<JobQueue>,
     events: &Arc<dyn EventBus>,
+    concept_extractor: Option<&Arc<ConceptExtractor>>,
     job: Job,
 ) {
     if job.job_type != JOB_TYPE_INDEX_DOCUMENT {
@@ -214,7 +311,7 @@ fn process_job(
     );
 
     match outcome {
-        Ok(_) => {
+        Ok(outcome) => {
             // `IndexingPipeline::index_document` already published
             // `IndexCompleted` (or, for an unchanged file, nothing further
             // is needed at all -- §22 cache invalidation) and updated the
@@ -222,6 +319,21 @@ fn process_job(
             // terminal status.
             if let Err(err) = job_queue.mark_succeeded(job.id) {
                 log_warn!("failed to mark job {} succeeded: {err}", job.id.0);
+            }
+
+            // Concept Graph extraction (§20) runs after a real (re)index,
+            // never on an unchanged/skipped file -- re-running extraction
+            // over content that didn't change would just re-derive nodes
+            // the dedup logic then discards as already-existing, for no
+            // benefit. A failure here (model unreachable, malformed JSON,
+            // ...) is logged and otherwise swallowed: indexing already
+            // succeeded and is already marked so above; extraction is a
+            // best-effort enrichment step layered on top, not a condition
+            // of indexing success (§45.1/§45.2 Recoverable).
+            if matches!(outcome, IndexOutcome::Indexed { .. }) {
+                if let Some(extractor) = concept_extractor {
+                    run_concept_extraction(indexing_pipeline, extractor, workspace_id, &relative_path);
+                }
             }
         }
         Err(err) => {
@@ -341,6 +453,7 @@ mod tests {
     use super::*;
     use atlas_config::hierarchy::LayeredSettingsProvider;
     use atlas_events::InMemoryEventBus;
+    use atlas_graph::GraphRepository;
     use atlas_indexer::embedding::HashEmbeddingEngine;
     use atlas_indexer::ocr::NoopOcrEngine;
     use atlas_indexer::parser::default_parser_selector;
@@ -494,6 +607,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// End-to-end: a document that actually indexes (produces chunks) also
+    /// gets Concept Graph nodes/edges when a `ConceptExtractor` is attached
+    /// -- confirms the worker->extractor wiring runs for real, not just
+    /// the extractor's own unit tests in isolation.
+    #[test]
+    fn worker_runs_concept_extraction_after_a_real_index() {
+        struct StubExtractionModel;
+        impl atlas_graph::ConceptExtractionModel for StubExtractionModel {
+            fn extract(&self, _prompt: &str) -> Result<String, AppError> {
+                Ok(r#"{"concepts":[{"label":"Title","description":null},
+                        {"label":"Content","description":null}],
+                       "relations":[{"from":"Title","to":"Content","type":"related-to"}]}"#
+                    .to_string())
+            }
+        }
+
+        let root = temp_workspace_dir("concept-extraction");
+        std::fs::write(root.join("notes.md"), "# Title\n\nSome content.").unwrap();
+
+        let (workspace_engine, workspace_id) = test_workspace_engine(&root);
+        let pipeline = test_pipeline();
+        let job_queue = Arc::new(JobQueue::new(Arc::new(InMemoryJobRepository::new())));
+        let events: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
+        let graph_repository = Arc::new(atlas_graph::testing::InMemoryGraphRepository::new());
+        let extractor = Arc::new(ConceptExtractor::new(
+            graph_repository.clone(),
+            Arc::new(StubExtractionModel),
+        ));
+
+        job_queue.enqueue_index_job(workspace_id, "notes.md").unwrap();
+
+        let mut worker = IndexingWorker::new(workspace_engine, pipeline.clone(), job_queue.clone(), events)
+            .with_poll_interval(20)
+            .with_concept_extractor(extractor);
+        worker.start();
+
+        let mut succeeded = false;
+        for _ in 0..100 {
+            std::thread::sleep(StdDuration::from_millis(20));
+            if job_queue.repository().list_by_status(JobStatus::Succeeded).unwrap().len() == 1 {
+                succeeded = true;
+                break;
+            }
+        }
+
+        // Extraction runs synchronously right after `mark_succeeded`
+        // within the same worker loop iteration, but give it a moment of
+        // headroom on slower CI machines before asserting.
+        let mut nodes = Vec::new();
+        for _ in 0..25 {
+            nodes = graph_repository.list_nodes_for_workspace(workspace_id).unwrap();
+            if !nodes.is_empty() {
+                break;
+            }
+            std::thread::sleep(StdDuration::from_millis(20));
+        }
+        worker.stop();
+
+        assert!(succeeded, "expected the queued job to reach Succeeded");
+        assert_eq!(nodes.len(), 2, "expected both extracted concepts to be persisted");
+        let labels: Vec<&str> = nodes.iter().map(|n| n.label.as_str()).collect();
+        assert!(labels.contains(&"Title"));
+        assert!(labels.contains(&"Content"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Multiple queued jobs are all drained, not just the first
     /// (acceptance criterion: "support multiple queued jobs").
     #[test]
@@ -593,7 +773,7 @@ mod tests {
             })
             .unwrap();
 
-        process_job(&workspace_engine, &pipeline, &job_queue, &events, job.clone());
+        process_job(&workspace_engine, &pipeline, &job_queue, &events, None, job.clone());
 
         let stored = job_queue.repository().find_by_id(job.id).unwrap().unwrap();
         assert_eq!(stored.status, JobStatus::Failed);

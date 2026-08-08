@@ -146,6 +146,13 @@ pub struct AppFacade {
     /// Fix 6 (P1 audit): real in-flight request cancellation for
     /// `assistant.cancel`/`chat_stream` (see `cancellation` module doc).
     cancellations: Arc<CancellationRegistry>,
+    /// Concept Graph extraction (§20): attached to the Background Indexing
+    /// Worker in `start_indexing_worker` so every successful (re)index
+    /// also derives concept nodes/edges. Kept as a facade field (rather
+    /// than only a local in `new`) so it can be inspected/reused directly
+    /// (e.g. a future `graph.reextract` IPC command re-running extraction
+    /// on demand) without reconstructing it.
+    concept_extractor: Arc<atlas_graph::ConceptExtractor>,
 }
 
 impl AppFacade {
@@ -201,8 +208,9 @@ impl AppFacade {
             events.clone(),
         ));
 
-        let graph_repository = Arc::new(SqliteGraphRepository::new(connection.clone()));
-        let graph_engine = Arc::new(GraphEngine::new(graph_repository, events.clone()));
+        let graph_repository: Arc<dyn atlas_graph::GraphRepository> =
+            Arc::new(SqliteGraphRepository::new(connection.clone()));
+        let graph_engine = Arc::new(GraphEngine::new(graph_repository.clone(), events.clone()));
 
         let job_repository = Arc::new(SqliteJobRepository::new(connection.clone()));
         let job_queue = Arc::new(JobQueue::new(job_repository));
@@ -284,6 +292,17 @@ impl AppFacade {
 
         let model_discovery = Arc::new(ModelDiscoveryService::new(ollama.clone(), model_registry.clone(), events.clone()));
 
+        // Concept Graph extraction (§20): a Reasoning-role call over each
+        // freshly-indexed document's chunks, run by the Background
+        // Indexing Worker right after indexing succeeds (see
+        // `start_indexing_worker` below and `worker::run_concept_extraction`).
+        // Reuses the same `engine_pool` every other AI feature runs
+        // through -- no separate inference stack.
+        let concept_extractor = Arc::new(atlas_graph::ConceptExtractor::new(
+            graph_repository,
+            Arc::new(crate::graph_extraction::EnginePoolConceptExtractor::new(engine_pool.clone())),
+        ));
+
         Self {
             workspace_engine,
             memory_engine,
@@ -307,6 +326,7 @@ impl AppFacade {
             chat,
             model_provider,
             cancellations: Arc::new(CancellationRegistry::new()),
+            concept_extractor,
         }
     }
 
@@ -336,6 +356,7 @@ impl AppFacade {
                 self.job_queue.clone(),
                 self.events.clone(),
             )
+            .with_concept_extractor(self.concept_extractor.clone())
         });
         worker.start();
         Ok(())
@@ -490,6 +511,90 @@ impl AppFacade {
             });
         }
         Ok(results)
+    }
+
+    /// Research Mode's cross-workspace synthesis query (§ objective
+    /// "literature review support, paper comparison"). Reuses the same
+    /// three components every other read path does --
+    /// `Retriever::retrieve_multi_workspace` (hybrid retrieval per
+    /// workspace, merged), `ContextBuilder::assemble` (unmodified --
+    /// chunk ids are globally unique so the multi-workspace pool merges
+    /// safely through it), `PromptBuilder::build_research` (source-
+    /// labeled citations, synthesis-oriented system prompt) -- then runs
+    /// the assembled prompt through `EngineRole::Reasoning`, the same
+    /// role Concept Extraction uses (§14.1's frozen role table isn't
+    /// extended). Deliberately bypasses the Intent/Scheduler pipeline
+    /// `chat`/`chat_stream` use: that pipeline's routing table is scoped
+    /// to a single workspace's `Intent` (§ MUST NOT change: "Single-
+    /// workspace chat/tutoring behavior or its default context scope"),
+    /// and Research Mode's multi-workspace shape doesn't fit it without
+    /// changing it.
+    pub fn research_query(
+        &self,
+        workspace_ids: &[WorkspaceId],
+        query: &str,
+        mode: atlas_models::prompt_builder::ResearchPromptMode,
+        limit_per_workspace: usize,
+    ) -> Result<(String, Vec<Citation>), AppError> {
+        let hits = self.retriever.retrieve_multi_workspace(workspace_ids, query, limit_per_workspace)?;
+        let context: AssembledContext =
+            self.context_builder.assemble(query, hits, self.context_builder.max_context_tokens())?;
+        let citations = context.citations.clone();
+
+        let source_labels = self.research_source_labels(&context)?;
+        let prompt = self.prompt_builder.build_research(query, context, mode, &source_labels);
+
+        let output = self.engine_pool.run_role(EngineRole::Reasoning, prompt)?;
+        Ok((output.content, citations))
+    }
+
+    /// Builds the `document_id -> "Workspace display name / relative/path"`
+    /// label map `build_research` renders inline next to each numbered
+    /// citation, so a synthesized answer spanning several
+    /// documents/workspaces can actually be told apart by source rather
+    /// than showing an anonymous `[n]`. A document or workspace that
+    /// can't be resolved (deleted mid-request, etc.) falls back to a
+    /// document-id-only label rather than failing the whole query over a
+    /// cosmetic label lookup.
+    fn research_source_labels(&self, context: &AssembledContext) -> Result<HashMap<i64, String>, AppError> {
+        let mut workspace_names: HashMap<i64, String> = HashMap::new();
+        let mut labels = HashMap::new();
+        for hit in &context.hits {
+            if labels.contains_key(&hit.document_id.0) {
+                continue;
+            }
+            let Some(document) = self.documents.find_by_id(hit.document_id)? else {
+                labels.insert(hit.document_id.0, format!("document #{}", hit.document_id.0));
+                continue;
+            };
+            let workspace_name = match workspace_names.get(&document.workspace_id.0) {
+                Some(name) => name.clone(),
+                None => {
+                    let name = self
+                        .workspace_engine
+                        .get(document.workspace_id)?
+                        .map(|w| w.display_name)
+                        .unwrap_or_else(|| format!("workspace #{}", document.workspace_id.0));
+                    workspace_names.insert(document.workspace_id.0, name.clone());
+                    name
+                }
+            };
+            labels.insert(hit.document_id.0, format!("{workspace_name} / {}", document.relative_path));
+        }
+        Ok(labels)
+    }
+
+    /// Research Mode's Citation Graph (§ objective "citation graph /
+    /// cross-document linking"). Pure query over the existing Concept
+    /// Graph + node-provenance data (`atlas_graph::citation_graph`) --
+    /// nothing here writes anything, and nothing is fabricated: every
+    /// edge returned traces to a real `concept_edges` row spanning more
+    /// than one document's real recorded provenance.
+    pub fn citation_graph(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<Vec<atlas_graph::CrossDocumentEdge>, AppError> {
+        atlas_graph::list_cross_document_edges(self.graph_engine.repository(), workspace_ids)
     }
 
     /// Settings-driven default for `search_global`'s `limit` when the

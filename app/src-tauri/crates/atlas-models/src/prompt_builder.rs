@@ -50,6 +50,37 @@ connect related concepts, compare similar topics, and provide examples where the
 Cite workspace evidence inline using [1], [2], ... matching the numbered context below, wherever you actually draw on it. \
 If your answer comes entirely from general knowledge rather than the workspace context, say so plainly.";
 
+/// Which Research Mode task the prompt is being built for (§ objective
+/// "literature review support, paper comparison"). Both reuse the same
+/// underlying synthesize-across-sources machinery -- this only changes the
+/// system framing, not the retrieval/context-assembly pipeline, matching
+/// the objective's "reuse Retriever/ContextBuilder/PromptBuilder, extended
+/// not replaced".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResearchPromptMode {
+    /// Synthesize across every retrieved source into one coherent answer.
+    LiteratureReview,
+    /// Explicitly structure the answer around agreements/disagreements/
+    /// gaps between the retrieved sources, rather than one blended
+    /// narrative.
+    PaperComparison,
+}
+
+const RESEARCH_LITERATURE_REVIEW_SYSTEM_PROMPT: &str = "You are Atlas, an AI research assistant helping a student conduct a literature review.\n\
+You have been given retrieved passages from MULTIPLE documents, possibly spanning multiple workspaces -- each passage is labeled with its source.\n\
+Synthesize across all of them into one coherent answer: identify where sources agree, where they add complementary detail, and where they genuinely conflict -- say so explicitly if they do.\n\
+Never present a single source's view as the consensus if the other retrieved sources don't support it.\n\
+Cite every claim inline using [1], [2], ... matching the numbered, source-labeled context below.\n\
+If the retrieved context does not fully answer the question, use general knowledge to fill gaps, but never contradict what the sources actually say, and say plainly when you are going beyond them.\n\
+Never fabricate a relationship between sources that the retrieved text doesn't actually support.";
+
+const RESEARCH_PAPER_COMPARISON_SYSTEM_PROMPT: &str = "You are Atlas, an AI research assistant helping a student compare multiple sources.\n\
+You have been given retrieved passages from MULTIPLE documents, possibly spanning multiple workspaces -- each passage is labeled with its source.\n\
+Structure your answer around the comparison itself: what each source claims on the question asked, where they agree, where they disagree, and what each is missing that another covers.\n\
+Do not blend the sources into one undifferentiated narrative -- keep it clear which source each specific claim comes from.\n\
+Cite every claim inline using [1], [2], ... matching the numbered, source-labeled context below.\n\
+Never fabricate an agreement or disagreement between sources that the retrieved text doesn't actually support.";
+
 impl PromptBuilder {
     pub fn new(settings: Arc<dyn SettingsProvider>) -> Self {
         Self { settings }
@@ -122,6 +153,59 @@ impl PromptBuilder {
         atlas_utils::log_info!("[PromptBuilder] exited, prompt size = {} chars", content.len());
         ResolvedPrompt::text(content)
     }
+
+    /// Research Mode's variant of `build` (§ objective "literature review
+    /// support, paper comparison"): same structured SYSTEM / CONTEXT /
+    /// QUESTION / ANSWER shape, but (a) uses a synthesis-across-sources
+    /// system prompt instead of the tutor persona, and (b) labels each
+    /// numbered context block with which document/workspace it came from
+    /// (`source_labels`, keyed by `document_id.0`), so the model -- and a
+    /// reader checking the citations -- can actually tell sources apart
+    /// instead of seeing an anonymous chunk dump. A `document_id` with no
+    /// entry in `source_labels` falls back to `"document #<id>"` rather
+    /// than silently omitting the label.
+    pub fn build_research(
+        &self,
+        query: &str,
+        context: AssembledContext,
+        mode: ResearchPromptMode,
+        source_labels: &std::collections::HashMap<i64, String>,
+    ) -> ResolvedPrompt {
+        let context_block = if context.hits.is_empty() {
+            "(No relevant material was retrieved from the selected workspaces for this question -- answer from general knowledge and say so.)".to_string()
+        } else {
+            context
+                .hits
+                .iter()
+                .enumerate()
+                .map(|(idx, hit)| {
+                    let label = source_labels
+                        .get(&hit.document_id.0)
+                        .cloned()
+                        .unwrap_or_else(|| format!("document #{}", hit.document_id.0));
+                    format!("[{}] (source: {label})\n{}", idx + 1, hit.text_content)
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+
+        let system = match mode {
+            ResearchPromptMode::LiteratureReview => RESEARCH_LITERATURE_REVIEW_SYSTEM_PROMPT,
+            ResearchPromptMode::PaperComparison => RESEARCH_PAPER_COMPARISON_SYSTEM_PROMPT,
+        };
+
+        let content = format!(
+            "SYSTEM\n\n{system}\n\n\
+             ---\n\n\
+             RETRIEVED SOURCES\n\n{context_block}\n\n\
+             ---\n\n\
+             RESEARCH QUESTION\n\n{query}\n\n\
+             ---\n\n\
+             ANSWER\n\nBegin naturally."
+        );
+
+        ResolvedPrompt::text(content)
+    }
 }
 
 #[cfg(test)]
@@ -183,5 +267,58 @@ mod tests {
         let prompt = builder.build("a question with no retrieved context", context(&[]));
         assert!(prompt.content.contains("a question with no retrieved context"));
         assert!(prompt.content.contains("No relevant workspace material"));
+    }
+
+    // ---- Research Mode: build_research ----
+
+    #[test]
+    fn build_research_labels_each_source_and_includes_the_question() {
+        let builder = PromptBuilder::new(Arc::new(LayeredSettingsProvider::new()));
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(1, "Workspace A / paper1.pdf".to_string());
+        let prompt = builder.build_research(
+            "compare the two approaches",
+            context(&["approach one details"]),
+            ResearchPromptMode::LiteratureReview,
+            &labels,
+        );
+        assert!(prompt.content.contains("Workspace A / paper1.pdf"));
+        assert!(prompt.content.contains("compare the two approaches"));
+        assert!(prompt.content.contains("[1]"));
+    }
+
+    #[test]
+    fn build_research_falls_back_to_a_generic_label_when_none_is_provided() {
+        let builder = PromptBuilder::new(Arc::new(LayeredSettingsProvider::new()));
+        let labels = std::collections::HashMap::new();
+        let prompt = builder.build_research(
+            "q",
+            context(&["c"]),
+            ResearchPromptMode::LiteratureReview,
+            &labels,
+        );
+        assert!(prompt.content.contains("document #1"));
+    }
+
+    #[test]
+    fn build_research_paper_comparison_mode_uses_the_comparison_system_prompt() {
+        let builder = PromptBuilder::new(Arc::new(LayeredSettingsProvider::new()));
+        let labels = std::collections::HashMap::new();
+        let prompt = builder.build_research("q", context(&["c"]), ResearchPromptMode::PaperComparison, &labels);
+        assert!(prompt.content.to_lowercase().contains("compare"));
+    }
+
+    #[test]
+    fn build_research_of_empty_context_says_so_and_still_includes_query() {
+        let builder = PromptBuilder::new(Arc::new(LayeredSettingsProvider::new()));
+        let labels = std::collections::HashMap::new();
+        let prompt = builder.build_research(
+            "a research question",
+            context(&[]),
+            ResearchPromptMode::LiteratureReview,
+            &labels,
+        );
+        assert!(prompt.content.contains("a research question"));
+        assert!(prompt.content.contains("No relevant material"));
     }
 }

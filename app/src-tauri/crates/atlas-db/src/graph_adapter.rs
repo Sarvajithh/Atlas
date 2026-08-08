@@ -3,7 +3,7 @@
 
 use atlas_graph::GraphRepository;
 use atlas_types::concept::{ConceptEdge, ConceptNode, RelationType};
-use atlas_types::ids::{ConceptEdgeId, ConceptNodeId, WorkspaceId};
+use atlas_types::ids::{ConceptEdgeId, ConceptNodeId, DocumentId, WorkspaceId};
 use atlas_utils::AppError;
 use rusqlite::{params, OptionalExtension, Row};
 
@@ -95,6 +95,22 @@ impl GraphRepository for SqliteGraphRepository {
         .map_err(|e| AppError::storage(format!("concept node find failed: {e}")))
     }
 
+    fn find_node_by_label(
+        &self,
+        workspace_id: WorkspaceId,
+        label: &str,
+    ) -> Result<Option<ConceptNode>, AppError> {
+        let conn = self.connection.lock()?;
+        conn.query_row(
+            "SELECT id, workspace_id, label, description, created_at \
+             FROM concept_nodes WHERE workspace_id = ?1 AND label = ?2 COLLATE NOCASE",
+            params![workspace_id.0, label],
+            row_to_node,
+        )
+        .optional()
+        .map_err(|e| AppError::storage(format!("concept node label lookup failed: {e}")))
+    }
+
     fn list_edges_for_node(&self, node_id: ConceptNodeId) -> Result<Vec<ConceptEdge>, AppError> {
         let conn = self.connection.lock()?;
         let mut stmt = conn
@@ -148,6 +164,65 @@ impl GraphRepository for SqliteGraphRepository {
         conn.execute("DELETE FROM concept_edges WHERE id = ?1", params![id.0])
             .map_err(|e| AppError::storage(format!("concept edge delete failed: {e}")))?;
         Ok(())
+    }
+
+    fn find_edge(
+        &self,
+        from_node_id: ConceptNodeId,
+        to_node_id: ConceptNodeId,
+        relation_type: &RelationType,
+    ) -> Result<Option<ConceptEdge>, AppError> {
+        let conn = self.connection.lock()?;
+        conn.query_row(
+            "SELECT id, from_node_id, to_node_id, relation_type, weight \
+             FROM concept_edges WHERE from_node_id = ?1 AND to_node_id = ?2 AND relation_type = ?3",
+            params![from_node_id.0, to_node_id.0, relation_type_to_str(relation_type)],
+            |row| {
+                let relation_str: String = row.get(3)?;
+                Ok((
+                    ConceptEdgeId(row.get(0)?),
+                    ConceptNodeId(row.get(1)?),
+                    ConceptNodeId(row.get(2)?),
+                    relation_str,
+                    row.get::<_, f64>(4)? as f32,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| AppError::storage(format!("concept edge lookup failed: {e}")))?
+        .map(|(id, from_node_id, to_node_id, relation_str, weight)| {
+            Ok(ConceptEdge {
+                id,
+                from_node_id,
+                to_node_id,
+                relation_type: relation_type_from_str(&relation_str)?,
+                weight,
+            })
+        })
+        .transpose()
+    }
+
+    fn record_node_source(&self, node_id: ConceptNodeId, document_id: DocumentId) -> Result<(), AppError> {
+        let conn = self.connection.lock()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO concept_node_sources (node_id, document_id) VALUES (?1, ?2)",
+            params![node_id.0, document_id.0],
+        )
+        .map_err(|e| AppError::storage(format!("concept node source insert failed: {e}")))?;
+        Ok(())
+    }
+
+    fn list_source_documents(&self, node_id: ConceptNodeId) -> Result<Vec<DocumentId>, AppError> {
+        let conn = self.connection.lock()?;
+        let mut stmt = conn
+            .prepare("SELECT document_id FROM concept_node_sources WHERE node_id = ?1")
+            .map_err(|e| AppError::storage(format!("concept node source query failed: {e}")))?;
+        let ids = stmt
+            .query_map(params![node_id.0], |row| row.get::<_, i64>(0))
+            .map_err(|e| AppError::storage(format!("concept node source query failed: {e}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| AppError::storage(format!("concept node source row read failed: {e}")))?;
+        Ok(ids.into_iter().map(DocumentId).collect())
     }
 }
 
@@ -251,5 +326,31 @@ mod tests {
         repo.delete_edge(edge.id).unwrap();
 
         assert!(repo.list_edges_for_node(a.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn find_node_by_label_is_case_insensitive_and_workspace_scoped() {
+        let repo = SqliteGraphRepository::new(conn());
+        repo.insert_node(sample_node(1, "Gradient Descent")).unwrap();
+
+        let found = repo.find_node_by_label(WorkspaceId(1), "gradient descent").unwrap();
+        assert!(found.is_some());
+
+        let wrong_workspace = repo.find_node_by_label(WorkspaceId(2), "Gradient Descent").unwrap();
+        assert!(wrong_workspace.is_none());
+    }
+
+    #[test]
+    fn record_node_source_is_idempotent_and_queryable() {
+        let repo = SqliteGraphRepository::new(conn());
+        let node = repo.insert_node(sample_node(1, "X")).unwrap();
+
+        repo.record_node_source(node.id, DocumentId(10)).unwrap();
+        repo.record_node_source(node.id, DocumentId(10)).unwrap(); // no-op, not a duplicate
+        repo.record_node_source(node.id, DocumentId(20)).unwrap();
+
+        let mut sources = repo.list_source_documents(node.id).unwrap();
+        sources.sort_by_key(|d| d.0);
+        assert_eq!(sources, vec![DocumentId(10), DocumentId(20)]);
     }
 }

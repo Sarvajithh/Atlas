@@ -158,6 +158,7 @@ mod tests {
                 title: "Sample".to_string(),
                 file_type: "md".to_string(),
                 content_hash: "abc".to_string(),
+                authored_at: None,
             },
             blocks: vec![Block {
                 block_type: BlockType::Paragraph,

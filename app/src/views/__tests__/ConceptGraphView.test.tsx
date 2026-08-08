@@ -31,20 +31,54 @@ describe("ConceptGraphView", () => {
     expect(screen.getByText("No workspaces yet")).toBeTruthy();
   });
 
-  it("renders real concept nodes from graph.get instead of a blank pane", async () => {
-    vi.mocked(invoke).mockResolvedValueOnce([
-      { id: 1, workspace_id: 1, label: "Photosynthesis", description: "Light-driven energy conversion", created_at: "2026-01-01T00:00:00Z" },
-    ]);
+  it("renders real concept nodes+edges from graph.getFull instead of a flat list", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({
+      nodes: [
+        { id: 1, workspace_id: 1, label: "Photosynthesis", description: "Light-driven energy conversion", created_at: "2026-01-01T00:00:00Z" },
+        { id: 2, workspace_id: 1, label: "Chlorophyll", description: null, created_at: "2026-01-01T00:00:00Z" },
+      ],
+      edges: [{ id: 1, from_node_id: 1, to_node_id: 2, relation_type: "RelatedTo", weight: 1 }],
+    });
 
     render(<ConceptGraphView />);
 
     await waitFor(() => expect(screen.getByText("Photosynthesis")).toBeTruthy());
-    expect(invoke).toHaveBeenCalledWith("graph_get", { workspaceId: 1 });
+    expect(screen.getByText("Chlorophyll")).toBeTruthy();
+    expect(invoke).toHaveBeenCalledWith("graph_get_full", { workspaceId: 1 });
   });
 
   it("shows an honest empty state when no concepts have been extracted yet", async () => {
-    vi.mocked(invoke).mockResolvedValueOnce([]);
+    vi.mocked(invoke).mockResolvedValueOnce({ nodes: [], edges: [] });
     render(<ConceptGraphView />);
     await waitFor(() => expect(screen.getByText("No concepts extracted yet")).toBeTruthy());
+  });
+
+  it("clicking a node shows its relations, and re-extract calls graph.reextract", async () => {
+    const user = (await import("@testing-library/user-event")).default.setup();
+    vi.mocked(invoke).mockResolvedValueOnce({
+      nodes: [
+        { id: 1, workspace_id: 1, label: "Photosynthesis", description: null, created_at: "t" },
+        { id: 2, workspace_id: 1, label: "Chlorophyll", description: null, created_at: "t" },
+      ],
+      edges: [{ id: 1, from_node_id: 1, to_node_id: 2, relation_type: "RelatedTo", weight: 1 }],
+    });
+
+    render(<ConceptGraphView />);
+    await waitFor(() => expect(screen.getByText("Photosynthesis")).toBeTruthy());
+
+    await user.click(screen.getByText("Photosynthesis"));
+    await waitFor(() => expect(screen.getByText(/related to Chlorophyll/)).toBeTruthy());
+
+    vi.mocked(invoke).mockResolvedValueOnce({
+      nodes_created: 1,
+      nodes_reused: 1,
+      edges_created: 0,
+      edges_skipped_existing: 1,
+    });
+    vi.mocked(invoke).mockResolvedValueOnce({ nodes: [], edges: [] });
+
+    await user.click(screen.getByRole("button", { name: "Re-extract concepts" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("graph_reextract", { workspaceId: 1 }));
+    await waitFor(() => expect(screen.getByText(/Re-extraction complete/)).toBeTruthy());
   });
 });

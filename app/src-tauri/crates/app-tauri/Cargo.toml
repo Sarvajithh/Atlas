@@ -23,6 +23,7 @@ tauri-build = { version = "2.2", features = [] }
 
 [dependencies]
 atlas-core = { path = "../atlas-core" }
+atlas-graph = { path = "../atlas-graph" }
 atlas-indexer = { path = "../atlas-indexer" }
 atlas-models = { path = "../atlas-models" }
 atlas-utils = { path = "../atlas-utils" }

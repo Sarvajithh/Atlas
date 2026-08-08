@@ -8,6 +8,7 @@
 
 pub mod chunk_repository;
 pub mod chunker;
+pub mod dates;
 pub mod document_repository;
 pub mod embedding;
 pub mod embedding_repository;

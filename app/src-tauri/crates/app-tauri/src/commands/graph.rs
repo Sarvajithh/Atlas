@@ -1,5 +1,5 @@
-//! `graph.*` namespace (§43.1): graph.get, graph.getConceptDetail,
-//! graph.citationGraph (Research Mode phase).
+//! `graph.*` namespace (§43.1): graph.get, graph.getFull, graph.reextract,
+//! graph.getConceptDetail, graph.citationGraph (Research Mode phase).
 
 use tauri::State;
 
@@ -18,6 +18,35 @@ pub fn graph_get(
         .graph_engine()
         .repository()
         .list_nodes_for_workspace(WorkspaceId(workspace_id))
+}
+
+/// Full graph (nodes + edges) for node-link rendering (§20). See
+/// `AppFacade::graph_full`'s doc comment for why `graph_get` alone was
+/// never enough to draw an actual graph.
+#[derive(Debug, Serialize)]
+pub struct GraphFullResponse {
+    pub nodes: Vec<ConceptNode>,
+    pub edges: Vec<ConceptEdge>,
+}
+
+#[tauri::command]
+pub fn graph_get_full(
+    facade: State<'_, AppFacade>,
+    workspace_id: i64,
+) -> Result<GraphFullResponse, AppError> {
+    let (nodes, edges) = facade.graph_full(WorkspaceId(workspace_id))?;
+    Ok(GraphFullResponse { nodes, edges })
+}
+
+/// Manual Concept Extraction re-run for a workspace (§20). See
+/// `AppFacade::reextract_workspace_concepts`'s doc comment for the
+/// idempotency/error-handling contract.
+#[tauri::command]
+pub fn graph_reextract(
+    facade: State<'_, AppFacade>,
+    workspace_id: i64,
+) -> Result<atlas_graph::ExtractionOutcome, AppError> {
+    facade.reextract_workspace_concepts(WorkspaceId(workspace_id))
 }
 
 /// One entry in `graph.citationGraph`'s response: a real Concept Graph

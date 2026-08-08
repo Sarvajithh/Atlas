@@ -23,6 +23,11 @@ pub trait GraphRepository: Send + Sync {
     ) -> Result<Option<ConceptNode>, AppError>;
 
     fn list_edges_for_node(&self, node_id: ConceptNodeId) -> Result<Vec<ConceptEdge>, AppError>;
+    /// All edges whose endpoints both belong to `workspace_id`'s concept
+    /// nodes -- used to render a node-link graph (previously nothing
+    /// fetched more than one node's edges at a time, so the UI could
+    /// never draw more than a fragment of the real relation set).
+    fn list_edges_for_workspace(&self, workspace_id: WorkspaceId) -> Result<Vec<ConceptEdge>, AppError>;
     fn insert_edge(&self, edge: ConceptEdge) -> Result<ConceptEdge, AppError>;
     fn delete_edge(&self, id: ConceptEdgeId) -> Result<(), AppError>;
 

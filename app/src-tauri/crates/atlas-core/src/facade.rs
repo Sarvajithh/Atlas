@@ -39,7 +39,9 @@ use atlas_models::{
 };
 use atlas_types::chat::{ChatMessage, ChatMode, ChatRole, ChatSession};
 use atlas_types::ids::{ChatSessionId, WorkspaceId};
+use atlas_types::memory::LearningProgress;
 use atlas_types::model::EngineRole;
+use atlas_types::quiz::{Flashcard, GeneratedFlashcards, GeneratedQuiz, QuizAnswerResult, QuizGradeResult};
 use atlas_types::retrieval::{Citation, GlobalSearchResult};
 use atlas_types::workspace::WorkspaceStatus;
 use atlas_utils::AppError;
@@ -153,6 +155,36 @@ pub struct AppFacade {
     /// (e.g. a future `graph.reextract` IPC command re-running extraction
     /// on demand) without reconstructing it.
     concept_extractor: Arc<atlas_graph::ConceptExtractor>,
+}
+
+/// Strips a leading/trailing markdown code fence if the model added one
+/// despite being told not to (§45.1: tolerate a common, recoverable model
+/// formatting slip). Same logic as `atlas_graph::extraction::strip_code_fence`;
+/// duplicated rather than imported since `atlas-core` -- not `atlas-graph`
+/// -- is where the Quiz/Flashcard JSON parsing lives, and this one-line
+/// helper isn't worth adding a cross-crate dependency for.
+fn strip_code_fence(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("```") {
+        let rest = rest.strip_prefix("json").unwrap_or(rest);
+        if let Some(end) = rest.rfind("```") {
+            return rest[..end].trim();
+        }
+        return rest.trim();
+    }
+    trimmed
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawQuizResponse {
+    #[serde(default)]
+    questions: Vec<atlas_types::quiz::QuizQuestion>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawFlashcardsResponse {
+    #[serde(default)]
+    cards: Vec<Flashcard>,
 }
 
 impl AppFacade {
@@ -595,6 +627,92 @@ impl AppFacade {
         workspace_ids: &[WorkspaceId],
     ) -> Result<Vec<atlas_graph::CrossDocumentEdge>, AppError> {
         atlas_graph::list_cross_document_edges(self.graph_engine.repository(), workspace_ids)
+    }
+
+    /// Full Concept Graph for a workspace: every node plus every edge
+    /// connecting two of that workspace's nodes (§20). Previously
+    /// `graph_get`/`graph.get` only ever returned nodes -- `Concept Graph
+    /// View` rendered a flat list, never a graph, because there was no
+    /// call anywhere that fetched more than one node's edges at a time
+    /// (`list_edges_for_node` alone can't cheaply build a whole-workspace
+    /// graph). Uses the new `GraphRepository::list_edges_for_workspace`.
+    pub fn graph_full(&self, workspace_id: WorkspaceId) -> Result<(Vec<atlas_types::concept::ConceptNode>, Vec<atlas_types::concept::ConceptEdge>), AppError> {
+        let nodes = self.graph_engine.repository().list_nodes_for_workspace(workspace_id)?;
+        let edges = self.graph_engine.repository().list_edges_for_workspace(workspace_id)?;
+        Ok((nodes, edges))
+    }
+
+    /// Manual re-extraction trigger (§20): re-runs Concept Extraction over
+    /// every already-indexed document in `workspace_id`, using the chunk
+    /// text already persisted from indexing (never re-parses a file --
+    /// same "no engine formats its own prompt" / module-boundary style
+    /// `ConceptExtractor::extract_and_store`'s own doc comment already
+    /// requires). This was previously only ever invoked automatically from
+    /// the Background Indexing Worker on a document that just finished
+    /// indexing (`worker.rs`); there was no path for a user to ask for a
+    /// re-extraction pass explicitly (e.g. after editing the extraction
+    /// prompt, changing the Reasoning model, or simply because the first
+    /// pass under-extracted). `extract_and_store` is already idempotent
+    /// (dedupes by label / exact edge match), so re-running it on
+    /// unchanged text is safe -- this never produces duplicate nodes or
+    /// edges. A single document's extraction failing (§45.1 Recoverable)
+    /// does not abort the rest of the workspace's documents; failures are
+    /// collected and returned alongside the successes rather than being
+    /// silently swallowed.
+    pub fn reextract_workspace_concepts(&self, workspace_id: WorkspaceId) -> Result<atlas_graph::ExtractionOutcome, AppError> {
+        let documents = self.documents.list_for_workspace(workspace_id)?;
+        let mut outcome = atlas_graph::ExtractionOutcome::default();
+        let mut first_error: Option<AppError> = None;
+
+        for document in documents {
+            let chunks = self.indexing_pipeline.chunks().list_for_document(document.id)?;
+            if chunks.is_empty() {
+                continue;
+            }
+            let text = chunks
+                .iter()
+                .map(|c| c.text_content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+
+            match self
+                .concept_extractor
+                .extract_and_store(workspace_id, document.id, &document.relative_path, &text)
+            {
+                Ok(doc_outcome) => {
+                    outcome.nodes_created += doc_outcome.nodes_created;
+                    outcome.nodes_reused += doc_outcome.nodes_reused;
+                    outcome.edges_created += doc_outcome.edges_created;
+                    outcome.edges_skipped_existing += doc_outcome.edges_skipped_existing;
+                }
+                Err(e) => {
+                    atlas_utils::log_warn!(
+                        "[AppFacade::reextract_workspace_concepts] extraction failed for document {}: {}",
+                        document.id.0,
+                        e.message
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+            }
+        }
+
+        // If literally every document failed (and at least one was
+        // attempted), surface that as an error rather than silently
+        // returning an all-zero outcome that looks identical to "nothing
+        // needed re-extracting".
+        if outcome.nodes_created == 0
+            && outcome.nodes_reused == 0
+            && outcome.edges_created == 0
+            && outcome.edges_skipped_existing == 0
+        {
+            if let Some(e) = first_error {
+                return Err(e);
+            }
+        }
+
+        Ok(outcome)
     }
 
     /// Settings-driven default for `search_global`'s `limit` when the
@@ -1158,21 +1276,66 @@ impl AppFacade {
     /// instruction sent to the Reasoning Engine in one pass -- the Model
     /// Scheduler pipeline for `Intent::Quiz` already routes through
     /// Retriever -> Reranker -> Reasoning (§15).
-    pub fn quiz(&self, workspace_id: WorkspaceId, topic: &str, question_count: u8) -> Result<(String, Vec<Citation>), AppError> {
+    /// Quiz Generator (§43.2). Previously returned a single opaque prose
+    /// `String` -- ungradeable, and indistinguishable from a plain chat
+    /// answer. Now instructs the model to return a fixed JSON shape
+    /// (mirrors `atlas-graph::extraction`'s "structured-output Reasoning-
+    /// role call" pattern) and parses it into real `QuizQuestion`s so
+    /// `submit_quiz` (below) can grade them and update Student Memory.
+    /// A malformed/unparseable model response is a hard `Err` here (fail
+    /// closed) rather than falling back to a fabricated single question,
+    /// since a quiz the user can't trust the grading of is worse than an
+    /// explicit error -- same posture the rest of `AppFacade`'s
+    /// model-backed methods already take on bad model output.
+    pub fn quiz(&self, workspace_id: WorkspaceId, topic: &str, question_count: u8) -> Result<GeneratedQuiz, AppError> {
         let instruction = format!(
-            "Generate {question_count} quiz questions (with answers) about: {topic}. Base every question strictly on the provided context."
+            "Generate exactly {question_count} multiple-choice quiz questions about: {topic}. \
+             Base every question strictly on the provided context -- never invent facts not present in it. \
+             Respond with ONLY a single JSON object, no prose before or after it, no markdown code fences, \
+             in exactly this shape:\n\
+             {{\"questions\": [{{\"question\": \"string\", \"options\": [\"string\", \"string\", \"string\", \"string\"], \
+             \"correct_index\": 0, \"explanation\": \"one sentence citing why this is correct\"}}]}}\n\n\
+             Rules:\n\
+             - Each question needs exactly 4 options.\n\
+             - \"correct_index\" is 0-based and must index into \"options\".\n\
+             - If the context doesn't support {question_count} distinct questions, return as many as it genuinely supports."
         );
         let (output, citations) = self
             .scheduler
             .execute(&self.engine_pool, &self.retriever, workspace_id, &Intent::Quiz, &instruction, 8, None)?;
-        Ok((output.content, citations))
+
+        let cleaned = strip_code_fence(&output.content);
+        let parsed: RawQuizResponse = serde_json::from_str(cleaned).map_err(|e| {
+            AppError::model(format!("quiz model returned unparseable JSON: {e} (raw: {cleaned:.200})"))
+        })?;
+
+        let questions = parsed
+            .questions
+            .into_iter()
+            .filter(|q| !q.options.is_empty() && q.correct_index < q.options.len())
+            .collect::<Vec<_>>();
+        if questions.is_empty() {
+            return Err(AppError::model(
+                "quiz model returned no gradeable questions (empty, or every correct_index out of range)",
+            ));
+        }
+
+        Ok(GeneratedQuiz { topic: topic.to_string(), questions, citations })
     }
 
     /// Flashcard Generator feature, composed on the Tutor Engine (via
     /// `Intent::Tutoring`'s existing routing) rather than a new role.
-    pub fn flashcards(&self, workspace_id: WorkspaceId, topic: &str, card_count: u8) -> Result<(String, Vec<Citation>), AppError> {
+    /// Same structured-JSON treatment as `quiz` above, for the same
+    /// reason: a `<pre>`-dumped prose blob can't drive a real front/back
+    /// review flow or spaced-repetition scheduling.
+    pub fn flashcards(&self, workspace_id: WorkspaceId, topic: &str, card_count: u8) -> Result<GeneratedFlashcards, AppError> {
         let instruction = format!(
-            "Create {card_count} flashcards (front/back pairs) covering the key facts about: {topic}. Base every card strictly on the provided context."
+            "Create exactly {card_count} flashcards (front/back pairs) covering the key facts about: {topic}. \
+             Base every card strictly on the provided context -- never invent facts not present in it. \
+             Respond with ONLY a single JSON object, no prose before or after it, no markdown code fences, \
+             in exactly this shape:\n\
+             {{\"cards\": [{{\"front\": \"question or term\", \"back\": \"answer or definition\"}}]}}\n\n\
+             If the context doesn't support {card_count} distinct cards, return as many as it genuinely supports."
         );
         let (output, citations) = self.scheduler.execute(
             &self.engine_pool,
@@ -1183,7 +1346,76 @@ impl AppFacade {
             8,
             None,
         )?;
-        Ok((output.content, citations))
+
+        let cleaned = strip_code_fence(&output.content);
+        let parsed: RawFlashcardsResponse = serde_json::from_str(cleaned).map_err(|e| {
+            AppError::model(format!("flashcards model returned unparseable JSON: {e} (raw: {cleaned:.200})"))
+        })?;
+
+        let cards: Vec<Flashcard> = parsed
+            .cards
+            .into_iter()
+            .filter(|c| !c.front.trim().is_empty() && !c.back.trim().is_empty())
+            .collect();
+        if cards.is_empty() {
+            return Err(AppError::model("flashcards model returned no usable front/back cards"));
+        }
+
+        Ok(GeneratedFlashcards { topic: topic.to_string(), cards, citations })
+    }
+
+    /// Grades a completed quiz attempt and, when `topic` resolves to an
+    /// existing Concept Graph node (case-insensitive label match -- same
+    /// lookup `atlas-graph::extraction`'s dedup already uses, so this
+    /// deliberately does not create a new node from a quiz topic string
+    /// that doesn't already correspond to one), persists the result into
+    /// `learning_progress` (§33.18, §19 Student Memory) so Memory &
+    /// Analytics and the Revision Planner see real quiz-derived signal
+    /// instead of only whatever `assistant_revision_plan` happened to be
+    /// fed directly. `answers[i]` is the option index the user selected
+    /// for `questions[i]`, or `None` if they left it unanswered
+    /// (counted as incorrect, never silently dropped from the total).
+    pub fn submit_quiz(
+        &self,
+        workspace_id: WorkspaceId,
+        topic: &str,
+        questions: &[atlas_types::quiz::QuizQuestion],
+        answers: &[Option<usize>],
+    ) -> Result<QuizGradeResult, AppError> {
+        let mut results = Vec::with_capacity(questions.len());
+        let mut correct_count = 0usize;
+        for (i, question) in questions.iter().enumerate() {
+            let selected = answers.get(i).copied().flatten();
+            let correct = selected == Some(question.correct_index);
+            if correct {
+                correct_count += 1;
+            }
+            results.push(QuizAnswerResult {
+                question_index: i,
+                selected_index: selected,
+                correct_index: question.correct_index,
+                correct,
+            });
+        }
+        let total_count = questions.len();
+        let score = if total_count == 0 { 0.0 } else { correct_count as f32 / total_count as f32 };
+
+        let matched_node = self.graph_engine.repository().find_node_by_label(workspace_id, topic)?;
+        let matched_concept_node_id = matched_node.as_ref().map(|n| n.id);
+
+        if let Some(node) = matched_node {
+            let existing = self.memory_engine.progress().get_progress(node.id)?;
+            let attempt_count = existing.as_ref().map(|p| p.attempt_count).unwrap_or(0) + 1;
+            self.memory_engine.progress().upsert_progress(LearningProgress {
+                concept_node_id: node.id,
+                mastery_score: score,
+                weakness_score: 1.0 - score,
+                last_reviewed_at: Some(atlas_utils::time::now_iso8601()),
+                attempt_count,
+            })?;
+        }
+
+        Ok(QuizGradeResult { correct_count, total_count, score, results, matched_concept_node_id })
     }
 
     /// Revision Planner feature, composed on the Planner Engine
@@ -1560,6 +1792,145 @@ mod tests {
         let messages = facade.memory_engine().chat().list_messages(sessions[0].id).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, atlas_types::chat::ChatRole::User);
+    }
+
+    #[test]
+    fn quiz_json_response_parses_into_gradeable_questions() {
+        let raw = r#"{"questions": [
+            {"question": "What is 2+2?", "options": ["3", "4", "5", "6"], "correct_index": 1, "explanation": "2+2=4"},
+            {"question": "Bad row, out of range", "options": ["a", "b"], "correct_index": 9, "explanation": "invalid"}
+        ]}"#;
+        let cleaned = strip_code_fence(raw);
+        let parsed: RawQuizResponse = serde_json::from_str(cleaned).unwrap();
+        // Mirrors the filter `AppFacade::quiz` applies: an out-of-range
+        // `correct_index` is dropped rather than producing an ungradeable
+        // question.
+        let valid: Vec<_> = parsed
+            .questions
+            .into_iter()
+            .filter(|q| !q.options.is_empty() && q.correct_index < q.options.len())
+            .collect();
+        assert_eq!(valid.len(), 1);
+        assert_eq!(valid[0].correct_index, 1);
+    }
+
+    #[test]
+    fn quiz_json_response_tolerates_a_wrapping_markdown_fence() {
+        let raw = "```json\n{\"questions\": []}\n```";
+        let cleaned = strip_code_fence(raw);
+        let parsed: RawQuizResponse = serde_json::from_str(cleaned).unwrap();
+        assert!(parsed.questions.is_empty());
+    }
+
+    #[test]
+    fn submit_quiz_grades_correctly_and_counts_unanswered_as_incorrect() {
+        let facade = AppFacade::new(SqliteConnection::open(":memory:"));
+        let questions = vec![
+            atlas_types::quiz::QuizQuestion {
+                question: "Q1".into(),
+                options: vec!["a".into(), "b".into()],
+                correct_index: 0,
+                explanation: "because".into(),
+            },
+            atlas_types::quiz::QuizQuestion {
+                question: "Q2".into(),
+                options: vec!["a".into(), "b".into()],
+                correct_index: 1,
+                explanation: "because".into(),
+            },
+        ];
+        // First answered correctly, second left unanswered (`None`).
+        let answers = vec![Some(0), None];
+        let result = facade
+            .submit_quiz(WorkspaceId(1), "a topic with no matching concept node", &questions, &answers)
+            .unwrap();
+
+        assert_eq!(result.correct_count, 1);
+        assert_eq!(result.total_count, 2);
+        assert!((result.score - 0.5).abs() < f32::EPSILON);
+        assert_eq!(result.results[0].correct, true);
+        assert_eq!(result.results[1].correct, false);
+        assert_eq!(result.results[1].selected_index, None);
+        // No Concept Graph node exists for this made-up topic string, so
+        // progress must not be fabricated -- this is the behavior the
+        // doc comment on `submit_quiz` promises.
+        assert!(result.matched_concept_node_id.is_none());
+    }
+
+    #[test]
+    fn graph_full_returns_nodes_and_only_edges_within_the_workspace() {
+        let facade = AppFacade::new(SqliteConnection::open(":memory:"));
+        let repo = facade.graph_engine().repository();
+
+        let a = repo
+            .insert_node(atlas_types::concept::ConceptNode {
+                id: atlas_types::ids::ConceptNodeId(0),
+                workspace_id: WorkspaceId(1),
+                label: "Derivatives".to_string(),
+                description: None,
+                created_at: "t".to_string(),
+            })
+            .unwrap();
+        let b = repo
+            .insert_node(atlas_types::concept::ConceptNode {
+                id: atlas_types::ids::ConceptNodeId(0),
+                workspace_id: WorkspaceId(1),
+                label: "Gradient Descent".to_string(),
+                description: None,
+                created_at: "t".to_string(),
+            })
+            .unwrap();
+        repo.insert_edge(atlas_types::concept::ConceptEdge {
+            id: atlas_types::ids::ConceptEdgeId(0),
+            from_node_id: a.id,
+            to_node_id: b.id,
+            relation_type: atlas_types::concept::RelationType::PrerequisiteOf,
+            weight: 1.0,
+        })
+        .unwrap();
+
+        let (nodes, edges) = facade.graph_full(WorkspaceId(1)).unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(edges.len(), 1);
+
+        let (empty_nodes, empty_edges) = facade.graph_full(WorkspaceId(2)).unwrap();
+        assert!(empty_nodes.is_empty());
+        assert!(empty_edges.is_empty());
+    }
+
+    #[test]
+    fn reextract_workspace_concepts_is_a_clean_noop_when_nothing_is_indexed() {
+        let facade = AppFacade::new(SqliteConnection::open(":memory:"));
+        // No documents linked/indexed for this workspace at all -- must
+        // not error just because there's nothing to re-extract from.
+        let outcome = facade.reextract_workspace_concepts(WorkspaceId(1)).unwrap();
+        assert_eq!(outcome, atlas_graph::ExtractionOutcome::default());
+    }
+
+    #[test]
+    fn reextract_workspace_concepts_skips_documents_with_no_chunks() {
+        let facade = AppFacade::new(SqliteConnection::open(":memory:"));
+        facade
+            .indexing_pipeline()
+            .documents()
+            .upsert(atlas_types::document::DocumentRecord {
+                id: atlas_types::ids::DocumentId(0),
+                workspace_id: WorkspaceId(1),
+                relative_path: "notes.md".to_string(),
+                content_hash: "hash".to_string(),
+                file_type: "md".to_string(),
+                size: 0,
+                mtime: "t".to_string(),
+                parse_status: atlas_types::document::ParseStatus::Parsed,
+                last_indexed_hash: None,
+                authored_at: None,
+            })
+            .unwrap();
+
+        // Document exists but was never chunked (e.g. parsing failed) --
+        // this must be skipped, not attempted against a live model.
+        let outcome = facade.reextract_workspace_concepts(WorkspaceId(1)).unwrap();
+        assert_eq!(outcome, atlas_graph::ExtractionOutcome::default());
     }
 
     #[test]

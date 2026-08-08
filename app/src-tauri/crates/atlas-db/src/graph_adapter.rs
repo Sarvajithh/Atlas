@@ -142,6 +142,39 @@ impl GraphRepository for SqliteGraphRepository {
         Ok(edges)
     }
 
+    fn list_edges_for_workspace(&self, workspace_id: WorkspaceId) -> Result<Vec<ConceptEdge>, AppError> {
+        let conn = self.connection.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT ce.id, ce.from_node_id, ce.to_node_id, ce.relation_type, ce.weight \
+                 FROM concept_edges ce \
+                 JOIN concept_nodes cn ON cn.id = ce.from_node_id \
+                 WHERE cn.workspace_id = ?1 ORDER BY ce.id ASC",
+            )
+            .map_err(|e| AppError::storage(format!("workspace concept edge list prepare failed: {e}")))?;
+        let rows = stmt
+            .query_map(params![workspace_id.0], |row| {
+                let relation_str: String = row.get(3)?;
+                Ok((
+                    ConceptEdgeId(row.get(0)?),
+                    ConceptNodeId(row.get(1)?),
+                    ConceptNodeId(row.get(2)?),
+                    relation_str,
+                    row.get::<_, f64>(4)? as f32,
+                ))
+            })
+            .map_err(|e| AppError::storage(format!("workspace concept edge list query failed: {e}")))?;
+
+        let mut edges = Vec::new();
+        for row in rows {
+            let (id, from_node_id, to_node_id, relation_str, weight) =
+                row.map_err(|e| AppError::storage(format!("workspace concept edge row read failed: {e}")))?;
+            let relation_type = relation_type_from_str(&relation_str)?;
+            edges.push(ConceptEdge { id, from_node_id, to_node_id, relation_type, weight });
+        }
+        Ok(edges)
+    }
+
     fn insert_edge(&self, edge: ConceptEdge) -> Result<ConceptEdge, AppError> {
         let conn = self.connection.lock()?;
         conn.execute(
@@ -306,6 +339,40 @@ mod tests {
 
         let edges_from_b = repo.list_edges_for_node(b.id).unwrap();
         assert_eq!(edges_from_b.len(), 1);
+    }
+
+    #[test]
+    fn list_edges_for_workspace_only_returns_edges_within_that_workspace() {
+        let repo = SqliteGraphRepository::new(conn());
+        let a = repo.insert_node(sample_node(1, "Derivatives")).unwrap();
+        let b = repo.insert_node(sample_node(1, "Gradient Descent")).unwrap();
+        let c = repo.insert_node(sample_node(2, "Unrelated Workspace Node A")).unwrap();
+        let d = repo.insert_node(sample_node(2, "Unrelated Workspace Node B")).unwrap();
+
+        repo.insert_edge(ConceptEdge {
+            id: ConceptEdgeId(0),
+            from_node_id: a.id,
+            to_node_id: b.id,
+            relation_type: RelationType::PrerequisiteOf,
+            weight: 0.9,
+        })
+        .unwrap();
+        repo.insert_edge(ConceptEdge {
+            id: ConceptEdgeId(0),
+            from_node_id: c.id,
+            to_node_id: d.id,
+            relation_type: RelationType::RelatedTo,
+            weight: 0.5,
+        })
+        .unwrap();
+
+        let workspace1_edges = repo.list_edges_for_workspace(WorkspaceId(1)).unwrap();
+        assert_eq!(workspace1_edges.len(), 1);
+        assert_eq!(workspace1_edges[0].from_node_id, a.id);
+
+        let workspace2_edges = repo.list_edges_for_workspace(WorkspaceId(2)).unwrap();
+        assert_eq!(workspace2_edges.len(), 1);
+        assert_eq!(workspace2_edges[0].from_node_id, c.id);
     }
 
     #[test]

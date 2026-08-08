@@ -37,7 +37,7 @@ pub trait ConceptExtractionModel: Send + Sync {
 /// Result of running extraction over one document/chunk-batch: how many
 /// concept nodes and cross-references were newly created versus already
 /// existed (and so were reused rather than duplicated).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ExtractionOutcome {
     pub nodes_created: usize,
     pub nodes_reused: usize,

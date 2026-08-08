@@ -164,11 +164,16 @@ impl IndexingPipeline {
             mtime: now_iso8601(),
             parse_status: ParseStatus::Parsing,
             last_indexed_hash: existing.as_ref().and_then(|d| d.last_indexed_hash.clone()),
+            // Carried forward until this re-parse completes and (possibly)
+            // overwrites it below -- avoids a brief window where a
+            // previously-known authored date disappears from the Timeline
+            // just because a re-index is in progress.
+            authored_at: existing.as_ref().and_then(|d| d.authored_at.clone()),
         };
         let record = self.documents.upsert(record)?;
 
         match self.run_pipeline(workspace_id, record.id, absolute_path, parser) {
-            Ok(chunk_count) => {
+            Ok((chunk_count, authored_at)) => {
                 let mut done = record.clone();
                 // Fix 5 (P1 audit): a pipeline run that completes without
                 // error but produces zero chunks (corrupt file, an
@@ -182,6 +187,13 @@ impl IndexingPipeline {
                     ParseStatus::Parsed
                 };
                 done.last_indexed_hash = Some(content_hash);
+                // Research Mode Timeline: overwrite with this parse's
+                // finding -- `None` genuinely means "re-parsed and still
+                // found no authored-date evidence" and should clear a
+                // stale value (e.g. the document's front matter was
+                // edited to remove the date), not leave a now-wrong one
+                // in place.
+                done.authored_at = authored_at;
                 self.documents.upsert(done)?;
 
                 self.events.publish(AppEvent {
@@ -228,14 +240,16 @@ impl IndexingPipeline {
 
     /// Parse -> OCR-fill -> chunk -> embed -> persist, for a document whose
     /// `documents` row already exists (§33.2, §33.3, §33.4). Returns the
-    /// number of chunks written.
+    /// number of chunks written and the parser's best-effort authored-date
+    /// finding (§ Research Mode Timeline; `None` when no parser-level
+    /// evidence was found, never fabricated from `mtime`).
     fn run_pipeline(
         &self,
         workspace_id: WorkspaceId,
         document_id: DocumentId,
         absolute_path: &str,
         parser: &dyn crate::parser::Parser,
-    ) -> Result<usize, AppError> {
+    ) -> Result<(usize, Option<String>), AppError> {
         let mut parsed: ParsedDocument = parser.parse(absolute_path)?;
 
         // §17: OCR runs only on blocks detected as image-based, never
@@ -301,7 +315,7 @@ impl IndexingPipeline {
             count += 1;
         }
 
-        Ok(count)
+        Ok((count, parsed.metadata.authored_at))
     }
 
     fn embed_and_store(

@@ -31,6 +31,7 @@ const doc = {
   mtime: "2026-01-01T00:00:00Z",
   parse_status: "Parsed" as const,
   last_indexed_hash: null,
+  authored_at: null,
 };
 
 describe("DocumentView", () => {

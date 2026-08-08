@@ -248,20 +248,15 @@ pub struct QuizRequest {
     pub question_count: Option<u8>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct GeneratedContent {
-    pub content: String,
-    pub citations: Vec<Citation>,
-}
-
 /// Quiz Generator feature (additive extension of `assistant.*`, §43.2).
 /// Composed on the Reasoning Engine via `atlas-core`'s `AppFacade::quiz`
 /// (see that method and the `atlas_models::engines` module doc for why
-/// this isn't a new §14.1 Engine role).
+/// this isn't a new §14.1 Engine role). Returns real structured, gradeable
+/// questions (`GeneratedQuiz`) rather than an opaque prose blob -- see
+/// `AppFacade::quiz`'s doc comment for why that changed.
 #[tauri::command]
-pub fn assistant_quiz(facade: State<'_, AppFacade>, request: QuizRequest) -> Result<GeneratedContent, AppError> {
-    let (content, citations) = facade.quiz(WorkspaceId(request.workspace_id), &request.topic, request.question_count.unwrap_or(5))?;
-    Ok(GeneratedContent { content, citations })
+pub fn assistant_quiz(facade: State<'_, AppFacade>, request: QuizRequest) -> Result<atlas_types::quiz::GeneratedQuiz, AppError> {
+    facade.quiz(WorkspaceId(request.workspace_id), &request.topic, request.question_count.unwrap_or(5))
 }
 
 #[derive(Debug, Deserialize)]
@@ -273,9 +268,32 @@ pub struct FlashcardsRequest {
 
 /// Flashcard Generator feature, composed on the Tutor Engine.
 #[tauri::command]
-pub fn assistant_flashcards(facade: State<'_, AppFacade>, request: FlashcardsRequest) -> Result<GeneratedContent, AppError> {
-    let (content, citations) = facade.flashcards(WorkspaceId(request.workspace_id), &request.topic, request.card_count.unwrap_or(10))?;
-    Ok(GeneratedContent { content, citations })
+pub fn assistant_flashcards(
+    facade: State<'_, AppFacade>,
+    request: FlashcardsRequest,
+) -> Result<atlas_types::quiz::GeneratedFlashcards, AppError> {
+    facade.flashcards(WorkspaceId(request.workspace_id), &request.topic, request.card_count.unwrap_or(10))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QuizSubmitRequest {
+    pub workspace_id: i64,
+    pub topic: String,
+    pub questions: Vec<atlas_types::quiz::QuizQuestion>,
+    /// `answers[i]` is the option index selected for `questions[i]`, or
+    /// `null` if that question was left unanswered.
+    pub answers: Vec<Option<usize>>,
+}
+
+/// Grades a completed quiz attempt and, when the topic resolves to a real
+/// Concept Graph node, records the result into Student Memory (§19). See
+/// `AppFacade::submit_quiz` for the matching/persistence rules.
+#[tauri::command]
+pub fn assistant_quiz_submit(
+    facade: State<'_, AppFacade>,
+    request: QuizSubmitRequest,
+) -> Result<atlas_types::quiz::QuizGradeResult, AppError> {
+    facade.submit_quiz(WorkspaceId(request.workspace_id), &request.topic, &request.questions, &request.answers)
 }
 
 #[derive(Debug, Deserialize)]

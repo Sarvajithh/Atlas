@@ -165,10 +165,9 @@ inferred from comments or prior documentation.
 - **Timeline is explicitly deferred, not silently skipped**:
   `DocumentRecord` (§33.2) has no publication/authored-date field, only
   filesystem `mtime` — surfacing that as a "timeline" would be actively
-  misleading (a re-saved older document would sort as recent). Needs
-  parser-level date extraction, out of this phase's scope; the
-  `ResearchMode.tsx` Timeline tab says this plainly rather than showing
-  empty or fake content.
+  misleading (a re-saved older document would sort as recent). **Fixed**:
+  see "Research Mode: Timeline fixed" in Remaining v1.0 Work's changelog
+  below — `DocumentRecord.authored_at` is now real, parser-derived data.
 - Not yet done: no visual node-link graph rendering for Citation Graph
   (currently a grouped list — the query being real and correct was this
   phase's focus, not graph layout); no combined "search across
@@ -241,17 +240,41 @@ inferred from comments or prior documentation.
 items independently re-verified as already done above.)*
 
 ### Medium priority
-- **Quiz / Flashcard / Revision Planner generation depth** — currently
-  one-line wrappers around a generic LLM call with no structured output
-  schema, no persisted structured records, and no real weak-topic-detection
-  computation behind them.
-- **Research Mode: Timeline** — explicitly deferred (not silently
-  skipped): `DocumentRecord` (§33.2) carries only a filesystem `mtime`,
-  not a publication/authored date, so there's no genuine chronological
-  metadata to surface. Needs parser-level date extraction (a PDF's
-  metadata date, or a document's own "Published on ..." text) — deeper
-  parser work than the Research Mode phase's scope. Flagged in
-  `ResearchMode.tsx`'s own doc comment and its Timeline tab, not hidden.
+- ~~**Quiz / Flashcard / Revision Planner generation depth**~~ — **Quiz
+  and Flashcards fixed** (this phase): `assistant.quiz`/`assistant.flashcards`
+  now return real structured JSON (`GeneratedQuiz`/`GeneratedFlashcards`,
+  `atlas_types::quiz`) instead of an opaque prose blob, `QuizExamMode.tsx`
+  renders an actual selectable multiple-choice flow instead of a `<pre>`
+  dump, and a new `assistant_quiz_submit` command grades attempts and
+  persists the score into `learning_progress` when the topic matches an
+  existing Concept Graph node (`AppFacade::submit_quiz`). Revision
+  Planner's own weak-topic-detection computation is unchanged by this fix
+  and remains open.
+- **Research Mode: Timeline fixed** (this phase): `DocumentRecord` now
+  carries a real `authored_at: Option<String>` (`YYYY-MM-DD`), populated
+  at parse time by the new `atlas_indexer::dates` module — the PDF
+  parser reads the file's own `/CreationDate` via `lopdf`'s object graph,
+  and every parser falls back to scanning extracted text for an explicit
+  "Published ..."/"Date: ..." line. Deliberately narrow: an unlabeled or
+  locale-ambiguous (`MM/DD/YYYY`) date is never guessed at — `None` stays
+  `None` rather than risk a wrong date. `ResearchTimelineView.tsx`
+  renders dated documents chronologically and undated ones in an honest
+  separate group, replacing the old "deferred" placeholder. Still not
+  covered: image files (no EXIF date extraction) and any format whose
+  authored date isn't in its own metadata or explicitly labeled in text.
+- ~~**Concept Graph: no node-link visualization**~~ — **fixed** (this
+  phase): new `GraphRepository::list_edges_for_workspace` +
+  `AppFacade::graph_full` (`graph.getFull`) return every node and edge
+  for a workspace in one call; `ConceptGraphView.tsx` now renders an
+  actual SVG node-link diagram (circular layout, click a node to see its
+  relations) instead of a flat node list. Also added a manual
+  "Re-extract concepts" trigger (`AppFacade::reextract_workspace_concepts`,
+  `graph.reextract`) — previously extraction only ever ran automatically
+  during indexing, with no way to ask for a re-run (e.g. after a
+  first pass under-extracted). A real force-directed layout library is
+  still a reasonable follow-up; the circular layout is legible at the
+  tens-of-nodes scale a single workspace realistically reaches, not a
+  scalable general solution.
 - **Vector store vs. architecture contract** — the current implementation
   is a custom in-house `EmbeddedVectorStore`, not Qdrant or LanceDB as
   mandated by the frozen architecture contract §5. This needs either a
@@ -367,6 +390,88 @@ not been independently re-verified against a live Ollama instance in this
 environment.
 
 ## Changelog
+
+- **[Research Mode Timeline: real authored dates]** — Closed the
+  "Research Mode: Timeline" gap. Added `atlas_indexer::dates`
+  (dependency-free date-extraction heuristics: an explicit "Published"/
+  "Date" label followed by `YYYY-MM-DD` or a month-name date; refuses to
+  guess on an unlabeled date or ambiguous `MM/DD/YYYY` ordering) and wired
+  it into every parser (`markdown`, `txt`, `html`, `docx` scan their
+  extracted text; `pdf` reads the real `/CreationDate` from the file's
+  own Info dictionary via `lopdf`'s object graph first, falling back to
+  page-1 text scanning). New `DocumentMetadata`/`DocumentRecord.authored_at:
+  Option<String>` field, migration `0018_add_documents_authored_at`,
+  persisted and carried forward across re-indexes in `pipeline.rs`.
+  `ResearchTimelineView.tsx` replaces the old placeholder with a real
+  chronological list, showing documents with no known date in an honest
+  separate group rather than omitting them or falling back to `mtime`.
+  New tests: `atlas_indexer::dates` unit tests (including the "does not
+  fabricate" cases), parser tests for markdown and PDF (one exercising a
+  synthetic PDF with a real `/CreationDate` Info dict, one exercising the
+  text-scan fallback), a document-adapter round-trip test, and updated
+  `ResearchMode.test.tsx`. Frontend: `npx tsc --noEmit` clean, full
+  `vitest run` 58/58 passing. **lopdf API note**: this environment has no
+  Rust toolchain, so rather than guess at `lopdf 0.32`'s `Object`/
+  `Dictionary` API from memory, I downloaded the actual crate source
+  from crates.io and verified `as_str()`, `as_reference()`, and
+  `get_dictionary()`'s real signatures against it before writing the
+  `/CreationDate` lookup — but the code itself is still uncompiled; run
+  `cargo check` before trusting it. Not covered: image files (no EXIF
+  date extraction) and non-PDF/text formats with no in-band date evidence.
+
+- **[Concept Graph: real node-link diagram + manual re-extract]** —
+  Closed the "no visual node-link graph rendering" gap for the Concept
+  Graph View specifically (Research Mode's separate Citation Graph list
+  is unchanged — still open, see below). New
+  `GraphRepository::list_edges_for_workspace` (SQLite + in-memory impls)
+  and `AppFacade::graph_full`/`graph.getFull` return a whole workspace's
+  nodes+edges in one call — previously nothing did, only
+  `list_edges_for_node` existed, so `ConceptGraphView.tsx` could only
+  ever render a flat node list. It now draws an actual SVG node-link
+  diagram (simple circular layout; a real force-directed library is a
+  reasonable follow-up, not required at the tens-of-nodes scale a single
+  workspace realistically reaches) with click-to-inspect relations. Also
+  added `AppFacade::reextract_workspace_concepts`/`graph.reextract`: a
+  manual re-run of Concept Extraction over a workspace's already-indexed
+  documents (reuses persisted chunk text, never re-parses files;
+  idempotent since `extract_and_store` already dedupes; one document's
+  extraction failing doesn't abort the rest). New tests: a SQLite
+  workspace-edge-isolation test, `graph_full`/`reextract` facade tests
+  (including the "nothing indexed yet" and "document has no chunks"
+  clean-noop cases), and rewritten `ConceptGraphView.test.tsx`. Frontend:
+  `npx tsc --noEmit` clean, full `vitest run` passing. Same caveat as
+  above: no Rust toolchain here, backend changes are manually reviewed,
+  not compiled.
+
+- **[Quiz/Flashcards structured generation + grading]** — Closed the
+  "Quiz / Flashcard generation depth" gap flagged as Medium priority.
+  `AppFacade::quiz`/`flashcards` now prompt for and parse fixed-shape JSON
+  (`atlas_types::quiz::GeneratedQuiz`/`GeneratedFlashcards`) instead of
+  returning a single opaque prose `String`; a malformed/empty model
+  response fails closed (`AppError::model`) rather than falling back to a
+  fabricated question. Added `AppFacade::submit_quiz` /
+  `assistant_quiz_submit`: grades a completed attempt, and — only when
+  the quiz's topic string resolves to an existing Concept Graph node via
+  `find_node_by_label` (never fabricated for an unmatched topic) —
+  persists `mastery_score`/`weakness_score`/`attempt_count` into
+  `learning_progress` (§33.18), so Quiz Mode now actually feeds Student
+  Memory / Memory & Analytics instead of being a dead end. `QuizExamMode.tsx`
+  was rewritten from a `<pre>`-dumped text blob into a real selectable
+  multiple-choice flow (select → submit → per-question correct/incorrect
+  highlighting + explanation + score) and a flip-to-reveal flashcard grid.
+  New unit tests: quiz JSON parsing (incl. an out-of-range `correct_index`
+  being dropped, and a wrapping ```` ```json ```` fence being tolerated)
+  and `submit_quiz` grading (including the "no matching concept → no
+  progress written" case) in `facade.rs`; updated/added React tests in
+  `QuizExamMode.test.tsx` covering generation and the submit-and-grade
+  flow. Frontend: `npx tsc --noEmit` clean, full `vitest run` 57/57
+  passing. **Not independently verified**: no Rust toolchain was
+  available in this environment, so the backend changes (`facade.rs`,
+  `assistant.rs`, `main.rs`, new `atlas_types::quiz` module) were not
+  compiled or run — read carefully before trusting them, same caveat as
+  prior entries in this changelog made under the same constraint.
+  Revision Planner's own weak-topic-detection logic is untouched by this
+  fix and remains open.
 
 - **[Fix pass, this entry: blank-view regression, not new feature work]**
   — Diagnosed and fixed the four blank routed views (Document View,

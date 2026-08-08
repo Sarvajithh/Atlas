@@ -34,6 +34,12 @@ pub struct DocumentRecord {
     pub mtime: String,
     pub parse_status: ParseStatus,
     pub last_indexed_hash: Option<String>,
+    /// Mirrors `ParsedDocument::metadata::authored_at` (Research Mode
+    /// Timeline). Persisted separately from the ephemeral `ParsedDocument`
+    /// each re-parse produces, so the Timeline can query it without
+    /// re-parsing every document on every view. `None` until a parse
+    /// finds genuine authored-date evidence.
+    pub authored_at: Option<String>,
 }
 
 /// A location reference into a source document, as described in §35.1 and
@@ -66,6 +72,14 @@ pub struct DocumentMetadata {
     pub title: String,
     pub file_type: String,
     pub content_hash: String,
+    /// Best-effort publication/authored date, as `YYYY-MM-DD`, distinct
+    /// from the filesystem `mtime` on `DocumentRecord` below (§ Research
+    /// Mode Timeline). `None` when no parser could find genuine authored-
+    /// date evidence -- never filled from `mtime` or a re-index/re-save
+    /// time, since that would be actively misleading (a re-saved older
+    /// paper sorting as "recent"). See `atlas_indexer::parser::dates` for
+    /// where this actually gets populated.
+    pub authored_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

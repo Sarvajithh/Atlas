@@ -1,7 +1,16 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import { ipcInvoke } from "@/ipc/client";
-import type { AssistantAnswer, ChatMessage, ChatSession, Citation, GeneratedContent } from "@/ipc/types";
+import type {
+  AssistantAnswer,
+  ChatMessage,
+  ChatSession,
+  Citation,
+  GeneratedFlashcards,
+  GeneratedQuiz,
+  QuizGradeResult,
+  QuizQuestion,
+} from "@/ipc/types";
 
 /**
  * `assistant.*` namespace (§43.1). Mirrors backend `assistant_*` Tauri
@@ -161,14 +170,31 @@ export function assistantGetSessionMessages(sessionId: number): Promise<ChatMess
   return ipcInvoke<ChatMessage[]>("assistant_get_session_messages", { sessionId });
 }
 
-export function assistantQuiz(workspaceId: number, topic: string, questionCount?: number): Promise<GeneratedContent> {
-  return ipcInvoke<GeneratedContent>("assistant_quiz", {
+export function assistantQuiz(workspaceId: number, topic: string, questionCount?: number): Promise<GeneratedQuiz> {
+  return ipcInvoke<GeneratedQuiz>("assistant_quiz", {
     request: { workspace_id: workspaceId, topic, question_count: questionCount ?? null },
   });
 }
 
-export function assistantFlashcards(workspaceId: number, topic: string, cardCount?: number): Promise<GeneratedContent> {
-  return ipcInvoke<GeneratedContent>("assistant_flashcards", {
+export function assistantFlashcards(workspaceId: number, topic: string, cardCount?: number): Promise<GeneratedFlashcards> {
+  return ipcInvoke<GeneratedFlashcards>("assistant_flashcards", {
     request: { workspace_id: workspaceId, topic, card_count: cardCount ?? null },
+  });
+}
+
+/**
+ * Grades a completed quiz attempt (§19 Student Memory) and, when `topic`
+ * resolves to a real Concept Graph node, updates that concept's
+ * mastery/weakness score. `answers[i]` is the option index selected for
+ * `questions[i]`, or `null` if left unanswered.
+ */
+export function assistantQuizSubmit(
+  workspaceId: number,
+  topic: string,
+  questions: QuizQuestion[],
+  answers: (number | null)[],
+): Promise<QuizGradeResult> {
+  return ipcInvoke<QuizGradeResult>("assistant_quiz_submit", {
+    request: { workspace_id: workspaceId, topic, questions, answers },
   });
 }

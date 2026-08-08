@@ -203,6 +203,7 @@ pub mod markdown {
                 title: path.to_string(),
                 file_type: "md".to_string(),
                 content_hash: atlas_utils::hashing::hash_str(text),
+                authored_at: crate::dates::extract_authored_date_from_text(text),
             },
             blocks,
         }
@@ -228,6 +229,15 @@ pub mod markdown {
             );
             assert_eq!(doc.blocks[2].block_type, BlockType::Heading);
             assert_eq!(doc.blocks[2].text_content, "Section");
+        }
+
+        #[test]
+        fn authored_at_is_populated_from_a_published_line_and_none_without_one() {
+            let with_date = parse_markdown_text("notes.md", "# Title\n\nPublished: 2023-06-14\n\nBody.");
+            assert_eq!(with_date.metadata.authored_at, Some("2023-06-14".to_string()));
+
+            let without_date = parse_markdown_text("notes.md", "# Title\n\nJust body text, no date label.");
+            assert_eq!(without_date.metadata.authored_at, None);
         }
 
         #[test]
@@ -329,10 +339,11 @@ pub mod pdf {
     /// is produced as `BlockType::Image` rather than dropped, so
     /// downstream OCR-gating (`requires_ocr`) keeps working unchanged.
     pub fn parse_pdf_bytes(path: &str, bytes: &[u8]) -> ParsedDocument {
-        let metadata = DocumentMetadata {
+        let mut metadata = DocumentMetadata {
             title: path.to_string(),
             file_type: "pdf".to_string(),
             content_hash: atlas_utils::hashing::hash_bytes(bytes),
+            authored_at: None,
         };
 
         let doc = match lopdf::Document::load_mem(bytes) {
@@ -354,6 +365,8 @@ pub mod pdf {
                 };
             }
         };
+
+        metadata.authored_at = pdf_creation_date(&doc);
 
         let pages = doc.get_pages();
         let mut blocks = Vec::new();
@@ -386,7 +399,36 @@ pub mod pdf {
             }
         }
 
+        // The PDF's own `/CreationDate` info-dict field (if present and
+        // parseable) is preferred -- it's the file format's own authored-
+        // date field. Only when that's absent/unparseable does this fall
+        // back to scanning the first page's extracted text for an
+        // explicit "Published ..." line, same heuristic the text-based
+        // parsers use.
+        if metadata.authored_at.is_none() {
+            if let Some(first_page_text) = blocks.first().map(|b| b.text_content.as_str()) {
+                metadata.authored_at = crate::dates::extract_authored_date_from_text(first_page_text);
+            }
+        }
+
         ParsedDocument { metadata, blocks }
+    }
+
+    /// Best-effort read of the PDF's `/Info` dictionary `/CreationDate`
+    /// (§7.9.4 of the PDF spec) via `lopdf`'s trailer/object-graph API.
+    /// Any failure at any step (no `/Info` entry, a dangling reference, a
+    /// non-string value, an unparseable date string) returns `None`
+    /// rather than erroring -- this is explicitly a best-effort
+    /// enhancement, not something that should ever fail parsing of the
+    /// document itself.
+    fn pdf_creation_date(doc: &lopdf::Document) -> Option<String> {
+        let info_ref = doc.trailer.get(b"Info").ok()?;
+        let info_id = info_ref.as_reference().ok()?;
+        let info_dict = doc.get_dictionary(info_id).ok()?;
+        let raw = info_dict.get(b"CreationDate").ok()?;
+        let text = raw.as_str().ok()?;
+        let text = String::from_utf8_lossy(text);
+        crate::dates::parse_pdf_date(&text)
     }
 
     /// Sanity-check that extracted text plausibly IS text, kept from the
@@ -625,6 +667,42 @@ pub mod pdf {
             assert_eq!(parsed.blocks.len(), 1);
             assert_eq!(parsed.blocks[0].block_type, BlockType::Paragraph);
             assert!(parsed.blocks[0].text_content.contains("Hello Compressed World"));
+        }
+
+        #[test]
+        fn authored_at_prefers_the_pdf_info_dict_creation_date() {
+            let mut doc = lopdf::Document::with_version("1.5");
+            let pages_id = doc.new_object_id();
+            doc.objects.insert(
+                pages_id,
+                lopdf::Object::Dictionary(lopdf::dictionary! { "Type" => "Pages", "Kids" => vec![], "Count" => 0 }),
+            );
+            let catalog_id = doc.add_object(lopdf::dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+            doc.trailer.set("Root", catalog_id);
+            let info_id = doc.add_object(lopdf::dictionary! {
+                "CreationDate" => lopdf::Object::string_literal("D:20230614120000-05'00'"),
+            });
+            doc.trailer.set("Info", info_id);
+
+            let mut bytes = Vec::new();
+            doc.save_to(&mut bytes).unwrap();
+
+            let parsed = parse_pdf_bytes("dated.pdf", &bytes);
+            assert_eq!(parsed.metadata.authored_at, Some("2023-06-14".to_string()));
+        }
+
+        #[test]
+        fn authored_at_falls_back_to_scanning_first_page_text_without_a_creation_date() {
+            let pdf_bytes = build_flate_compressed_text_pdf("Published: 2023-06-14");
+            let parsed = parse_pdf_bytes("no-info-dict.pdf", &pdf_bytes);
+            assert_eq!(parsed.metadata.authored_at, Some("2023-06-14".to_string()));
+        }
+
+        #[test]
+        fn authored_at_is_none_when_neither_source_has_a_date() {
+            let pdf_bytes = build_flate_compressed_text_pdf("Just some ordinary text, no date.");
+            let parsed = parse_pdf_bytes("undated.pdf", &pdf_bytes);
+            assert_eq!(parsed.metadata.authored_at, None);
         }
 
         #[test]
@@ -1022,6 +1100,13 @@ pub mod docx {
                 title: path.to_string(),
                 file_type: "docx".to_string(),
                 content_hash: atlas_utils::hashing::hash_bytes(bytes),
+                // No single raw "document text" string exists at this
+                // point (paragraphs/tables are already split into
+                // `blocks`) -- scan the first few blocks' text, which is
+                // where front-matter like "Published: ..." would appear.
+                authored_at: crate::dates::extract_authored_date_from_text(
+                    &blocks.iter().take(10).map(|b| b.text_content.as_str()).collect::<Vec<_>>().join("\n"),
+                ),
             },
             blocks,
         }
@@ -1190,6 +1275,11 @@ pub mod image {
                     title: path.to_string(),
                     file_type: "image".to_string(),
                     content_hash: atlas_utils::hashing::hash_bytes(&bytes),
+                    // No text content exists to scan for a date, and no
+                    // image-metadata (EXIF) date extraction is in scope
+                    // here -- honestly `None`, not a guess from filename
+                    // or filesystem time.
+                    authored_at: None,
                 },
                 blocks: vec![Block {
                     block_type: BlockType::Image,
@@ -1299,6 +1389,7 @@ pub mod txt {
                 title: path.to_string(),
                 file_type: "txt".to_string(),
                 content_hash: atlas_utils::hashing::hash_str(text),
+                authored_at: crate::dates::extract_authored_date_from_text(text),
             },
             blocks,
         }
@@ -1641,6 +1732,12 @@ pub mod html {
                 title: path.to_string(),
                 file_type: "html".to_string(),
                 content_hash: atlas_utils::hashing::hash_str(html),
+                // Best-effort: scans the raw markup, not stripped visible
+                // text, so a label split across tags (e.g. `<b>Published</b>:
+                // 2023-06-14`) won't match -- acceptable for this
+                // heuristic's scope (§ Research Mode Timeline), not worth
+                // a second HTML-stripping pass just for date detection.
+                authored_at: crate::dates::extract_authored_date_from_text(html),
             },
             blocks,
         }

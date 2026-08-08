@@ -278,6 +278,7 @@ mod tests {
             mtime: "1970-01-01T00:00:00Z".to_string(),
             parse_status: ParseStatus::Pending,
             last_indexed_hash: None,
+            authored_at: None,
         }
     }
 

@@ -109,6 +109,26 @@ impl GraphRepository for InMemoryGraphRepository {
             .collect())
     }
 
+    fn list_edges_for_workspace(&self, workspace_id: WorkspaceId) -> Result<Vec<ConceptEdge>, AppError> {
+        let node_ids: std::collections::HashSet<ConceptNodeId> = self
+            .nodes
+            .lock()
+            .map_err(|_| AppError::user("graph node lock poisoned"))?
+            .iter()
+            .filter(|n| n.workspace_id == workspace_id)
+            .map(|n| n.id)
+            .collect();
+        let edges = self
+            .edges
+            .lock()
+            .map_err(|_| AppError::user("graph edge lock poisoned"))?;
+        Ok(edges
+            .iter()
+            .filter(|e| node_ids.contains(&e.from_node_id))
+            .cloned()
+            .collect())
+    }
+
     fn insert_edge(&self, edge: ConceptEdge) -> Result<ConceptEdge, AppError> {
         let mut edges = self
             .edges

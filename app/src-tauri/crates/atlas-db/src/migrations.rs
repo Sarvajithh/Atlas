@@ -326,6 +326,18 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_concept_node_sources_document ON concept_node_sources(document_id);
         ",
     },
+    // Research Mode Timeline (§8.2.4): a real, best-effort publication/
+    // authored date, distinct from the existing `mtime` column (which is
+    // filesystem modification time, not a publication date, and was
+    // never meant to be shown as one -- see `ResearchMode.tsx`'s prior
+    // doc comment on why Timeline was deferred rather than built against
+    // `mtime`). Populated by `atlas_indexer::dates` at parse time; `NULL`
+    // for any document a parser couldn't find genuine authored-date
+    // evidence for, never backfilled from `mtime`.
+    Migration {
+        id: "0018_add_documents_authored_at",
+        sql: "ALTER TABLE documents ADD COLUMN authored_at TEXT;",
+    },
 ];
 
 pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {

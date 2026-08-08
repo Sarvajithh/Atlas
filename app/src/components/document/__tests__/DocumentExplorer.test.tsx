@@ -21,6 +21,7 @@ function makeDoc(overrides: Partial<DocumentRecord> = {}): DocumentRecord {
     mtime: "2026-01-01T00:00:00Z",
     parse_status: "Parsed",
     last_indexed_hash: null,
+    authored_at: null,
     ...overrides,
   };
 }

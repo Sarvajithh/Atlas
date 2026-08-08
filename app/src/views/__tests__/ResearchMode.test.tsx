@@ -115,11 +115,63 @@ describe("ResearchMode", () => {
     );
   });
 
-  it("explicitly flags Timeline as deferred rather than showing fabricated dates", async () => {
+  it("shows a chronological timeline of dated documents and groups undated ones separately", async () => {
     const user = userEvent.setup();
+    vi.mocked(invoke).mockResolvedValueOnce([
+      {
+        id: 1,
+        workspace_id: 1,
+        relative_path: "later-paper.pdf",
+        content_hash: "h1",
+        file_type: "pdf",
+        size: 100,
+        mtime: "2026-01-01T00:00:00Z",
+        parse_status: "Parsed",
+        last_indexed_hash: "h1",
+        authored_at: "2023-06-14",
+      },
+      {
+        id: 2,
+        workspace_id: 1,
+        relative_path: "earlier-paper.pdf",
+        content_hash: "h2",
+        file_type: "pdf",
+        size: 100,
+        mtime: "2026-01-01T00:00:00Z",
+        parse_status: "Parsed",
+        last_indexed_hash: "h2",
+        authored_at: "2020-01-01",
+      },
+      {
+        id: 3,
+        workspace_id: 1,
+        relative_path: "undated-notes.md",
+        content_hash: "h3",
+        file_type: "md",
+        size: 50,
+        mtime: "2026-01-01T00:00:00Z",
+        parse_status: "Parsed",
+        last_indexed_hash: "h3",
+        authored_at: null,
+      },
+    ]);
+    vi.mocked(invoke).mockResolvedValueOnce([]); // workspace B's document_list call
+
     render(<ResearchMode />);
     await user.click(screen.getByRole("button", { name: "Timeline" }));
-    expect(screen.getByText(/Timeline is deferred/)).toBeTruthy();
+
+    await waitFor(() => expect(screen.getByText("earlier-paper.pdf")).toBeTruthy());
+    // Chronological: earlier date should render before the later one in the DOM.
+    const earlierIndex = screen.getByText("earlier-paper.pdf").compareDocumentPosition(
+      screen.getByText("later-paper.pdf"),
+    );
+    // eslint-disable-next-line no-bitwise
+    expect(earlierIndex & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    expect(screen.getByText(/No known date \(1 document\)/)).toBeTruthy();
+    expect(screen.getByText("undated-notes.md")).toBeTruthy();
+    expect(invoke).toHaveBeenCalledWith("document_list", { workspaceId: 1 });
+    expect(invoke).toHaveBeenCalledWith("document_list", { workspaceId: 2 });
   });
 
   it("shows an honest error state when the research query IPC call fails", async () => {

@@ -57,6 +57,7 @@ type DocumentRow = (
     String,
     String,
     Option<String>,
+    Option<String>,
 );
 
 fn row_to_document(row: &Row<'_>) -> rusqlite::Result<DocumentRow> {
@@ -70,11 +71,12 @@ fn row_to_document(row: &Row<'_>) -> rusqlite::Result<DocumentRow> {
         row.get(6)?,
         row.get(7)?,
         row.get(8)?,
+        row.get(9)?,
     ))
 }
 
 fn tuple_to_document(tuple: DocumentRow) -> Result<DocumentRecord, AppError> {
-    let (id, workspace_id, relative_path, content_hash, file_type, size, mtime, parse_status, last_indexed_hash) =
+    let (id, workspace_id, relative_path, content_hash, file_type, size, mtime, parse_status, last_indexed_hash, authored_at) =
         tuple;
     Ok(DocumentRecord {
         id: DocumentId(id),
@@ -86,10 +88,11 @@ fn tuple_to_document(tuple: DocumentRow) -> Result<DocumentRecord, AppError> {
         mtime,
         parse_status: status_from_str(&parse_status)?,
         last_indexed_hash,
+        authored_at,
     })
 }
 
-const SELECT_COLUMNS: &str = "id, workspace_id, relative_path, content_hash, file_type, size, mtime, parse_status, last_indexed_hash FROM documents";
+const SELECT_COLUMNS: &str = "id, workspace_id, relative_path, content_hash, file_type, size, mtime, parse_status, last_indexed_hash, authored_at FROM documents";
 
 impl DocumentRepository for SqliteDocumentRepository {
     fn find_by_id(&self, id: DocumentId) -> Result<Option<DocumentRecord>, AppError> {
@@ -144,8 +147,8 @@ impl DocumentRepository for SqliteDocumentRepository {
             conn.execute(
                 "UPDATE documents
                  SET content_hash = ?1, file_type = ?2, size = ?3, mtime = ?4,
-                     parse_status = ?5, last_indexed_hash = ?6
-                 WHERE id = ?7",
+                     parse_status = ?5, last_indexed_hash = ?6, authored_at = ?7
+                 WHERE id = ?8",
                 params![
                     document.content_hash,
                     document.file_type,
@@ -153,6 +156,7 @@ impl DocumentRepository for SqliteDocumentRepository {
                     document.mtime,
                     status_to_str(&document.parse_status),
                     document.last_indexed_hash,
+                    document.authored_at,
                     id,
                 ],
             )
@@ -164,8 +168,8 @@ impl DocumentRepository for SqliteDocumentRepository {
         } else {
             conn.execute(
                 "INSERT INTO documents
-                    (workspace_id, relative_path, content_hash, file_type, size, mtime, parse_status, last_indexed_hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    (workspace_id, relative_path, content_hash, file_type, size, mtime, parse_status, last_indexed_hash, authored_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     document.workspace_id.0,
                     document.relative_path,
@@ -175,6 +179,7 @@ impl DocumentRepository for SqliteDocumentRepository {
                     document.mtime,
                     status_to_str(&document.parse_status),
                     document.last_indexed_hash,
+                    document.authored_at,
                 ],
             )
             .map_err(|e| AppError::storage(format!("document insert failed: {e}")))?;
@@ -209,6 +214,7 @@ mod tests {
             mtime: "1970-01-01T00:00:00Z".to_string(),
             parse_status: ParseStatus::Pending,
             last_indexed_hash: None,
+            authored_at: None,
         }
     }
 
@@ -264,5 +270,20 @@ mod tests {
     fn find_by_id_missing_returns_none() {
         let repo = repo();
         assert!(repo.find_by_id(DocumentId(999)).unwrap().is_none());
+    }
+
+    #[test]
+    fn authored_at_round_trips_through_upsert_and_is_null_by_default() {
+        let repo = repo();
+        let inserted = repo.upsert(sample(1, "no-date.md")).unwrap();
+        assert_eq!(inserted.authored_at, None);
+
+        let mut with_date = sample(1, "dated.md");
+        with_date.authored_at = Some("2023-06-14".to_string());
+        let inserted_with_date = repo.upsert(with_date).unwrap();
+        assert_eq!(inserted_with_date.authored_at, Some("2023-06-14".to_string()));
+
+        let refetched = repo.find_by_id(inserted_with_date.id).unwrap().unwrap();
+        assert_eq!(refetched.authored_at, Some("2023-06-14".to_string()));
     }
 }

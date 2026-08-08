@@ -2,21 +2,18 @@
  * Research Mode (§8.2.6): multi-document, cross-workspace assistant
  * context for literature-review-style work (§9: explicit, opt-in state).
  *
- * Literature Review, Paper Comparison, and Citation Graph are real here --
- * every panel below is backed by a genuine IPC round-trip
- * (`rag.researchQuery`, `graph.citationGraph`) over real retrieved/
- * extracted data, no mock content.
+ * Literature Review, Paper Comparison, Citation Graph, and Timeline are
+ * all real here -- every panel below is backed by a genuine IPC
+ * round-trip (`rag.researchQuery`, `graph.citationGraph`, `document.list`)
+ * over real retrieved/extracted/parsed data, no mock content.
  *
- * Timeline is intentionally NOT implemented in this phase and is flagged
- * here rather than silently missing: `DocumentRecord` (§33.2) carries only
- * a filesystem `mtime`, not a publication/authored date, so there is no
- * real chronological metadata to surface yet. Fabricating one from file
- * modification time would be actively misleading (a re-saved or
- * re-indexed older paper would sort as "recent"). Building a real one
- * needs parser-level date extraction (e.g. a PDF's metadata date, or a
- * document's own "Published on ..." text) -- deeper parser work than this
- * phase's scope, called out here as the explicit follow-up rather than
- * skipped without comment.
+ * Timeline was previously deferred rather than fabricated:
+ * `DocumentRecord` only carried a filesystem `mtime`, not a publication
+ * date, and sorting by `mtime` would be actively misleading (a re-saved
+ * older paper would sort as "recent"). `DocumentRecord.authored_at` is
+ * now a real, best-effort parser-level authored date
+ * (`atlas_indexer::dates`); see `ResearchTimelineView`'s doc comment for
+ * how it's rendered, including the documents it honestly can't date.
  */
 import { useState } from "react";
 import type { ReactNode } from "react";
@@ -25,6 +22,7 @@ import { useAppStore } from "@/state/store";
 
 import { CitationGraphView } from "@/views/research/CitationGraphView";
 import { ResearchQueryPanel } from "@/views/research/ResearchQueryPanel";
+import { ResearchTimelineView } from "@/views/research/ResearchTimelineView";
 
 type ResearchTab = "literature" | "citations" | "timeline";
 
@@ -48,13 +46,7 @@ export function ResearchMode() {
 
       {tab === "literature" && <ResearchQueryPanel workspaces={workspaces} />}
       {tab === "citations" && <CitationGraphView workspaces={workspaces} />}
-      {tab === "timeline" && (
-        <p className="text-sm text-muted-foreground">
-          Timeline is deferred: source documents don't yet carry a real publication/authored date (only filesystem
-          modification time), so there's no genuine chronological data to show. See the note in this file's doc
-          comment for what a real implementation needs.
-        </p>
-      )}
+      {tab === "timeline" && <ResearchTimelineView workspaces={workspaces} />}
     </section>
   );
 }

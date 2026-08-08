@@ -43,6 +43,24 @@ export interface ConceptEdge {
 }
 
 /**
+ * Mirrors backend `commands::graph::GraphFullResponse` (`graph.getFull`):
+ * every node plus every edge connecting two of that workspace's nodes, for
+ * node-link rendering.
+ */
+export interface GraphFullResponse {
+  nodes: ConceptNode[];
+  edges: ConceptEdge[];
+}
+
+/** Mirrors backend `atlas_graph::ExtractionOutcome` (`graph.reextract` response). */
+export interface ExtractionOutcome {
+  nodes_created: number;
+  nodes_reused: number;
+  edges_created: number;
+  edges_skipped_existing: number;
+}
+
+/**
  * Mirrors backend `commands::graph::CitationGraphEdge` (Research Mode
  * phase, `graph.citationGraph`): a real Concept Graph edge whose
  * endpoints are, between them, sourced from more than one document.
@@ -74,6 +92,13 @@ export interface DocumentRecord {
   mtime: string;
   parse_status: ParseStatus;
   last_indexed_hash: string | null;
+  /**
+   * Best-effort publication/authored date (`YYYY-MM-DD`), distinct from
+   * `mtime` (filesystem modification time). `null` when no parser found
+   * genuine authored-date evidence -- never derived from `mtime`. Powers
+   * Research Mode's Timeline tab.
+   */
+  authored_at: string | null;
 }
 
 /** Mirrors backend `DocumentContent` DTO, returned by `document.read`. */
@@ -148,10 +173,49 @@ export interface AssistantAnswer {
   citations: Citation[];
 }
 
-/** Mirrors backend `GeneratedContent` (quiz/flashcards responses). */
-export interface GeneratedContent {
-  content: string;
+/** Mirrors backend `atlas_types::quiz::QuizQuestion`. */
+export interface QuizQuestion {
+  question: string;
+  options: string[];
+  correct_index: number;
+  explanation: string;
+}
+
+/** Mirrors backend `atlas_types::quiz::GeneratedQuiz` (`assistant_quiz` response). */
+export interface GeneratedQuiz {
+  topic: string;
+  questions: QuizQuestion[];
   citations: Citation[];
+}
+
+/** Mirrors backend `atlas_types::quiz::Flashcard`. */
+export interface Flashcard {
+  front: string;
+  back: string;
+}
+
+/** Mirrors backend `atlas_types::quiz::GeneratedFlashcards` (`assistant_flashcards` response). */
+export interface GeneratedFlashcards {
+  topic: string;
+  cards: Flashcard[];
+  citations: Citation[];
+}
+
+/** Mirrors backend `atlas_types::quiz::QuizAnswerResult`. */
+export interface QuizAnswerResult {
+  question_index: number;
+  selected_index: number | null;
+  correct_index: number;
+  correct: boolean;
+}
+
+/** Mirrors backend `atlas_types::quiz::QuizGradeResult` (`assistant_quiz_submit` response). */
+export interface QuizGradeResult {
+  correct_count: number;
+  total_count: number;
+  score: number;
+  results: QuizAnswerResult[];
+  matched_concept_node_id: number | null;
 }
 
 /** Mirrors backend `RunningIndexingJob` (§21, `atlas_types::job`). */

@@ -20,7 +20,7 @@ construction, Ollama-backed chat/tutoring with streaming, a folder watcher
 with incremental indexing, and a working React/Tauri frontend shell with
 IPC wiring for workspaces, documents, and the assistant.
 
-**Estimated overall completion toward the Atlas v1.0 vision: ~65%.**
+**Estimated overall completion toward the Atlas v1.0 vision: ~57%.**
 See "Completed Features," "Remaining Atlas v1.0 Work," and "Known
 Limitations & Technical Debt" below for the itemized breakdown this
 estimate is based on.
@@ -189,16 +189,49 @@ inferred from comments or prior documentation.
   (Ctrl/Cmd+\\), assistant panel toggle (Ctrl/Cmd+B)
 - Theme support, Settings view
 - **Frontend navigation wiring** — `ConceptGraphView`, `ResearchMode`,
-  `QuizExamMode`, `MemoryAnalyticsView`, and `DocumentView` are now routed
-  and reachable from the running shell (`ActivityRail` for Concept Graph
-  and Memory & Analytics; a workspace-scoped mode switcher in `TopNav` for
-  Document View, Research Mode, and Quiz/Exam Mode) — see Changelog. This
-  only wires navigation; it does not claim the underlying feature logic
-  behind each view is complete. Most still render an honest empty/loading
-  state pending their own backend surfaces (Concept Graph extraction,
-  Research Mode's cross-document linking, Quiz/Flashcard generation depth,
-  Memory & Analytics' aggregation queries) — each remains tracked below
-  under its own item, not silently marked done here.
+  `QuizExamMode`, `MemoryAnalyticsView`, and `DocumentView` are routed and
+  reachable from the running shell (`ActivityRail` for Concept Graph and
+  Memory & Analytics; a workspace-scoped mode switcher in `TopNav` for
+  Document View, Research Mode, and Quiz/Exam Mode) — see Changelog.
+- **Document View, Concept Graph View, Quiz/Exam Mode, and Memory &
+  Analytics View now render real content, fixed this phase.** Until this
+  fix, all four were routed to a bare, empty component
+  (`return <section aria-label="..." />;`) with no data fetching, no IPC
+  call, and no loading/empty/error state — a silent blank pane every
+  time, regardless of whether the workspace had data. **This was not a
+  regression: these four views never rendered real data at any point in
+  this repository's history** — the "wiring only, feature logic tracked
+  separately" framing directly above (and the equivalent claims in the
+  Phase 4/5 reports that introduced these views) undersold what was
+  actually shipped, which was zero logic, not partial logic. Research
+  Mode (`ResearchMode.tsx`) was the only one of the five routed views
+  that was ever real, which is why it alone survived a running-app
+  screenshot check unchanged.
+  - `ConceptGraphView` now calls real `graph.get` per workspace, with a
+    workspace picker and honest loading/empty/error states — same data
+    source `MemoryAnalyticsView` below reuses, same one already proven
+    real for Research Mode's Citation Graph.
+  - `MemoryAnalyticsView` lists a workspace's real concept nodes
+    (`graph.get`) and fetches real per-concept mastery/weakness data
+    (`memory.getWeaknesses`). There is no aggregate "all progress rows
+    for a workspace" backend command yet, so this view is per-concept,
+    not a single dashboard query — a concept with no recorded attempts
+    shows "Not yet reviewed", never a fabricated score.
+  - `QuizExamMode` now calls the real `assistant.quiz` /
+    `assistant.flashcards` IPC (`app-tauri/src/commands/assistant.rs`,
+    `AppFacade::quiz`/`AppFacade::flashcards`) — that backend logic and
+    its frontend IPC wrapper (`ipc/assistant.ts`) already existed and
+    already worked; nothing in the UI layer had ever called them.
+  - `DocumentView` composes the same real `DocumentExplorer` and
+    `DocumentViewer` components `WorkspaceDetail`'s tab system already
+    used — those were real and working, just unreachable from this
+    view's own route (only `WorkspaceDetail` could open a document tab).
+    This route now owns that trigger itself: pick a workspace, open a
+    document from the explorer, it renders in the same real viewer.
+  - Node-link graph layout for Concept Graph, a true aggregate analytics
+    dashboard for Memory & Analytics, and a structured quiz/flashcard
+    UI (vs. today's plain-text model output) remain open follow-ups —
+    tracked below, not silently implied done by this fix.
 
 ---
 
@@ -219,17 +252,6 @@ items independently re-verified as already done above.)*
   metadata date, or a document's own "Published on ..." text) — deeper
   parser work than the Research Mode phase's scope. Flagged in
   `ResearchMode.tsx`'s own doc comment and its Timeline tab, not hidden.
-- **Concept Graph View / Quiz-Exam Mode / Memory Analytics frontend
-  wiring** — `ConceptGraphView.tsx`, `QuizExamMode.tsx`, and
-  `MemoryAnalyticsView.tsx` are still stub components
-  (`<section aria-label="..." />`). A stray `app/app/` directory
-  previously contained test files apparently written against fuller
-  implementations of exactly these three components; that directory has
-  now been deleted (see Changelog) since it was never wired into the
-  real build and was polluting `npx vitest run`. Those tests are gone
-  along with it — if a fuller implementation of these three views is
-  still wanted, it needs to be written for real against the actual
-  `app/src` components, not recovered from the stray copy.
 - **Vector store vs. architecture contract** — the current implementation
   is a custom in-house `EmbeddedVectorStore`, not Qdrant or LanceDB as
   mandated by the frozen architecture contract §5. This needs either a
@@ -313,15 +335,15 @@ items independently re-verified as already done above.)*
 | Subsystem | Estimated completion |
 |---|---|
 | Workspaces | ~68% |
-| Document System | ~55% |
+| Document System | ~57% |
 | Knowledge Ingestion | ~60% |
 | AI System (core chat) | ~65% |
 | RAG | ~60% |
-| Learning | ~20% |
+| Learning | ~28% |
 | Research | ~10% |
-| UI (shell + navigation) | ~55% |
+| UI (shell + navigation) | ~60% |
 | Performance | ~45% |
-| **Overall** | **~55%** |
+| **Overall** | **~57%** |
 
 ---
 
@@ -346,6 +368,46 @@ environment.
 
 ## Changelog
 
+- **[Fix pass, this entry: blank-view regression, not new feature work]**
+  — Diagnosed and fixed the four blank routed views (Document View,
+  Quiz/Exam Mode, Concept Graph View, Memory & Analytics View). Root
+  cause was shared for three of the four:
+  `ConceptGraphView.tsx`/`QuizExamMode.tsx`/`MemoryAnalyticsView.tsx`
+  were literal one-line stub components (`return <section aria-label=
+  "..." />;`) with no data fetching, IPC call, or state of any kind —
+  this was **never working**, not a regression from a previously-passing
+  state, despite this file's own prior "manual trace: renders real data"
+  language for the phases that introduced them. `DocumentView.tsx` was
+  also a stub, but for a different reason: the real viewer (`DocumentViewer`,
+  `DocumentExplorer`) already existed and worked inside `WorkspaceDetail`'s
+  tab system — it just had no path to the `document-view` route.
+  Research Mode was the only one of the five routed views ever real,
+  which is why it alone survived a running-app check.
+  - `ConceptGraphView` → real `graph.get` per workspace, honest
+    loading/empty/error states.
+  - `MemoryAnalyticsView` → real `graph.get` + per-concept
+    `memory.getWeaknesses`; no aggregate progress query exists in the
+    backend yet, so this is a per-concept list, not a single dashboard
+    call, and shows "Not yet reviewed" rather than a fabricated score.
+  - `QuizExamMode` → wired to the already-real, already-working
+    `assistant.quiz`/`assistant.flashcards` IPC, which nothing in the UI
+    had ever called.
+  - `DocumentView` → composes the existing real `DocumentExplorer` +
+    `DocumentViewer` + document-tab store, giving this route its own
+    trigger to open a document instead of relying on `WorkspaceDetail`.
+  - The `app/app/` cleanup this fix's task brief asked for was already
+    done — verified via `git log --diff-filter=D` that the Phase 6
+    commit itself deleted that directory; the current tree has no
+    `app/app/` and needed no further action.
+  - Added `src/test-setup.ts` (a `DOMMatrix` shim for `pdfjs-dist` under
+    jsdom, a pre-existing test-environment gap, not new production
+    logic) and wired it into `vitest.config.ts`'s `setupFiles`, needed to
+    get `DocumentView`'s new tests running since it now pulls in
+    `PdfViewer` transitively.
+  - `npx tsc --noEmit` clean. `npx vitest run` (no exclusion) passes:
+    13/13 test files, 56/56 tests (up from 9/9, 45/45 — 4 new test files
+    for the four fixed views). `ResearchMode.tsx` and its tests
+    untouched, confirmed unchanged by re-running its suite.
 - **[`app/app/` cleanup, this entry]** — Deleted the stray,
   untracked-by-the-build `app/app/` directory (35 tracked files: a
   partial duplicate/shadow copy of several backend crates and 3 frontend

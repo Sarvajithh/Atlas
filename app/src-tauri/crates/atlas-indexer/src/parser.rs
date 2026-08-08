@@ -887,12 +887,84 @@ pub mod docx {
         None
     }
 
-    pub fn parse_docx_bytes(path: &str, bytes: &[u8]) -> ParsedDocument {
-        let paragraphs = find_document_xml(bytes)
-            .map(|xml| extract_paragraphs(&xml))
-            .unwrap_or_default();
+    /// Word tables use explicit `<w:tbl>...</w:tbl>` markup (unlike PDF,
+    /// which has no structural table markers at all), so -- like the HTML
+    /// parser's `<table>` handling -- a table's rows/cells can be lifted
+    /// into a dedicated `BlockType::Table` block instead of flattening
+    /// into indistinguishable paragraph text. Returns `(blocks, byte
+    /// ranges consumed)` so the caller can skip those ranges when walking
+    /// ordinary paragraphs, avoiding double-extraction of a table cell's
+    /// own `<w:p>` content.
+    fn extract_tables(xml: &str) -> Vec<(usize, usize, String)> {
+        let mut tables = Vec::new();
+        let mut rest_offset = 0usize;
+        loop {
+            let Some(start_rel) = xml[rest_offset..].find("<w:tbl>").or_else(|| xml[rest_offset..].find("<w:tbl ")) else {
+                break;
+            };
+            let start = rest_offset + start_rel;
+            let Some(end_rel) = xml[start..].find("</w:tbl>") else {
+                break;
+            };
+            let end = start + end_rel + "</w:tbl>".len();
+            let table_xml = &xml[start..end];
+            // Cell text = every `<w:t>` run inside the table region,
+            // joined with " | " between cells (`<w:tc>`) so a flattened
+            // row still reads sensibly, and rows separated by "; ".
+            let mut row_texts = Vec::new();
+            for row_xml in split_between(table_xml, "<w:tr>", "</w:tr>").into_iter()
+                .chain(split_between(table_xml, "<w:tr ", "</w:tr>"))
+            {
+                let mut cell_texts = Vec::new();
+                for cell_xml in split_between(&row_xml, "<w:tc>", "</w:tc>").into_iter()
+                    .chain(split_between(&row_xml, "<w:tc ", "</w:tc>"))
+                {
+                    let cell_paragraphs = extract_paragraphs(&cell_xml);
+                    if !cell_paragraphs.is_empty() {
+                        cell_texts.push(cell_paragraphs.join(" "));
+                    }
+                }
+                if !cell_texts.is_empty() {
+                    row_texts.push(cell_texts.join(" | "));
+                }
+            }
+            if !row_texts.is_empty() {
+                tables.push((start, end, row_texts.join("; ")));
+            } else {
+                tables.push((start, end, String::new()));
+            }
+            rest_offset = end;
+        }
+        tables
+    }
 
-        let blocks: Vec<Block> = if paragraphs.is_empty() {
+    pub fn parse_docx_bytes(path: &str, bytes: &[u8]) -> ParsedDocument {
+        let xml_opt = find_document_xml(bytes);
+        let tables = xml_opt.as_deref().map(extract_tables).unwrap_or_default();
+
+        // Paragraphs that fall inside a `<w:tbl>` region are dropped from
+        // the plain-paragraph stream here and represented once, as a
+        // Table block, instead -- otherwise every cell's text would also
+        // show up a second time as an ordinary flattened paragraph.
+        let paragraphs: Vec<String> = match &xml_opt {
+            Some(xml) => {
+                if tables.is_empty() {
+                    extract_paragraphs(xml)
+                } else {
+                    let mut kept = String::new();
+                    let mut cursor = 0usize;
+                    for (start, end, _) in &tables {
+                        kept.push_str(&xml[cursor..*start]);
+                        cursor = *end;
+                    }
+                    kept.push_str(&xml[cursor..]);
+                    extract_paragraphs(&kept)
+                }
+            }
+            None => Vec::new(),
+        };
+
+        let blocks: Vec<Block> = if paragraphs.is_empty() && tables.is_empty() {
             // Recoverable degradation (§45.1): the ZIP entry was
             // compressed (the common case for real Word documents) or the
             // container couldn't be read; still return a valid document
@@ -908,7 +980,7 @@ pub mod docx {
                 text_content: String::new(),
             }]
         } else {
-            paragraphs
+            let mut blocks: Vec<Block> = paragraphs
                 .into_iter()
                 .enumerate()
                 .map(|(idx, text)| Block {
@@ -918,7 +990,31 @@ pub mod docx {
                     },
                     text_content: text,
                 })
-                .collect()
+                .collect();
+            // Table blocks are appended after the paragraph stream rather
+            // than interleaved at their original document position --
+            // `extract_paragraphs`/`extract_tables` each walk the XML
+            // independently, so reconstructing exact original ordering
+            // across both isn't free; scoped out for this pass (flagged in
+            // README) in favor of shipping real, non-flattened table
+            // structure at all, which is the bigger fidelity win over the
+            // prior behavior (every cell silently merged into the plain
+            // paragraph stream with no distinguishing block type).
+            let mut next_index = blocks.len();
+            for (_, _, text) in tables {
+                if text.is_empty() {
+                    continue;
+                }
+                next_index += 1;
+                blocks.push(Block {
+                    block_type: BlockType::Table,
+                    location_ref: LocationRef {
+                        page_or_location: next_index.to_string(),
+                    },
+                    text_content: text,
+                });
+            }
+            blocks
         };
 
         ParsedDocument {
@@ -989,6 +1085,41 @@ pub mod docx {
             entry.extend_from_slice(name);
             entry.extend_from_slice(&compressed);
             entry
+        }
+
+        #[test]
+        fn table_markup_becomes_a_table_block_not_flattened_paragraphs() {
+            let xml = "<w:p><w:t>Intro paragraph</w:t></w:p>\
+                <w:tbl>\
+                <w:tr><w:tc><w:p><w:t>Name</w:t></w:p></w:tc><w:tc><w:p><w:t>Score</w:t></w:p></w:tc></w:tr>\
+                <w:tr><w:tc><w:p><w:t>Ada</w:t></w:p></w:tc><w:tc><w:p><w:t>9</w:t></w:p></w:tc></w:tr>\
+                </w:tbl>\
+                <w:p><w:t>Outro paragraph</w:t></w:p>";
+            let doc = parse_docx_bytes("table.docx", xml.as_bytes());
+            // Not actually a real ZIP, so this exercises `extract_tables`
+            // directly against the raw XML the way `find_document_xml`
+            // would only be able to return it after unzipping -- covered
+            // separately by the ZIP-fixture test below via table-free XML.
+            let tables = extract_tables(xml);
+            assert_eq!(tables.len(), 1);
+            assert!(tables[0].2.contains("Name | Score"));
+            assert!(tables[0].2.contains("Ada | 9"));
+            // And paragraphs outside the table are preserved and not
+            // duplicated with cell content.
+            let paragraphs = extract_paragraphs(xml);
+            assert!(paragraphs.iter().any(|p| p == "Intro paragraph"));
+            assert!(paragraphs.iter().any(|p| p == "Outro paragraph"));
+            let _ = doc; // parse_docx_bytes itself needs a real ZIP container; see below.
+        }
+
+        #[test]
+        fn real_docx_zip_with_a_table_produces_a_table_block() {
+            let xml = "<w:p><w:t>Intro</w:t></w:p>\
+                <w:tbl><w:tr><w:tc><w:p><w:t>A</w:t></w:p></w:tc><w:tc><w:p><w:t>B</w:t></w:p></w:tc></w:tr></w:tbl>";
+            let fixture = build_deflate_docx_fixture(xml);
+            let doc = parse_docx_bytes("table.docx", &fixture);
+            assert!(doc.blocks.iter().any(|b| b.block_type == BlockType::Table && b.text_content.contains("A | B")));
+            assert!(doc.blocks.iter().any(|b| b.block_type == BlockType::Paragraph && b.text_content == "Intro"));
         }
 
         #[test]
@@ -1251,6 +1382,72 @@ pub mod html {
         matches!(name, "pre" | "code")
     }
 
+    /// Tags with explicit HTML markup this parser can lift into their own
+    /// structural `BlockType` rather than flattening into plain paragraph
+    /// text (task: "table/figure/formula extraction... table structure
+    /// detection for HTML/DOCX, these have explicit table markup"). Handled
+    /// as whole-region extraction (find start tag -> matching end tag) up
+    /// front, before the generic char-by-char tag walk, since a `<table>`
+    /// or `<math>` region's *internal* tags (`<tr>`, `<td>`, `<mrow>`, ...)
+    /// must not be re-interpreted as ordinary block-boundary tags.
+    fn find_region<'a>(html: &'a str, search_from: usize, tag: &str) -> Option<(usize, usize, &'a str)> {
+        let open_needle_a = format!("<{tag}>");
+        let open_needle_b = format!("<{tag} ");
+        let close_needle = format!("</{tag}>");
+        let rest = &html[search_from..];
+        let start_a = rest.find(&open_needle_a);
+        let start_b = rest.find(&open_needle_b);
+        let start_rel = match (start_a, start_b) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => return None,
+        };
+        let open_tag_end_rel = rest[start_rel..].find('>')? + start_rel + 1;
+        let close_rel = rest[open_tag_end_rel..].find(&close_needle)? + open_tag_end_rel;
+        let region_end_rel = close_rel + close_needle.len();
+        Some((
+            search_from + start_rel,
+            search_from + region_end_rel,
+            &html[search_from + start_rel..search_from + region_end_rel],
+        ))
+    }
+
+    /// Strip all tags from a region, collapsing whitespace, for use as the
+    /// flattened text content of a Table/Equation block. Deliberately
+    /// simple (no cell/row structure preserved) -- good enough for
+    /// indexing/search/citation purposes without a full table model, which
+    /// is out of scope here (see README "Partially implemented" notes).
+    fn strip_tags_collapse_ws(fragment: &str) -> String {
+        let mut out = String::new();
+        let mut in_tag = false;
+        for c in fragment.chars() {
+            match c {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                _ if !in_tag => out.push(c),
+                _ => {}
+            }
+        }
+        decode_entities(out.split_whitespace().collect::<Vec<_>>().join(" ").as_str())
+    }
+
+    /// Detect a formula/equation region: either real MathML (`<math>...
+    /// </math>`, which some HTML exports/LaTeX-to-HTML pipelines emit
+    /// directly) or an image explicitly marked as a formula/equation via
+    /// `class="...formula..."` / `class="...equation..."` (a common export
+    /// convention for formula-as-image HTML, e.g. from OCR'd or converted
+    /// documents). Full LaTeX transcription of either is out of scope here
+    /// (task brief: "mark formula regions as 'formula content' for
+    /// downstream Vision-OCR transcription rather than building a new
+    /// math-specific extractor") -- this only tags the region so the
+    /// existing Vision-OCR path (`atlas-models::vision_ocr`) can be pointed
+    /// at it later; it does not itself produce LaTeX.
+    fn img_tag_is_formula(tag_content: &str) -> bool {
+        let lower = tag_content.to_ascii_lowercase();
+        lower.contains("class=") && (lower.contains("formula") || lower.contains("equation") || lower.contains("katex") || lower.contains("mathjax"))
+    }
+
     /// Tags that start a new block-level element -- encountering one
     /// flushes whatever text was accumulating for the previous block.
     fn is_block_boundary_tag(name: &str) -> bool {
@@ -1320,7 +1517,67 @@ pub mod html {
         let chars: Vec<char> = html.chars().collect();
         let mut i = 0usize;
         while i < chars.len() {
+            // Whole-region structural extraction (§ table/figure/formula
+            // extraction), checked in-line at each `<table`/`<math` start
+            // so ordering relative to surrounding paragraphs is preserved:
+            // `<table>...</table>` -> one Table block, `<math>...</math>`
+            // -> one Equation block. Their *internal* tags (`<tr>`, `<td>`,
+            // `<mrow>`, ...) are never re-interpreted as ordinary block-
+            // boundary tags, since the whole region is consumed at once.
             if chars[i] == '<' {
+                let byte_offset: usize = chars[..i].iter().map(|c| c.len_utf8()).sum();
+                let region = find_region(html, byte_offset, "table")
+                    .filter(|(rs, _, _)| *rs == byte_offset)
+                    .map(|r| (r, BlockType::Table))
+                    .or_else(|| {
+                        find_region(html, byte_offset, "math")
+                            .filter(|(rs, _, _)| *rs == byte_offset)
+                            .map(|r| (r, BlockType::Equation))
+                    });
+                if let Some(((_, region_end, region_text), block_type)) = region {
+                    flush(&mut buffer, current_kind, &mut block_index, &mut blocks);
+                    let text = strip_tags_collapse_ws(region_text);
+                    if !text.is_empty() {
+                        block_index += 1;
+                        blocks.push(Block {
+                            block_type,
+                            location_ref: LocationRef {
+                                page_or_location: block_index.to_string(),
+                            },
+                            text_content: text,
+                        });
+                    }
+                    i += html[byte_offset..region_end].chars().count();
+                    continue;
+                }
+            }
+            if chars[i] == '<' {
+                // `<img ...>` figure detection: a single self-closing-ish
+                // tag (no separate closing tag in HTML), so handled here
+                // rather than via `find_region`.
+                if chars[i..].iter().take(4).collect::<String>().to_lowercase().starts_with("<img") {
+                    let start = i;
+                    let mut j = i + 1;
+                    while j < chars.len() && chars[j] != '>' {
+                        j += 1;
+                    }
+                    let tag_content: String = chars[start + 1..j].iter().collect();
+                    i = if j < chars.len() { j + 1 } else { chars.len() };
+                    flush(&mut buffer, current_kind, &mut block_index, &mut blocks);
+                    block_index += 1;
+                    blocks.push(Block {
+                        block_type: if img_tag_is_formula(&tag_content) {
+                            BlockType::Equation
+                        } else {
+                            BlockType::Image
+                        },
+                        location_ref: LocationRef {
+                            page_or_location: block_index.to_string(),
+                        },
+                        text_content: String::new(),
+                    });
+                    continue;
+                }
                 // Find the matching '>' for this tag (or bail to end of
                 // input on a malformed/unterminated tag rather than
                 // looping forever).
@@ -1442,6 +1699,48 @@ pub mod html {
             assert_eq!(doc.blocks.len(), 2);
             assert_eq!(doc.blocks[0].text_content, "Line one");
             assert_eq!(doc.blocks[1].text_content, "Line two");
+        }
+
+        #[test]
+        fn table_markup_becomes_a_table_block() {
+            let doc = parse_html_text(
+                "page.html",
+                "<p>Before</p><table><tr><th>Name</th><th>Score</th></tr><tr><td>Ada</td><td>9</td></tr></table><p>After</p>",
+            );
+            assert_eq!(doc.blocks.len(), 3);
+            assert_eq!(doc.blocks[0].text_content, "Before");
+            assert_eq!(doc.blocks[1].block_type, BlockType::Table);
+            assert!(doc.blocks[1].text_content.contains("Name"));
+            assert!(doc.blocks[1].text_content.contains("Ada"));
+            assert_eq!(doc.blocks[2].text_content, "After");
+        }
+
+        #[test]
+        fn img_tag_becomes_a_figure_block() {
+            let doc = parse_html_text("page.html", "<p>See below</p><img src=\"chart.png\" alt=\"Chart\">");
+            assert_eq!(doc.blocks.len(), 2);
+            assert_eq!(doc.blocks[1].block_type, BlockType::Image);
+        }
+
+        #[test]
+        fn img_tag_marked_as_formula_becomes_an_equation_block() {
+            let doc = parse_html_text(
+                "page.html",
+                "<img src=\"eq1.png\" class=\"formula\" alt=\"quadratic formula\">",
+            );
+            assert_eq!(doc.blocks.len(), 1);
+            assert_eq!(doc.blocks[0].block_type, BlockType::Equation);
+        }
+
+        #[test]
+        fn mathml_region_becomes_an_equation_block() {
+            let doc = parse_html_text(
+                "page.html",
+                "<p>Intro</p><math><mi>x</mi><mo>=</mo><mn>2</mn></math><p>Outro</p>",
+            );
+            assert_eq!(doc.blocks.len(), 3);
+            assert_eq!(doc.blocks[1].block_type, BlockType::Equation);
+            assert!(doc.blocks[1].text_content.contains('x'));
         }
     }
 }

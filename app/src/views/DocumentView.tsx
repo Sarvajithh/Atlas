@@ -25,6 +25,7 @@ import { useDocumentStore } from "@/state/documents";
 import { DocumentExplorer } from "@/components/document/DocumentExplorer";
 import { DocumentViewer } from "@/components/document/DocumentViewer";
 import { EmptyState } from "@/components/states/StateViews";
+import { ResizablePanel } from "@/components/layout/ResizablePanel";
 
 export function DocumentView() {
   const workspaces = useAppStore((s) => s.workspaces);
@@ -49,31 +50,40 @@ export function DocumentView() {
 
   return (
     <section aria-label="Document View" className="flex h-full flex-1 overflow-hidden">
-      <aside className="w-72 shrink-0 border-r">
-        <div className="border-b p-2">
-          <label htmlFor="document-view-workspace" className="text-xs text-muted-foreground">
-            Workspace
-          </label>
-          <select
-            id="document-view-workspace"
-            value={workspaceId ?? ""}
-            onChange={(e) => setWorkspaceId(Number(e.target.value))}
-            className="mt-1 w-full rounded-md border bg-background px-2 py-1 text-sm"
-          >
-            {workspaces.map((w) => (
-              <option key={w.id} value={w.id}>
-                {w.display_name}
-              </option>
-            ))}
-          </select>
-        </div>
-        {workspaceId !== null ? (
-          <DocumentExplorer
-            workspaceId={workspaceId}
-            onOpenDocument={(doc) => openDocument(workspaceId, doc)}
-          />
-        ) : null}
-      </aside>
+      <ResizablePanel
+        id="documentWorkspace.explorer"
+        defaultWidth={288}
+        minWidth={220}
+        maxWidth={560}
+        handleSide="end"
+        handleAriaLabel="Resize file explorer"
+      >
+        <aside className="flex h-full w-full flex-col border-r">
+          <div className="border-b p-2">
+            <label htmlFor="document-view-workspace" className="text-xs text-muted-foreground">
+              Workspace
+            </label>
+            <select
+              id="document-view-workspace"
+              value={workspaceId ?? ""}
+              onChange={(e) => setWorkspaceId(Number(e.target.value))}
+              className="mt-1 w-full rounded-md border bg-background px-2 py-1 text-sm"
+            >
+              {workspaces.map((w) => (
+                <option key={w.id} value={w.id}>
+                  {w.display_name}
+                </option>
+              ))}
+            </select>
+          </div>
+          {workspaceId !== null ? (
+            <DocumentExplorer
+              workspaceId={workspaceId}
+              onOpenDocument={(doc) => openDocument(workspaceId, doc)}
+            />
+          ) : null}
+        </aside>
+      </ResizablePanel>
 
       <div className="flex flex-1 flex-col overflow-hidden">
         {activeTab ? (

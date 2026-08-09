@@ -247,3 +247,37 @@ export interface SettingEntry {
   workspace_id: number | null;
   updated_at: string;
 }
+
+/**
+ * Mirrors backend `atlas_types::model::EngineRole` (V1.0 Part 3, Model
+ * Dashboard). Every value here must match the Rust enum's serde variant
+ * names exactly.
+ */
+export type EngineRole =
+  | "Vision"
+  | "Ocr"
+  | "Embedding"
+  | "Retriever"
+  | "Reranker"
+  | "Tutor"
+  | "Reasoning"
+  | "Planner"
+  | "Memory"
+  | "Analytics";
+
+/** Mirrors backend `atlas_types::model::ModelStatus`. */
+export type ModelStatus = "Available" | "Loading" | "Unavailable" | "Error";
+
+/** Mirrors backend `atlas_types::model::ModelRegistryEntry` (`model.list`). */
+export interface ModelRegistryEntry {
+  id: number;
+  model_identifier: string;
+  engine_role: EngineRole;
+  capabilities: string[];
+  context_length: number;
+  vram_requirement: number | null;
+  status: ModelStatus;
+  version: string;
+  supported_tasks: string[];
+  is_selected_for_role: boolean;
+}

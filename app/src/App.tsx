@@ -8,6 +8,8 @@ import { SplitView } from "@/components/SplitView";
 import { Toaster } from "@/components/Toaster";
 import { GlobalSearchOverlay } from "@/components/GlobalSearchOverlay";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
+import { LayoutProvider } from "@/components/layout/LayoutProvider";
+import { ResizablePanel } from "@/components/layout/ResizablePanel";
 import { StatusBar } from "@/panels/StatusBar";
 import { AssistantPanel } from "@/panels/AssistantPanel";
 import { WorkspaceHome } from "@/views/WorkspaceHome";
@@ -18,6 +20,7 @@ import { ResearchMode } from "@/views/ResearchMode";
 import { QuizExamMode } from "@/views/QuizExamMode";
 import { MemoryAnalyticsView } from "@/views/MemoryAnalyticsView";
 import { DocumentView } from "@/views/DocumentView";
+import { ModelDashboardView } from "@/views/ModelDashboardView";
 import { workspaceList } from "@/ipc/workspace";
 import { useAppStore } from "@/state/store";
 import { useThemeStore } from "@/state/theme";
@@ -83,7 +86,13 @@ export function App() {
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [isAssistantPanelOpen, isSplitViewOpen, setAssistantPanelOpen, setSplitViewOpen, setGlobalSearchOpen]);
+  }, [
+    isAssistantPanelOpen,
+    isSplitViewOpen,
+    setAssistantPanelOpen,
+    setSplitViewOpen,
+    setGlobalSearchOpen,
+  ]);
 
   let mainContent;
   if (currentView === "settings") {
@@ -100,29 +109,53 @@ export function App() {
     mainContent = <MemoryAnalyticsView />;
   } else if (currentView === "document-view") {
     mainContent = <DocumentView />;
+  } else if (currentView === "model-dashboard") {
+    mainContent = <ModelDashboardView />;
   } else {
     mainContent = <WorkspaceHome />;
   }
 
   return (
-    <div className="flex h-screen w-screen flex-col">
-      <TopNav />
-      <div className="flex flex-1 overflow-hidden">
-        <ActivityRail />
-        <Sidebar />
-        <div className="flex flex-1 flex-col overflow-hidden">
-          <Tabs />
-          <main className="flex-1 overflow-auto">
-            <ErrorBoundary>
-              <SplitView>{mainContent}</SplitView>
-            </ErrorBoundary>
-          </main>
+    <LayoutProvider>
+      <div className="flex h-screen w-screen flex-col">
+        <TopNav />
+        <div className="flex flex-1 overflow-hidden">
+          <ActivityRail />
+          <ResizablePanel
+            id="global.sidebar"
+            defaultWidth={256}
+            minWidth={200}
+            maxWidth={480}
+            handleSide="end"
+            handleAriaLabel="Resize workspace sidebar"
+          >
+            <Sidebar />
+          </ResizablePanel>
+          <div className="flex flex-1 flex-col overflow-hidden">
+            <Tabs />
+            <main className="flex-1 overflow-auto">
+              <ErrorBoundary>
+                <SplitView>{mainContent}</SplitView>
+              </ErrorBoundary>
+            </main>
+          </div>
+          {isAssistantPanelOpen ? (
+            <ResizablePanel
+              id="global.assistantPanel"
+              defaultWidth={384}
+              minWidth={280}
+              maxWidth={720}
+              handleSide="start"
+              handleAriaLabel="Resize assistant panel"
+            >
+              <AssistantPanel />
+            </ResizablePanel>
+          ) : null}
         </div>
-        {isAssistantPanelOpen ? <AssistantPanel /> : null}
+        <StatusBar />
+        <Toaster />
+        <GlobalSearchOverlay />
       </div>
-      <StatusBar />
-      <Toaster />
-      <GlobalSearchOverlay />
-    </div>
+    </LayoutProvider>
   );
 }

@@ -270,12 +270,12 @@ mod tests {
         let inserted = repo.upsert(sample(EngineRole::Reasoning, true)).unwrap();
 
         let mut updated = inserted.clone();
-        updated.model_identifier = "qwen2.5".to_string();
+        updated.model_identifier = "test-replacement-model".to_string();
         repo.upsert(updated).unwrap();
 
         let all = repo.list().unwrap();
         assert_eq!(all.len(), 1);
-        assert_eq!(all[0].model_identifier, "qwen2.5");
+        assert_eq!(all[0].model_identifier, "test-replacement-model");
     }
 
     #[test]

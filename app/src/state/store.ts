@@ -31,7 +31,8 @@ export type AppView =
   | "research-mode"
   | "quiz-exam"
   | "memory-analytics"
-  | "document-view";
+  | "document-view"
+  | "model-dashboard";
 
 export interface Toast {
   id: string;

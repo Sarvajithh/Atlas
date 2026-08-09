@@ -591,6 +591,34 @@ mod tests {
                         payload
                     );
                     let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                    // Half-close the write side (sends a proper TCP FIN)
+                    // instead of just dropping the socket. Dropping a
+                    // `TcpStream` immediately after `write_all` returns
+                    // only guarantees the bytes were handed to the OS
+                    // send buffer, not that the client has read them yet
+                    // -- on Windows in particular, tearing the socket down
+                    // before the client finishes reading can surface as a
+                    // hard RST ("An established connection was aborted by
+                    // the software in your host machine", os error 10053)
+                    // rather than a graceful close, which reqwest then
+                    // reports as a network error even though the response
+                    // was actually served correctly. Draining any
+                    // remaining bytes from the read side until the client
+                    // closes its end (EOF) -- which it will, since the
+                    // response declares `Connection: close` -- lets the
+                    // OS complete a normal four-way close before this
+                    // thread moves on to `listener.accept()` for the next
+                    // route.
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                    let mut drain = [0u8; 64];
+                    loop {
+                        match stream.read(&mut drain) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => continue,
+                        }
+                    }
                 }
             });
             Self { port }
@@ -678,7 +706,7 @@ mod tests {
         )]);
         let vectors = server
             .provider()
-            .embed_batch("qwen3-embedding", &["first", "second"])
+            .embed_batch("test-embed-model", &["first", "second"])
             .unwrap();
         assert_eq!(vectors, vec![vec![0.1, 0.2], vec![0.3, 0.4]]);
     }
@@ -690,7 +718,7 @@ mod tests {
             "/api/embed",
             serde_json::json!({ "embeddings": [[1.0, 2.0, 3.0]] }),
         )]);
-        let vector = server.provider().embed("qwen3-embedding", "hello").unwrap();
+        let vector = server.provider().embed("test-embed-model", "hello").unwrap();
         assert_eq!(vector, vec![1.0, 2.0, 3.0]);
     }
 
@@ -700,13 +728,13 @@ mod tests {
         // hang waiting for a connection that never comes, so an immediate
         // empty `Ok` proves the short-circuit.
         let provider = OllamaProvider::new(OllamaConnection::new("127.0.0.1", 1));
-        assert_eq!(provider.embed_batch("qwen3-embedding", &[]).unwrap(), Vec::<Vec<f32>>::new());
+        assert_eq!(provider.embed_batch("test-embed-model", &[]).unwrap(), Vec::<Vec<f32>>::new());
     }
 
     #[test]
     fn embed_batch_is_a_model_error_when_ollama_unreachable() {
         let provider = OllamaProvider::new(OllamaConnection::new("127.0.0.1", 1));
-        let err = provider.embed_batch("qwen3-embedding", &["x"]).unwrap_err();
+        let err = provider.embed_batch("test-embed-model", &["x"]).unwrap_err();
         assert_eq!(err.category, atlas_utils::ErrorCategory::ModelError);
     }
 
@@ -719,7 +747,7 @@ mod tests {
         )]);
         let err = server
             .provider()
-            .embed_batch("qwen3-embedding", &["first", "second"])
+            .embed_batch("test-embed-model", &["first", "second"])
             .unwrap_err();
         assert_eq!(err.category, atlas_utils::ErrorCategory::ModelError);
     }

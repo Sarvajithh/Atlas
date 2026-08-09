@@ -256,10 +256,13 @@ impl AppFacade {
         // Embedding (Part 1 "Replace HashEmbeddingEngine ... real
         // embedding engine using Ollama", §18, §37.1): resolved per-call
         // from whichever model the Model Registry currently has selected
-        // for `EngineRole::Embedding` (e.g. qwen3-embedding), never a
-        // hardcoded model name. `embedding.dimensions` is a Settings value
-        // (§23) like `ollama.host`/`ollama.port` above -- it only sizes
-        // storage up front (`VectorDbEmbeddingRepository`); the real
+        // for `EngineRole::Embedding` (whatever embedding-capable model
+        // Model Discovery found installed, e.g. nomic-embed-text --
+        // never a hardcoded model name and never assumed to still be
+        // installed once selected, see `ModelDiscoveryService::run`'s
+        // stale-selection handling). `embedding.dimensions` is a Settings
+        // value (§23) like `ollama.host`/`ollama.port` above -- it only
+        // sizes storage up front (`VectorDbEmbeddingRepository`); the real
         // per-call vector length always comes from Ollama's response.
         let embedding_dimensions = settings
             .get_global("embedding.dimensions")

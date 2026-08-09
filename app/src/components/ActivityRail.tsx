@@ -17,6 +17,7 @@ const RAIL_ITEMS = [
   { id: "dashboard", label: "Workspaces", view: "dashboard" as const, enabled: true, glyph: "▤" },
   { id: "graph", label: "Concept Graph", view: "concept-graph" as const, enabled: true, glyph: "◇" },
   { id: "memory", label: "Memory & Analytics", view: "memory-analytics" as const, enabled: true, glyph: "◎" },
+  { id: "models", label: "Model Dashboard", view: "model-dashboard" as const, enabled: true, glyph: "▣" },
   { id: "settings", label: "Settings", view: "settings" as const, enabled: true, glyph: "⚙" },
 ];
 

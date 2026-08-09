@@ -26,6 +26,11 @@ import { useDocumentStore } from "@/state/documents";
  * Prompt Builder -> Tutor/Reasoning Engine -> Citations pipeline (§15,
  * §39, §40) already lives in `atlas-core::AppFacade`; this component only
  * renders it and manages Session Manager state (§33.10/§33.11, Part 5).
+ *
+ * Width is no longer owned here: both `<aside>` roots below fill their
+ * parent (`h-full w-full`) rather than hardcoding `w-80`/`w-96`. The
+ * caller (`App.tsx`) wraps this component in a `ResizablePanel`
+ * (`components/layout`), which owns the persisted, user-draggable width.
  */
 
 interface DisplayMessage extends Omit<ChatMessage, "id"> {
@@ -283,7 +288,7 @@ export function AssistantPanel() {
 
   if (activeWorkspaceId === null) {
     return (
-      <aside aria-label="Assistant Panel" className="flex w-80 shrink-0 flex-col border-l">
+      <aside aria-label="Assistant Panel" className="flex h-full w-full flex-col border-l">
         <div className="flex flex-1 items-center justify-center p-6 text-center text-sm text-muted-foreground">
           Open a workspace to start a conversation with your tutor.
         </div>
@@ -292,7 +297,7 @@ export function AssistantPanel() {
   }
 
   return (
-    <aside aria-label="Assistant Panel" className="flex w-96 shrink-0 flex-col border-l bg-background">
+    <aside aria-label="Assistant Panel" className="flex h-full w-full flex-col border-l bg-background">
       <header className="flex shrink-0 items-center justify-between gap-2 border-b px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
           <span className="text-sm font-medium">Tutor</span>

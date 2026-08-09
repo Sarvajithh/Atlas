@@ -12,8 +12,8 @@
 //! cleanly, which then silently poisons chunking/embedding/retrieval
 //! downstream with garbage the Tutor Engine has no way to distinguish
 //! from real content. Locally-available vision-capable models (already
-//! discovered into `EngineRole::Vision` by `ModelDiscoveryService`, e.g.
-//! a `qwen3-vl`/`glm-ocr`-class model) read handwriting far better.
+//! discovered into `EngineRole::Vision` by `ModelDiscoveryService`) read
+//! handwriting far better.
 
 use std::sync::Arc;
 
@@ -175,7 +175,7 @@ mod tests {
         // actual network-failure path rather than being short-circuited
         // by `looks_like_an_image_file`.
         let ollama = Arc::new(OllamaProvider::new(OllamaConnection::new("127.0.0.1", 1)));
-        let registry = registry_with_vision_model("qwen3-vl:latest");
+        let registry = registry_with_vision_model("test-vision-model:latest");
         let fallback: Arc<dyn OcrEngine> = Arc::new(StubFallback { text: "fallback text" });
         let engine = OllamaVisionOcrEngine::new(ollama, registry, fallback);
 
@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn falls_back_without_calling_ollama_when_bytes_dont_look_like_an_image() {
         let ollama = Arc::new(OllamaProvider::new(OllamaConnection::new("127.0.0.1", 1)));
-        let registry = registry_with_vision_model("qwen3-vl:latest");
+        let registry = registry_with_vision_model("test-vision-model:latest");
         let fallback: Arc<dyn OcrEngine> = Arc::new(StubFallback { text: "fallback text" });
         let engine = OllamaVisionOcrEngine::new(ollama, registry, fallback);
 

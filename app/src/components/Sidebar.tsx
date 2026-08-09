@@ -26,7 +26,7 @@ export function Sidebar() {
   const openTab = useAppStore((s) => s.openTab);
 
   return (
-    <aside aria-label="Workspace file tree" className="flex w-64 shrink-0 flex-col border-r">
+    <aside aria-label="Workspace file tree" className="flex h-full w-full flex-col border-r">
       <div className="border-b px-3 py-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
         Workspaces
       </div>

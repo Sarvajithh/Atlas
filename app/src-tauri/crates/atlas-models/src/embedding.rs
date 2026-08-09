@@ -68,8 +68,9 @@ impl OllamaEmbeddingEngine {
             .map_err(|err| AppError::model(format!("model registry lookup for EngineRole::Embedding failed: {}", err.message)))?
             .ok_or_else(|| {
                 AppError::model(
-                    "no model currently assigned to EngineRole::Embedding -- assign an embedding-capable model \
-                     (e.g. qwen3-embedding) in Settings before indexing or searching",
+                    "no model currently assigned to EngineRole::Embedding -- pull an embedding-capable \
+                     model in Ollama (any model whose /api/show capabilities include \"embedding\") and \
+                     restart Atlas so Model Discovery can assign it, or assign one manually in Settings",
                 )
             })?;
         Ok(entry.model_identifier)
@@ -149,7 +150,7 @@ mod tests {
     #[test]
     fn embed_fails_with_a_model_error_rather_than_a_fake_vector_when_ollama_is_unreachable() {
         let ollama = Arc::new(OllamaProvider::new(OllamaConnection::new("127.0.0.1", 1)));
-        let registry = registry_with_embedding_model("qwen3-embedding:latest");
+        let registry = registry_with_embedding_model("test-embed-model:latest");
         let engine = OllamaEmbeddingEngine::new(ollama, registry, 1024);
 
         let err = engine.embed("hello").unwrap_err();

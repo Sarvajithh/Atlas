@@ -12,3 +12,4 @@ pub mod search;
 pub mod ocr;
 pub mod document;
 pub mod bookmark;
+pub mod model;

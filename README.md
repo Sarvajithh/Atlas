@@ -168,9 +168,12 @@ inferred from comments or prior documentation.
   misleading (a re-saved older document would sort as recent). **Fixed**:
   see "Research Mode: Timeline fixed" in Remaining v1.0 Work's changelog
   below — `DocumentRecord.authored_at` is now real, parser-derived data.
-- Not yet done: no visual node-link graph rendering for Citation Graph
-  (currently a grouped list — the query being real and correct was this
-  phase's focus, not graph layout); no combined "search across
+- ~~Not yet done: no visual node-link graph rendering for Citation
+  Graph~~ — **fixed this phase**: `CitationGraphView.tsx` now renders a
+  real SVG node-link diagram (same circular-layout approach as
+  `ConceptGraphView.tsx`), reusing the same real `graph.citationGraph`
+  data; the old grouped-list is retained as the node-detail panel's
+  content, not dropped. Still not done: no combined "search across
   literature review + citation graph" view; Paper Comparison and
   Literature Review currently differ only in system-prompt framing, not
   in a structurally different UI (e.g. side-by-side per-source columns).
@@ -275,10 +278,10 @@ items independently re-verified as already done above.)*
   still a reasonable follow-up; the circular layout is legible at the
   tens-of-nodes scale a single workspace realistically reaches, not a
   scalable general solution.
-- **Vector store vs. architecture contract** — the current implementation
-  is a custom in-house `EmbeddedVectorStore`, not Qdrant or LanceDB as
-  mandated by the frozen architecture contract §5. This needs either a
-  formal contract amendment or a migration.
+- ~~**Vector store vs. architecture contract**~~ — **reviewed and
+  formally amended this phase**, not migrated. See
+  `docs/vector_store_decision.md` and Amendment Log entry #5 in
+  `app/docs/README.md`.
 
 ### Lower priority / feature completion
 - Explicit HTML parsing (no dedicated module found)
@@ -289,9 +292,18 @@ items independently re-verified as already done above.)*
 - Formula rendering in the frontend — no math-rendering library found
 - Explicit "rebuild index" action — only incremental, event-driven indexing
   exists
-- Model Dashboard view — no standalone surface for reviewing Model
-  Registry assignments per engine role
-- Resizable panel support — not independently confirmed present
+- ~~**Model Dashboard view**~~ — **added this phase**: read-only
+  `ModelDashboardView.tsx` + `model.list` IPC command, grouped by Engine
+  role, showing status/context length/VRAM from the real
+  `model_registry` table (no role-reassignment UI — out of scope, see
+  its own doc comment).
+- ~~**Resizable panel support**~~ — **added this phase**: reusable
+  `components/layout` system (`ResizablePanel`, `ResizeHandle`,
+  `LayoutProvider`, `layoutStore`), wired into the global sidebar +
+  Assistant panel and the Document Workspace explorer, with persisted
+  widths via `settings.*`. Not yet applied to Quiz/Flashcard Mode or
+  Research Mode, which don't have a matching pane structure to resize
+  (see Changelog).
 - Conversation memory threaded into multi-turn prompts — chat history is
   stored, but the prompt template does not appear to include prior-turn
   context
@@ -316,9 +328,13 @@ items independently re-verified as already done above.)*
   degrades" pattern is still unaddressed for the previously-identified
   dropped-user-query-from-prompts issue (see Finding 1 in
   `docs/fix7_audit_report.md`), which remains out of this phase's scope.
-- **Architecture contract deviation**: custom vector store instead of the
-  mandated Qdrant/LanceDB (§5 of `app/docs/README.md`) — unresolved,
-  unamended as of this writing.
+- **Architecture contract deviation, now reviewed**: custom vector store
+  instead of the mandated Qdrant/LanceDB (§5 of `app/docs/README.md`).
+  Formally evaluated this phase (`docs/vector_store_decision.md`) and
+  **kept as-is for V1.0** — recorded as Amendment Log entry #5 in
+  `app/docs/README.md` rather than left as a silent, unamended deviation.
+  Not a migration; see that document for the full rationale and the
+  trigger conditions for revisiting it.
 - **Missing devDependency**: `tailwind.config.js` imports
   `@tailwindcss/typography`, but it was absent from `package.json`/
   `package-lock.json` (pre-existing gap, not introduced by any phase's
@@ -390,6 +406,101 @@ not been independently re-verified against a live Ollama instance in this
 environment.
 
 ## Changelog
+
+- **[V1.0 gap-closure phase: resizable panels, Citation Graph
+  visualization, Model Dashboard, vector store decision, docs]** —
+  Addressed the remaining audited V1.0 gaps.
+  - **Global Resizable Panel System** (new): `src/components/layout/`
+    (`ResizablePanel.tsx`, `ResizeHandle.tsx`, `LayoutProvider.tsx`,
+    `layoutStore.ts`) — drag-to-resize, min/max clamping, double-click
+    reset, keyboard resizing (arrow keys, ARIA `separator` role), widths
+    persisted through the real `settings.*` IPC (one JSON blob under
+    `ui.layout.panelWidths`, mirroring `state/theme.ts`'s persistence
+    pattern; no `localStorage`). Wired into the global sidebar + Assistant
+    panel (`App.tsx`, replacing hardcoded `w-64`/`w-80`/`w-96`) and the
+    Document Workspace file explorer (`DocumentView.tsx`, replacing
+    `w-72`). Not applied to Quiz/Flashcard Mode or Research Mode, which
+    don't currently have a matching multi-pane structure to resize (Quiz
+    is a single vertical flow; Research Mode is tabbed, not simultaneous
+    panes) — restructuring either's information architecture to add that
+    structure was judged out of scope for a resizing-system phase. New
+    tests: `components/layout/__tests__/ResizablePanel.test.tsx` (default
+    width, drag resize, clamping, double-click reset + persistence,
+    debounced persistence) — 5/5 passing.
+  - **Citation Graph visualization** (fix): `CitationGraphView.tsx` was a
+    grouped `<ul>` list over real data; now a real SVG node-link diagram,
+    reusing `ConceptGraphView.tsx`'s existing circular-layout approach.
+    Nodes are derived from the real edges (no separate node fetch, no
+    invented labels); clicking a node shows its cross-document relations
+    and the source-document provenance the old list surfaced, preserved
+    rather than dropped.
+  - **Model Dashboard** (new): no dashboard existed; the backing data did
+    (`AppFacade::model_registry()`, populated by `ModelDiscoveryService`
+    from live Ollama discovery) but had no IPC command exposing it. Added
+    `model_list` (`app-tauri/src/commands/model.rs`, registered in
+    `main.rs`, read-only — no role-reassignment command, since that needs
+    real conflict-resolution design out of this phase's scope), the
+    `ipc/model.ts` wrapper, `ModelRegistryEntry`/`EngineRole`/`ModelStatus`
+    types in `ipc/types.ts`, and `views/ModelDashboardView.tsx` (grouped by
+    Engine role, status/context-length/VRAM, honest "Unknown" for VRAM
+    since discovery never populates it). Reachable from a new Activity
+    Rail icon. New tests: `views/__tests__/ModelDashboardView.test.tsx`
+    (real data render, empty state, error state) — 3/3 passing. **Not
+    verified against a real Rust compiler**: no `cargo` available in this
+    environment (see below); the command mirrors `commands/settings.rs`
+    exactly, but run `cargo check` before trusting it compiles.
+  - **Vector store decision**: formally evaluated Option A (keep
+    `EmbeddedVectorStore`) vs. Option B (migrate to Qdrant/LanceDB) in
+    `docs/vector_store_decision.md`. Recommendation: **keep the current
+    store for V1.0** — not a silent decision, recorded as Amendment Log
+    entry #5 in `app/docs/README.md`. No migration performed.
+  - **Documentation**: added a "How to Use Atlas Features" section to this
+    README covering AI Assistant, Quiz, Flashcards, Research Mode, Concept
+    Graph, Memory Analytics, and Model Dashboard — where to open each,
+    what input it needs, what happens internally, and expected output.
+    Updated the relevant "Remaining v1.0 Work" and "Known Limitations"
+    bullets above to reflect what this phase closed.
+  - **Testing performed**: `npx tsc --noEmit` clean (one pre-existing,
+    unrelated `baseUrl` deprecation warning, confirmed present on a clean
+    checkout too); `npm run build` succeeds; full `vitest run`, 66/66
+    passing (63 pre-existing + this phase's 3 new test files' worth of
+    cases, none regressed). `npm run lint` is currently broken
+    independent of this phase's changes — `eslint@10` is installed but the
+    repo still has an old-style config, and v10 requires flat
+    `eslint.config.js`; not fixed here since it's a pre-existing tooling
+    gap outside this phase's stated scope, flagged for a follow-up.
+    `app/node_modules` had to be installed fresh
+    (`npm install --legacy-peer-deps`, needed because
+    `eslint-plugin-react-hooks@4.6.2`'s peer range conflicts with
+    `eslint@10`) before any of the above could run. **Backend: partially
+    verified.** `rustc`/`cargo` 1.75.0 became available via `apt-get
+    install cargo` mid-phase (this repo's own documented toolchain, per
+    "Known Environment Limitations"). `cargo check -p atlas-graph` (Part
+    2's backend, unmodified this phase) and the foundational crates
+    (`atlas-types`, `atlas-utils`, `atlas-config`, `atlas-events`) all
+    check clean. `cargo check -p atlas-models` (Part 3's `model_list`
+    command depends on this crate's `ModelRegistryRepository`) could
+    **not** be run — it hits the exact same documented edition2024/MSRV
+    blocker as `atlas-watcher` and `atlas-vector` (their `reqwest`/`time`/
+    `inotify` dependency trees require a newer toolchain than 1.75.0),
+    consistent with this repo's own disclosed limitation, not something
+    introduced or fixable here without a compatibility shim (explicitly
+    disallowed). Instead, `commands/model.rs`'s two real call sites were
+    verified by hand against source: `AppFacade::model_registry()`
+    returns `&Arc<dyn ModelRegistryRepository>`
+    (`atlas-core/src/facade.rs:914`), whose `list()` returns exactly
+    `Result<Vec<ModelRegistryEntry>, AppError>`
+    (`atlas-models/src/registry.rs`) — matching `model.rs`'s signature
+    exactly. The frontend `EngineRole`/`ModelRegistryEntry` TS mirrors were
+    checked field-by-field against `atlas-types/src/model.rs`. A
+    regenerated `Cargo.lock` (needed to unblock `cargo check` under
+    1.75.0's older lockfile-version support) was reverted before
+    finishing, since the real target environment's newer cargo produced
+    the checked-in v4 lockfile intentionally. Net: Part 2's backend is
+    compiler-verified; Part 3's backend is hand-verified against real
+    source but not compiler-verified — run `cargo check -p atlas-models
+    -p app-tauri` on a machine with a current Rust toolchain before
+    trusting it fully.
 
 - **[Research Mode Timeline: real authored dates]** — Closed the
   "Research Mode: Timeline" gap. Added `atlas_indexer::dates`
@@ -848,7 +959,104 @@ environment.
 
 ---
 
-## Layout
+## How to Use Atlas Features
+
+Grounded in the actual routing/IPC wiring in `app/src` — every "where" below
+is a real, clickable path in the current shell, not an aspirational one.
+
+### AI Assistant
+1. **Where to open it:** the right-docked panel, toggled with `Ctrl/Cmd+B`
+   or the panel toggle in `TopNav`. Requires a workspace to be open —
+   otherwise it shows an empty-state prompt to open one.
+2. **Input required:** a typed question, plus an optional intent
+   (`Tutor` / `Quick answer`, see `AssistantIntent`).
+3. **What happens internally:** `assistant_ask_stream` walks the real
+   Retrieval → Context Builder → Prompt Builder → Tutor/Reasoning Engine →
+   Citations pipeline in `atlas-core::AppFacade`, scoped to the active
+   workspace's indexed content.
+4. **Expected output:** a streamed chat reply with inline citations back to
+   the source chunks it drew from, saved into a real chat session
+   (`assistant.listSessions`/`assistant.getSessionMessages`).
+
+### Quiz
+1. **Where to open it:** `TopNav` → **Quiz / Exam** (workspace-scoped;
+   appears once a workspace is open), then the **Quiz** toggle within that
+   view.
+2. **Input required:** a workspace, and a topic (free text, e.g.
+   "photosynthesis").
+3. **What happens internally:** `assistant_quiz` generates a structured set
+   of multiple-choice questions from that workspace's indexed content.
+   Submitting answers calls `assistant_quiz_submit`, which grades against
+   the generated key and, when it can match the topic to a real Concept
+   Graph node, records the score into Student Memory.
+4. **Expected output:** each question shown with selectable options; after
+   submitting, per-question correctness, an explanation, and an overall
+   score — with a note when the score couldn't be matched to a concept and
+   so wasn't saved to progress.
+
+### Flashcards
+1. **Where to open it:** same **Quiz / Exam** view, **Flashcards** toggle.
+2. **Input required:** a workspace and a topic.
+3. **What happens internally:** `assistant_flashcards` generates real
+   front/back card pairs from the workspace's indexed content (same
+   generation pipeline family as Quiz, different output shape).
+4. **Expected output:** a grid of cards; clicking one flips it between its
+   question (front) and answer (back).
+
+### Research Mode
+1. **Where to open it:** `TopNav` → **Research Mode** (workspace-scoped).
+   Three tabs: Literature review & comparison, Citation graph, Timeline.
+2. **Input required:** one or more workspaces selected via checkboxes, and
+   (for the literature tab) a query plus a literature-review-or-comparison
+   mode toggle.
+3. **What happens internally:** the literature tab calls
+   `rag.researchQuery` (routed through `EngineRole::Reasoning`); the
+   citation-graph tab calls `graph.citationGraph`, which finds real
+   Concept Graph edges whose endpoints are sourced from more than one
+   document; the timeline tab sorts documents by a real parser-derived
+   `authored_at` date where one could be extracted.
+4. **Expected output:** literature tab — a synthesized answer with real
+   citations; citation-graph tab — an SVG node-link diagram of
+   cross-document concept relationships, click a node for its relations
+   and source documents; timeline tab — documents in chronological order,
+   with undated documents shown honestly in a separate group rather than
+   guessed at.
+
+### Concept Graph
+1. **Where to open it:** the Activity Rail's **Concept Graph** icon.
+2. **Input required:** a workspace with indexed documents. Concepts are
+   extracted automatically as documents finish indexing; a **Re-extract
+   concepts** button is available to force a re-run.
+3. **What happens internally:** `graph.getFull` returns every concept node
+   and edge for the workspace in one call (`AppFacade::graph_full`).
+4. **Expected output:** an SVG node-link diagram (nodes laid out on a
+   circle); clicking a node shows its label, description, and every real
+   relation it has to other concepts.
+
+### Memory Analytics
+1. **Where to open it:** the Activity Rail's **Memory & Analytics** icon.
+2. **Input required:** a workspace with at least one extracted concept.
+3. **What happens internally:** for each concept node, `memory.getWeaknesses`
+   returns real mastery/weakness scores derived from actual Quiz/Flashcard
+   attempt history, not synthetic data.
+4. **Expected output:** a per-concept mastery percentage and attempt count,
+   or an honest "Not yet reviewed" for concepts with no recorded attempts —
+   never a fabricated score.
+
+### Model Dashboard
+1. **Where to open it:** the Activity Rail's **Model Dashboard** icon
+   (added this phase).
+2. **Input required:** none — it's read-only and loads automatically. A
+   **Refresh** button re-fetches.
+3. **What happens internally:** `model.list` returns the real
+   `model_registry` table, populated by `ModelDiscoveryService` from
+   whatever Ollama actually reports installed on this machine.
+4. **Expected output:** models grouped by Engine role (Tutor, Vision, OCR,
+   Embedding, etc.), each row showing loaded/available status, context
+   window size, and VRAM requirement where known (shown as "Unknown"
+   rather than guessed, since discovery doesn't currently populate it).
+
+---
 
 ```
 /app            -- frontend (React/TS/Tailwind) + src-tauri (Rust workspace)

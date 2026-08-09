@@ -29,11 +29,12 @@ use crate::registry::ModelRegistryRepository;
 /// code change.
 ///
 /// Depends on `ModelRegistryRepository` rather than the narrower
-/// `ModelProvider` specifically so it can list *alternative* models for its
-/// role and retry against them when the currently-selected one fails
-/// (§45.1 "Model Errors"; requirement: "Handle model failures gracefully by
-/// selecting alternative capable models"). Selection is still entirely
-/// role-driven -- never a hardcoded model name.
+/// `ModelProvider` so callers (e.g. the Model Dashboard) can still list
+/// every candidate model registered for this role. Runtime inference,
+/// however, only ever uses the single model the user has selected for the
+/// role (`is_selected_for_role`) -- there is no automatic fallback to a
+/// different model on failure; a failure is surfaced to the user instead.
+/// Selection is still entirely role-driven -- never a hardcoded model name.
 pub struct OllamaEngine {
     role: EngineRole,
     model_registry: Arc<dyn ModelRegistryRepository>,
@@ -90,29 +91,12 @@ impl Engine for OllamaEngine {
             })?;
         atlas_utils::log_info!("[ModelRegistry] selected model {} for role {:?}", primary.model_identifier, self.role);
 
-        match self.try_generate(&primary.model_identifier, primary.context_length, &prompt) {
-            Ok(content) => Ok(EngineOutput { content }),
-            Err(primary_err) => {
-                // Fall back to any other Available model already registered
-                // for this role, in registry order, before surfacing the
-                // failure. This only ever considers models the Model
-                // Registry already assigns to this role/capability -- it
-                // never guesses at an unrelated model.
-                let alternatives = self.model_registry.list()?.into_iter().filter(|entry| {
-                    entry.engine_role == self.role
-                        && entry.id != primary.id
-                        && entry.status == atlas_types::model::ModelStatus::Available
-                });
-
-                for alternative in alternatives {
-                    if let Ok(content) = self.try_generate(&alternative.model_identifier, alternative.context_length, &prompt) {
-                        return Ok(EngineOutput { content });
-                    }
-                }
-
-                Err(primary_err)
-            }
-        }
+        // No automatic fallback to a different model (manual selection
+        // only, per the Model Dashboard requirement): if the user's
+        // selected model fails, surface that failure directly rather than
+        // silently substituting a different model they didn't choose.
+        self.try_generate(&primary.model_identifier, primary.context_length, &prompt)
+            .map(|content| EngineOutput { content })
     }
 }
 
@@ -143,9 +127,8 @@ impl EnginePool {
     /// non-inference roles in a pipeline (Retriever/Reranker) are handled
     /// upstream by the Scheduler via Context Builder (§39); this runs
     /// whichever role actually produces the answer (Tutor/Reasoning/
-    /// Planner), with graceful fallback (§45.1 "Model Errors";
-    /// requirement: "Handle model failures gracefully by selecting
-    /// alternative capable models").
+    /// Planner) using only the user's selected model for that role -- no
+    /// automatic fallback to a different model on failure.
     pub fn run_role(&self, role: EngineRole, prompt: ResolvedPrompt) -> Result<EngineOutput, AppError> {
         // TEMPORARY TRACE LOGGING (remove once the pipeline is confirmed working).
         atlas_utils::log_info!("[EnginePool] run_role entered role={role:?} registered_roles={:?}", self.engines.keys().collect::<Vec<_>>());
@@ -344,16 +327,18 @@ mod tests {
     }
 
     #[test]
-    fn ollama_engine_reports_a_model_error_when_every_candidate_for_the_role_fails() {
-        // Unreachable Ollama, but two Available candidates for the same
-        // role -- both must be tried, and failure is still surfaced
-        // cleanly (not a panic) once every alternative is exhausted.
+    fn ollama_engine_never_falls_back_to_an_unselected_alternative_model() {
+        // Unreachable Ollama, with an unselected alternative also
+        // registered for the same role. The engine must use ONLY the
+        // user-selected model and surface its failure -- it must never
+        // silently retry against the alternative, even though one exists.
         let provider = Arc::new(OllamaProvider::new(crate::ollama::OllamaConnection::new(
             "127.0.0.1",
             1,
         )));
         let mut primary = sample_model(EngineRole::Reasoning);
         primary.id = ModelRegistryId(1);
+        primary.model_identifier = "deepseek-r1".to_string();
         let mut alternative = sample_model(EngineRole::Reasoning);
         alternative.id = ModelRegistryId(2);
         alternative.is_selected_for_role = false;

@@ -57,6 +57,7 @@ fn main() {
             commands::bookmark::bookmark_create,
             commands::bookmark::bookmark_delete,
             commands::model::model_list,
+            commands::model::model_select,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Atlas")

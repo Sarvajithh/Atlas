@@ -15,6 +15,42 @@ pub trait ModelRegistryRepository: Send + Sync {
     fn list(&self) -> Result<Vec<ModelRegistryEntry>, AppError>;
     fn find_for_role(&self, role: EngineRole) -> Result<Option<ModelRegistryEntry>, AppError>;
     fn upsert(&self, entry: ModelRegistryEntry) -> Result<ModelRegistryEntry, AppError>;
+
+    /// Manual selection (Model Dashboard): mark `model_identifier` as the
+    /// selected model for `role`, unselecting any other row currently
+    /// selected for that same role first, so at most one entry per role is
+    /// ever selected at a time. This is the ONLY place a role's selection
+    /// changes -- there is no automatic/background selection anywhere else
+    /// (`ModelDiscoveryService::run` deliberately never sets
+    /// `is_selected_for_role = true`; see its doc comment). Errors if
+    /// `model_identifier` isn't actually a registered candidate for `role`
+    /// (i.e. it was never discovered as compatible with that role), which
+    /// doubles as the capability-validation step: only models the registry
+    /// already knows are compatible with a role can be selected for it.
+    fn select_for_role(&self, role: EngineRole, model_identifier: &str) -> Result<ModelRegistryEntry, AppError> {
+        let entries = self.list()?;
+        let target = entries
+            .iter()
+            .find(|e| e.engine_role == role && e.model_identifier == model_identifier)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::model(format!(
+                    "{model_identifier} is not a discovered/compatible candidate for role {role:?}"
+                ))
+            })?;
+
+        for mut other in entries
+            .into_iter()
+            .filter(|e| e.engine_role == role && e.model_identifier != model_identifier && e.is_selected_for_role)
+        {
+            other.is_selected_for_role = false;
+            self.upsert(other)?;
+        }
+
+        let mut selected = target;
+        selected.is_selected_for_role = true;
+        self.upsert(selected)
+    }
 }
 
 /// The interface Engines depend on (§37.1, §37.2). Assignment of models to
@@ -167,6 +203,34 @@ mod tests {
     fn current_model_for_missing_role_is_a_model_error() {
         let registry = InMemoryModelRegistry::new();
         let err = registry.current_model_for(EngineRole::Vision).unwrap_err();
+        assert_eq!(err.category, atlas_utils::ErrorCategory::ModelError);
+    }
+
+    #[test]
+    fn select_for_role_switches_selection_between_two_candidates() {
+        let registry = InMemoryModelRegistry::new();
+        let mut a = sample_entry(EngineRole::Tutor, true);
+        a.model_identifier = "model-a".to_string();
+        let mut b = sample_entry(EngineRole::Tutor, false);
+        b.model_identifier = "model-b".to_string();
+        registry.upsert(a).unwrap();
+        registry.upsert(b).unwrap();
+
+        registry.select_for_role(EngineRole::Tutor, "model-b").unwrap();
+
+        assert_eq!(
+            registry.find_for_role(EngineRole::Tutor).unwrap().unwrap().model_identifier,
+            "model-b"
+        );
+        let all = registry.list().unwrap();
+        assert!(!all.iter().find(|e| e.model_identifier == "model-a").unwrap().is_selected_for_role);
+    }
+
+    #[test]
+    fn select_for_role_rejects_a_model_not_registered_for_that_role() {
+        let registry = InMemoryModelRegistry::new();
+        registry.upsert(sample_entry(EngineRole::Tutor, false)).unwrap();
+        let err = registry.select_for_role(EngineRole::Tutor, "not-a-candidate").unwrap_err();
         assert_eq!(err.category, atlas_utils::ErrorCategory::ModelError);
     }
 

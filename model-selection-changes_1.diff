@@ -1,0 +1,916 @@
+diff --git a/app/src-tauri/crates/app-tauri/src/commands/model.rs b/app/src-tauri/crates/app-tauri/src/commands/model.rs
+index cdaad10..d49487e 100644
+--- a/app/src-tauri/crates/app-tauri/src/commands/model.rs
++++ b/app/src-tauri/crates/app-tauri/src/commands/model.rs
+@@ -1,19 +1,35 @@
+-//! `model.*` namespace (§43.1, V1.0 Part 3 -- Model Dashboard). Read-only:
+-//! exposes the real `model_registry` table (role assignments, status,
+-//! context size, VRAM) that `atlas-core::AppFacade::model_registry()` and
+-//! `ModelDiscoveryService` already populate from live Ollama discovery.
+-//! No write commands here -- Part 3 explicitly only requires the
+-//! dashboard to *display* this data, and assigning a model to a role from
+-//! the UI would need its own real design (conflict resolution when a role
+-//! already has a selection, etc.) that's out of scope for this pass.
++//! `model.*` namespace (§43.1, V1.0 Part 3 -- Model Dashboard).
++//! `model_list` exposes the real `model_registry` table (role assignments,
++//! status, context size, VRAM) that `atlas-core::AppFacade::model_registry()`
++//! and `ModelDiscoveryService` already populate from live Ollama discovery.
++//! `model_select` is the manual-selection write path: the user, and only
++//! the user, assigns a model to a role from the Model Dashboard.
++//! `ModelRegistryRepository::select_for_role` (atlas-models) both performs
++//! the assignment (unselecting any prior selection for that role first)
++//! and validates that the requested model is actually a discovered
++//! candidate for that role, returning a `ModelError` otherwise.
+ 
+ use tauri::State;
+ 
+ use atlas_core::AppFacade;
+-use atlas_types::model::ModelRegistryEntry;
++use atlas_types::model::{EngineRole, ModelRegistryEntry};
+ use atlas_utils::AppError;
+ 
+ #[tauri::command]
+ pub fn model_list(facade: State<'_, AppFacade>) -> Result<Vec<ModelRegistryEntry>, AppError> {
+     facade.model_registry().list()
+ }
++
++/// Manually select `model_identifier` for `role`. This is the only way a
++/// role's active model ever changes -- there is no automatic selection or
++/// fallback anywhere in the runtime (§ Model Dashboard requirement).
++/// Errors with a `ModelError` (surfaced to the UI as a clear message) if
++/// `model_identifier` was never discovered as compatible with `role`.
++#[tauri::command]
++pub fn model_select(
++    facade: State<'_, AppFacade>,
++    role: EngineRole,
++    model_identifier: String,
++) -> Result<ModelRegistryEntry, AppError> {
++    facade.model_registry().select_for_role(role, &model_identifier)
++}
+diff --git a/app/src-tauri/crates/app-tauri/src/main.rs b/app/src-tauri/crates/app-tauri/src/main.rs
+index 8620274..2f6b851 100644
+--- a/app/src-tauri/crates/app-tauri/src/main.rs
++++ b/app/src-tauri/crates/app-tauri/src/main.rs
+@@ -57,6 +57,7 @@ fn main() {
+             commands::bookmark::bookmark_create,
+             commands::bookmark::bookmark_delete,
+             commands::model::model_list,
++            commands::model::model_select,
+         ])
+         .build(tauri::generate_context!())
+         .expect("error while building Atlas")
+diff --git a/app/src-tauri/crates/atlas-indexer/src/pipeline.rs b/app/src-tauri/crates/atlas-indexer/src/pipeline.rs
+index de1ae1b..bf27fd5 100644
+--- a/app/src-tauri/crates/atlas-indexer/src/pipeline.rs
++++ b/app/src-tauri/crates/atlas-indexer/src/pipeline.rs
+@@ -17,6 +17,15 @@
+ //! document's `last_indexed_hash`, indexing is skipped entirely -- this is
+ //! what makes re-scans of an unchanged workspace cheap and what makes the
+ //! Folder Watcher's `FileUpdated` events safe to fire generously.
++//!
++//! Crash/failure safety on re-index: embedding a document's chunks is
++//! validated (via a single `embed_batch` call) BEFORE the document's
++//! previous chunk/vector set is deleted. If embedding fails -- no model
++//! currently assigned to `EngineRole::Embedding`, the assigned model
++//! having been removed, Ollama unreachable, etc. -- the previously
++//! indexed content is left completely untouched and the document is
++//! marked `Failed` (§45.1 Recoverable) for a later retry, rather than
++//! being deleted and left permanently un-indexed.
+ 
+ use std::sync::Arc;
+ 
+@@ -301,37 +310,66 @@ impl IndexingPipeline {
+ 
+         let chunks = chunk_document(document_id, &parsed, self.chunking_config);
+ 
+-        // Incremental re-indexing (§22): the old chunk set for this
+-        // document is fully superseded by the new parse -- clear then
+-        // rewrite, keeping the AI Cache consistent with the current file
+-        // content rather than accumulating stale chunks from a previous
+-        // version.
++        // Embed everything BEFORE touching the existing chunk/vector set
++        // (real production bug, traced live: `delete_for_document` used
++        // to run unconditionally first, so any embedding failure --
++        // overwhelmingly "no model currently assigned to
++        // EngineRole::Embedding" or the assigned model having been
++        // removed/unavailable -- deleted every previously-indexed
++        // chunk/vector for this document and then aborted, permanently
++        // un-indexing it until some *later* re-index happened to run
++        // with a working embedding model again, which for an unchanged
++        // file might be never. Embedding is now validated up front, in
++        // one batch call, against the *new* parse; if it fails, nothing
++        // about the document's existing, previously-successful index is
++        // touched at all -- the failure is recorded (§45.1 Recoverable)
++        // and the old content stays fully searchable until a retry
++        // succeeds.
++        let embeddable: Vec<(usize, String)> = chunks
++            .iter()
++            .enumerate()
++            .filter(|(_, c)| !c.text_content.trim().is_empty())
++            .map(|(i, c)| (i, c.text_content.clone()))
++            .collect();
++        let texts: Vec<String> = embeddable.iter().map(|(_, t)| t.clone()).collect();
++        let embedded_vectors = self.embedder.embed_batch(&texts)?;
++        if embedded_vectors.len() != embeddable.len() {
++            return Err(AppError::model(format!(
++                "embedding engine returned {} vectors for {} inputs -- refusing to index with a mismatched result rather than guess which text each vector belongs to",
++                embedded_vectors.len(),
++                embeddable.len()
++            )));
++        }
++        let mut vectors_by_chunk_index: std::collections::HashMap<usize, crate::embedding::Embedding> =
++            embeddable.iter().map(|(i, _)| *i).zip(embedded_vectors).collect();
++
++        // Only now, with embedding already known to have succeeded for
++        // this parse, is it safe to supersede the old chunk set (§22:
++        // incremental re-indexing) -- clear then rewrite.
+         self.chunks.delete_for_document(document_id)?;
+ 
+         let mut count = 0usize;
+-        for chunk in chunks {
++        for (chunk_index, chunk) in chunks.into_iter().enumerate() {
+             let inserted = self.chunks.insert(chunk)?;
+-            self.embed_and_store(workspace_id, inserted.document_id, inserted.id, &inserted.text_content)?;
++            match vectors_by_chunk_index.remove(&chunk_index) {
++                Some(vector) => self.store_vector(workspace_id, inserted.id, vector)?,
++                None => atlas_utils::log_info!(
++                    "[IndexingPipeline] embed_and_store skipped chunk_id={} (empty text)",
++                    inserted.id.0
++                ),
++            }
+             count += 1;
+         }
+ 
+         Ok((count, parsed.metadata.authored_at))
+     }
+ 
+-    fn embed_and_store(
+-        &self,
+-        workspace_id: WorkspaceId,
+-        _document_id: DocumentId,
+-        chunk_id: ChunkId,
+-        text: &str,
+-    ) -> Result<(), AppError> {
+-        // TEMPORARY TRACE LOGGING (remove once the pipeline is confirmed working).
+-        if text.trim().is_empty() {
+-            atlas_utils::log_info!("[IndexingPipeline] embed_and_store skipped chunk_id={} (empty text)", chunk_id.0);
+-            return Ok(());
+-        }
+-        let vector = self.embedder.embed(text)?;
+-        atlas_utils::log_info!("[IndexingPipeline] embedded chunk_id={} ({} chars -> {} dims)", chunk_id.0, text.len(), vector.len());
++    /// Persists a vector already produced by `embed_batch` (see
++    /// `run_pipeline`'s up-front embedding step) for `chunk_id`. Storage
++    /// only -- embedding itself already happened and already succeeded by
++    /// the time this is called.
++    fn store_vector(&self, workspace_id: WorkspaceId, chunk_id: ChunkId, vector: crate::embedding::Embedding) -> Result<(), AppError> {
++        atlas_utils::log_info!("[IndexingPipeline] embedded chunk_id={} ({} dims)", chunk_id.0, vector.len());
+         // BUG FIX (was hardcoded WorkspaceId(0), traced live: chat's
+         // Retriever queried the real workspace id and got
+         // "vector_search returned 0 raw hits" every time, because every
+@@ -546,6 +584,81 @@ mod tests {
+         let _ = std::fs::remove_file(&path);
+     }
+ 
++    #[test]
++    fn embedding_failure_on_reindex_does_not_delete_the_previous_successful_index() {
++        // Regression test for a real production bug: `run_pipeline` used
++        // to call `chunks.delete_for_document` unconditionally before
++        // embedding the new parse, so an embedding failure on re-index
++        // (most commonly "no model currently assigned to
++        // EngineRole::Embedding", or the assigned model becoming
++        // unavailable) deleted every previously-indexed chunk/vector for
++        // the document and then aborted -- permanently un-indexing it
++        // until some later re-index happened to run with a working
++        // embedding model again.
++        struct FailingEmbeddingEngine;
++        impl crate::embedding::EmbeddingEngine for FailingEmbeddingEngine {
++            fn dimensions(&self) -> usize {
++                1
++            }
++            fn embed(&self, _text: &str) -> Result<crate::embedding::Embedding, AppError> {
++                Err(AppError::model("no model currently assigned to EngineRole::Embedding"))
++            }
++        }
++
++        let documents = Arc::new(InMemoryDocumentRepository::new());
++        let chunks = Arc::new(InMemoryChunkRepository::new());
++        let vector_store = Arc::new(InMemoryVectorStore::new());
++        let embeddings = Arc::new(InMemoryEmbeddingRepository::new());
++
++        let working_pipeline = IndexingPipeline::new(
++            documents.clone(),
++            chunks.clone(),
++            Arc::new(default_parser_selector()),
++            Arc::new(LayeredSettingsProvider::new()),
++            Arc::new(InMemoryEventBus::new()),
++            Arc::new(NoopOcrEngine),
++            Arc::new(HashEmbeddingEngine::default()),
++            embeddings.clone(),
++            vector_store.clone(),
++        );
++
++        let path = temp_file("md-embed-fail", "# Title\n\nOriginal content here.");
++        working_pipeline
++            .index_document(WorkspaceId(1), "embed-fail.md", path.to_str().unwrap())
++            .unwrap();
++        let docs = working_pipeline.documents().list_for_workspace(WorkspaceId(1)).unwrap();
++        let chunk_count_before = working_pipeline.chunks().list_for_document(docs[0].id).unwrap().len();
++        assert!(chunk_count_before > 0);
++
++        // Now re-index changed content through a pipeline whose embedder
++        // always fails -- simulating the embedding model having been
++        // removed/unassigned since the first successful index.
++        let failing_pipeline = IndexingPipeline::new(
++            documents,
++            chunks,
++            Arc::new(default_parser_selector()),
++            Arc::new(LayeredSettingsProvider::new()),
++            Arc::new(InMemoryEventBus::new()),
++            Arc::new(NoopOcrEngine),
++            Arc::new(FailingEmbeddingEngine),
++            embeddings,
++            vector_store,
++        );
++        std::fs::write(&path, "# Title\n\nCompletely different content now.").unwrap();
++        let err = failing_pipeline
++            .index_document(WorkspaceId(1), "embed-fail.md", path.to_str().unwrap())
++            .unwrap_err();
++        assert_eq!(err.category, atlas_utils::ErrorCategory::ModelError);
++
++        // The previously-indexed chunks must still be there, untouched --
++        // not deleted just because the re-index attempt failed.
++        let chunks_after = failing_pipeline.chunks().list_for_document(docs[0].id).unwrap();
++        assert_eq!(chunks_after.len(), chunk_count_before);
++        assert!(chunks_after.iter().any(|c| c.text_content.contains("Original")));
++
++        let _ = std::fs::remove_file(&path);
++    }
++
+     #[test]
+     fn missing_file_is_a_recoverable_indexing_error() {
+         let pipeline = pipeline();
+diff --git a/app/src-tauri/crates/atlas-models/src/discovery.rs b/app/src-tauri/crates/atlas-models/src/discovery.rs
+index 74d4510..f930a9e 100644
+--- a/app/src-tauri/crates/atlas-models/src/discovery.rs
++++ b/app/src-tauri/crates/atlas-models/src/discovery.rs
+@@ -207,18 +207,15 @@ impl ModelDiscoveryService {
+ 
+         for (role, candidates) in &role_candidates {
+             let role = *role;
+-            // A selection only counts as "already selected" if it's for a
+-            // model that's still actually installed -- see doc comment
+-            // above. Stale rows were already corrected (unselected)
+-            // above, so `existing` here never has a stale row marked
+-            // selected.
+-            let already_selected_for_role = existing.iter().any(|e| e.engine_role == role && e.is_selected_for_role);
+-            let best_identifier = if already_selected_for_role {
+-                None // an existing, still-valid (user or prior-run) selection wins; don't recompute one.
+-            } else {
+-                select_best_for_role(role, candidates.iter().copied()).map(|m| m.model_identifier.clone())
+-            };
+-
++            // Discovery NEVER auto-assigns a model to a role (manual
++            // selection only, per the Model Dashboard requirement: the
++            // user picks the model for every role themselves). This loop
++            // therefore only ever *preserves* an existing selection --
++            // it never computes a "best" candidate and marks it selected.
++            // `select_best_for_role` is retained purely as a ranking
++            // helper the Model Dashboard/UI can use to sort/annotate
++            // compatible candidates for the user to choose from; it must
++            // never be used here to set `is_selected_for_role`.
+             for model in candidates {
+                 let existing_entry = existing
+                     .iter()
+@@ -226,10 +223,11 @@ impl ModelDiscoveryService {
+                     .cloned();
+ 
+                 let is_selected_for_role = match &existing_entry {
+-                    // Never move a selection an existing row already has,
+-                    // even between runs of this same loop.
++                    // Only ever preserve a selection an existing row
++                    // already has (i.e. one the user made). Never invent
++                    // a new selection here.
+                     Some(e) => e.is_selected_for_role,
+-                    None => best_identifier.as_deref() == Some(model.model_identifier.as_str()),
++                    None => false,
+                 };
+ 
+                 let entry = ModelRegistryEntry {
+@@ -407,7 +405,11 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn run_auto_selects_first_discovered_model_for_each_covered_role() {
++    fn run_discovers_models_without_auto_selecting_any_role() {
++        // Discovery populates the registry with every role a discovered
++        // model is compatible with, but selection is manual-only: no role
++        // should come out of run() marked `is_selected_for_role = true`
++        // unless a prior/user selection already existed for it.
+         let (ollama, _handle) = mock_ollama_tags(serde_json::json!({ "models": [{ "name": "llama3.1" }] }));
+         let registry: Arc<dyn ModelRegistryRepository> = Arc::new(InMemoryModelRegistry::new());
+         let events: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
+@@ -415,9 +417,16 @@ mod tests {
+ 
+         let written = service.run().unwrap();
+         assert!(!written.is_empty());
+-        assert!(registry.find_for_role(EngineRole::Tutor).unwrap().is_some());
+-        assert!(registry.find_for_role(EngineRole::Reasoning).unwrap().is_some());
+-        assert!(registry.find_for_role(EngineRole::Planner).unwrap().is_some());
++        assert!(registry.find_for_role(EngineRole::Tutor).unwrap().is_none());
++        assert!(registry.find_for_role(EngineRole::Reasoning).unwrap().is_none());
++        assert!(registry.find_for_role(EngineRole::Planner).unwrap().is_none());
++        // The candidate is still visible in the registry for the Model
++        // Dashboard to offer, just not auto-selected.
++        assert!(registry
++            .list()
++            .unwrap()
++            .iter()
++            .any(|e| e.engine_role == EngineRole::Tutor && e.model_identifier == "llama3.1"));
+     }
+ 
+     #[test]
+@@ -459,7 +468,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn run_unselects_a_stale_selection_and_picks_a_real_replacement() {
++    fn run_unselects_a_stale_selection_and_does_not_auto_replace_it() {
+         // Regression test for a real production failure: the registry had
+         // `qwen3-embedding:latest` selected for `EngineRole::Embedding`,
+         // but that model was never actually installed in this Ollama
+@@ -468,7 +477,10 @@ mod tests {
+         // ... not found, try pulling it first", and the old `run()` kept
+         // the dead selection forever because it treated any existing
+         // selection as untouchable, with no check that the model behind
+-        // it still actually existed.
++        // it still actually existed. The fix unselects the dead row, but
++        // (per manual-selection-only) must NOT auto-pick a replacement --
++        // the user has to choose the new embedding model themselves in
++        // the Model Dashboard.
+         let registry: Arc<dyn ModelRegistryRepository> = Arc::new(InMemoryModelRegistry::new());
+         registry
+             .upsert(ModelRegistryEntry {
+@@ -498,8 +510,15 @@ mod tests {
+         let service = ModelDiscoveryService::new(ollama, registry.clone(), events);
+         service.run().unwrap();
+ 
+-        let selected = registry.find_for_role(EngineRole::Embedding).unwrap().unwrap();
+-        assert_eq!(selected.model_identifier, "nomic-embed-text");
++        // No auto-replacement: the role must come back unselected so the
++        // Model Dashboard surfaces a clear "select a model" prompt rather
++        // than silently substituting one.
++        assert!(registry.find_for_role(EngineRole::Embedding).unwrap().is_none());
++        assert!(registry
++            .list()
++            .unwrap()
++            .iter()
++            .any(|e| e.engine_role == EngineRole::Embedding && e.model_identifier == "nomic-embed-text"));
+ 
+         // The stale row itself was corrected in place, not just ignored:
+         // querying the registry directly (not via find_for_role, which
+@@ -521,15 +540,15 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn run_selects_exactly_one_model_per_role_even_when_several_compete() {
+-        // Regression test for the bug this fix closes: with more than one
+-        // newly-discovered model sharing a role and no prior selection,
+-        // `run()` used to mark *every one* of them `is_selected_for_role`
+-        // in the same pass, and `find_for_role` would then return
+-        // whichever one storage happened to return first -- arbitrary,
+-        // not "best". Five real models compete here, matching a real
++    fn run_never_auto_selects_even_when_several_candidates_compete() {
++        // With more than one newly-discovered model sharing a role and no
++        // prior (user) selection, `run()` must leave the role unselected
++        // entirely -- manual selection only, no auto-pick of a "best"
++        // candidate. Five real models compete here, matching a real
+         // `ollama list` output shape (mixed sizes, one with no reported
+-        // parameter size at all, like a cloud-hosted model).
++        // parameter size at all, like a cloud-hosted model), all of which
++        // should simply be listed as candidates for the user to choose
++        // from in the Model Dashboard.
+         let mut show_by_name = std::collections::HashMap::new();
+         show_by_name.insert(
+             "granite4.1",
+@@ -574,19 +593,63 @@ mod tests {
+ 
+         let written = service.run().unwrap();
+ 
+-        // Exactly one written entry per role is selected, never zero and
+-        // never more than one.
++        // Zero auto-selected entries per role -- manual selection only.
+         for role in [EngineRole::Tutor, EngineRole::Reasoning, EngineRole::Planner] {
+             let selected_count = written.iter().filter(|e| e.engine_role == role && e.is_selected_for_role).count();
+-            assert_eq!(selected_count, 1, "role {role:?} should have exactly one selected model, got {selected_count}");
++            assert_eq!(selected_count, 0, "role {role:?} should have zero auto-selected models, got {selected_count}");
+         }
++        assert!(registry.find_for_role(EngineRole::Tutor).unwrap().is_none());
++
++        // But `select_best_for_role` (used by the Model Dashboard to rank
++        // candidates for the user, never to auto-select) still correctly
++        // ranks the largest reported model highest.
++        let candidates: Vec<&DiscoveredModel> = discovered_models_for_test();
++        let best = select_best_for_role(EngineRole::Tutor, candidates.iter().copied()).unwrap();
++        assert_eq!(best.model_identifier, "gemma4:12b");
++    }
+ 
+-        // The largest reported model (gemma4:12b, 12B) wins over every
+-        // 8B competitor and over the model with no reported size at all.
+-        assert_eq!(
+-            registry.find_for_role(EngineRole::Tutor).unwrap().unwrap().model_identifier,
+-            "gemma4:12b"
+-        );
++    fn discovered_models_for_test() -> Vec<&'static DiscoveredModel> {
++        // Static candidates mirroring the mocked models above, for
++        // exercising `select_best_for_role` directly as a ranking helper.
++        use std::sync::OnceLock;
++        static MODELS: OnceLock<Vec<DiscoveredModel>> = OnceLock::new();
++        MODELS
++            .get_or_init(|| {
++                vec![
++                    DiscoveredModel {
++                        model_identifier: "granite4.1".to_string(),
++                        capabilities: vec![ModelCapability::TextGeneration],
++                        context_length: 8192,
++                        parameter_size: Some("8B".to_string()),
++                    },
++                    DiscoveredModel {
++                        model_identifier: "llama3.1".to_string(),
++                        capabilities: vec![ModelCapability::TextGeneration],
++                        context_length: 8192,
++                        parameter_size: Some("8B".to_string()),
++                    },
++                    DiscoveredModel {
++                        model_identifier: "gemma4:12b".to_string(),
++                        capabilities: vec![ModelCapability::TextGeneration],
++                        context_length: 8192,
++                        parameter_size: Some("12B".to_string()),
++                    },
++                    DiscoveredModel {
++                        model_identifier: "deepseek-r1".to_string(),
++                        capabilities: vec![ModelCapability::TextGeneration],
++                        context_length: 8192,
++                        parameter_size: Some("8B".to_string()),
++                    },
++                    DiscoveredModel {
++                        model_identifier: "minimax-m3".to_string(),
++                        capabilities: vec![ModelCapability::TextGeneration],
++                        context_length: 8192,
++                        parameter_size: None,
++                    },
++                ]
++            })
++            .iter()
++            .collect()
+     }
+ 
+     #[test]
+diff --git a/app/src-tauri/crates/atlas-models/src/engines.rs b/app/src-tauri/crates/atlas-models/src/engines.rs
+index 69da817..292691b 100644
+--- a/app/src-tauri/crates/atlas-models/src/engines.rs
++++ b/app/src-tauri/crates/atlas-models/src/engines.rs
+@@ -29,11 +29,12 @@ use crate::registry::ModelRegistryRepository;
+ /// code change.
+ ///
+ /// Depends on `ModelRegistryRepository` rather than the narrower
+-/// `ModelProvider` specifically so it can list *alternative* models for its
+-/// role and retry against them when the currently-selected one fails
+-/// (§45.1 "Model Errors"; requirement: "Handle model failures gracefully by
+-/// selecting alternative capable models"). Selection is still entirely
+-/// role-driven -- never a hardcoded model name.
++/// `ModelProvider` so callers (e.g. the Model Dashboard) can still list
++/// every candidate model registered for this role. Runtime inference,
++/// however, only ever uses the single model the user has selected for the
++/// role (`is_selected_for_role`) -- there is no automatic fallback to a
++/// different model on failure; a failure is surfaced to the user instead.
++/// Selection is still entirely role-driven -- never a hardcoded model name.
+ pub struct OllamaEngine {
+     role: EngineRole,
+     model_registry: Arc<dyn ModelRegistryRepository>,
+@@ -90,29 +91,12 @@ impl Engine for OllamaEngine {
+             })?;
+         atlas_utils::log_info!("[ModelRegistry] selected model {} for role {:?}", primary.model_identifier, self.role);
+ 
+-        match self.try_generate(&primary.model_identifier, primary.context_length, &prompt) {
+-            Ok(content) => Ok(EngineOutput { content }),
+-            Err(primary_err) => {
+-                // Fall back to any other Available model already registered
+-                // for this role, in registry order, before surfacing the
+-                // failure. This only ever considers models the Model
+-                // Registry already assigns to this role/capability -- it
+-                // never guesses at an unrelated model.
+-                let alternatives = self.model_registry.list()?.into_iter().filter(|entry| {
+-                    entry.engine_role == self.role
+-                        && entry.id != primary.id
+-                        && entry.status == atlas_types::model::ModelStatus::Available
+-                });
+-
+-                for alternative in alternatives {
+-                    if let Ok(content) = self.try_generate(&alternative.model_identifier, alternative.context_length, &prompt) {
+-                        return Ok(EngineOutput { content });
+-                    }
+-                }
+-
+-                Err(primary_err)
+-            }
+-        }
++        // No automatic fallback to a different model (manual selection
++        // only, per the Model Dashboard requirement): if the user's
++        // selected model fails, surface that failure directly rather than
++        // silently substituting a different model they didn't choose.
++        self.try_generate(&primary.model_identifier, primary.context_length, &prompt)
++            .map(|content| EngineOutput { content })
+     }
+ }
+ 
+@@ -143,9 +127,8 @@ impl EnginePool {
+     /// non-inference roles in a pipeline (Retriever/Reranker) are handled
+     /// upstream by the Scheduler via Context Builder (§39); this runs
+     /// whichever role actually produces the answer (Tutor/Reasoning/
+-    /// Planner), with graceful fallback (§45.1 "Model Errors";
+-    /// requirement: "Handle model failures gracefully by selecting
+-    /// alternative capable models").
++    /// Planner) using only the user's selected model for that role -- no
++    /// automatic fallback to a different model on failure.
+     pub fn run_role(&self, role: EngineRole, prompt: ResolvedPrompt) -> Result<EngineOutput, AppError> {
+         // TEMPORARY TRACE LOGGING (remove once the pipeline is confirmed working).
+         atlas_utils::log_info!("[EnginePool] run_role entered role={role:?} registered_roles={:?}", self.engines.keys().collect::<Vec<_>>());
+@@ -344,16 +327,18 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn ollama_engine_reports_a_model_error_when_every_candidate_for_the_role_fails() {
+-        // Unreachable Ollama, but two Available candidates for the same
+-        // role -- both must be tried, and failure is still surfaced
+-        // cleanly (not a panic) once every alternative is exhausted.
++    fn ollama_engine_never_falls_back_to_an_unselected_alternative_model() {
++        // Unreachable Ollama, with an unselected alternative also
++        // registered for the same role. The engine must use ONLY the
++        // user-selected model and surface its failure -- it must never
++        // silently retry against the alternative, even though one exists.
+         let provider = Arc::new(OllamaProvider::new(crate::ollama::OllamaConnection::new(
+             "127.0.0.1",
+             1,
+         )));
+         let mut primary = sample_model(EngineRole::Reasoning);
+         primary.id = ModelRegistryId(1);
++        primary.model_identifier = "deepseek-r1".to_string();
+         let mut alternative = sample_model(EngineRole::Reasoning);
+         alternative.id = ModelRegistryId(2);
+         alternative.is_selected_for_role = false;
+diff --git a/app/src-tauri/crates/atlas-models/src/registry.rs b/app/src-tauri/crates/atlas-models/src/registry.rs
+index e3c0842..58ae976 100644
+--- a/app/src-tauri/crates/atlas-models/src/registry.rs
++++ b/app/src-tauri/crates/atlas-models/src/registry.rs
+@@ -15,6 +15,42 @@ pub trait ModelRegistryRepository: Send + Sync {
+     fn list(&self) -> Result<Vec<ModelRegistryEntry>, AppError>;
+     fn find_for_role(&self, role: EngineRole) -> Result<Option<ModelRegistryEntry>, AppError>;
+     fn upsert(&self, entry: ModelRegistryEntry) -> Result<ModelRegistryEntry, AppError>;
++
++    /// Manual selection (Model Dashboard): mark `model_identifier` as the
++    /// selected model for `role`, unselecting any other row currently
++    /// selected for that same role first, so at most one entry per role is
++    /// ever selected at a time. This is the ONLY place a role's selection
++    /// changes -- there is no automatic/background selection anywhere else
++    /// (`ModelDiscoveryService::run` deliberately never sets
++    /// `is_selected_for_role = true`; see its doc comment). Errors if
++    /// `model_identifier` isn't actually a registered candidate for `role`
++    /// (i.e. it was never discovered as compatible with that role), which
++    /// doubles as the capability-validation step: only models the registry
++    /// already knows are compatible with a role can be selected for it.
++    fn select_for_role(&self, role: EngineRole, model_identifier: &str) -> Result<ModelRegistryEntry, AppError> {
++        let entries = self.list()?;
++        let target = entries
++            .iter()
++            .find(|e| e.engine_role == role && e.model_identifier == model_identifier)
++            .cloned()
++            .ok_or_else(|| {
++                AppError::model(format!(
++                    "{model_identifier} is not a discovered/compatible candidate for role {role:?}"
++                ))
++            })?;
++
++        for mut other in entries
++            .into_iter()
++            .filter(|e| e.engine_role == role && e.model_identifier != model_identifier && e.is_selected_for_role)
++        {
++            other.is_selected_for_role = false;
++            self.upsert(other)?;
++        }
++
++        let mut selected = target;
++        selected.is_selected_for_role = true;
++        self.upsert(selected)
++    }
+ }
+ 
+ /// The interface Engines depend on (§37.1, §37.2). Assignment of models to
+@@ -170,6 +206,34 @@ mod tests {
+         assert_eq!(err.category, atlas_utils::ErrorCategory::ModelError);
+     }
+ 
++    #[test]
++    fn select_for_role_switches_selection_between_two_candidates() {
++        let registry = InMemoryModelRegistry::new();
++        let mut a = sample_entry(EngineRole::Tutor, true);
++        a.model_identifier = "model-a".to_string();
++        let mut b = sample_entry(EngineRole::Tutor, false);
++        b.model_identifier = "model-b".to_string();
++        registry.upsert(a).unwrap();
++        registry.upsert(b).unwrap();
++
++        registry.select_for_role(EngineRole::Tutor, "model-b").unwrap();
++
++        assert_eq!(
++            registry.find_for_role(EngineRole::Tutor).unwrap().unwrap().model_identifier,
++            "model-b"
++        );
++        let all = registry.list().unwrap();
++        assert!(!all.iter().find(|e| e.model_identifier == "model-a").unwrap().is_selected_for_role);
++    }
++
++    #[test]
++    fn select_for_role_rejects_a_model_not_registered_for_that_role() {
++        let registry = InMemoryModelRegistry::new();
++        registry.upsert(sample_entry(EngineRole::Tutor, false)).unwrap();
++        let err = registry.select_for_role(EngineRole::Tutor, "not-a-candidate").unwrap_err();
++        assert_eq!(err.category, atlas_utils::ErrorCategory::ModelError);
++    }
++
+     #[test]
+     fn upsert_with_same_id_replaces_existing_entry() {
+         let registry = InMemoryModelRegistry::new();
+diff --git a/app/src/ipc/model.ts b/app/src/ipc/model.ts
+index 43b6494..e19f266 100644
+--- a/app/src/ipc/model.ts
++++ b/app/src/ipc/model.ts
+@@ -1,7 +1,18 @@
+ import { ipcInvoke } from "@/ipc/client";
+-import type { ModelRegistryEntry } from "@/ipc/types";
++import type { EngineRole, ModelRegistryEntry } from "@/ipc/types";
+ 
+ /** `model.*` namespace (§43.1, V1.0 Part 3). Mirrors backend `model_list`. */
+ export function modelList(): Promise<ModelRegistryEntry[]> {
+   return ipcInvoke<ModelRegistryEntry[]>("model_list");
+ }
++
++/**
++ * Manually select `modelIdentifier` as the model used for `role`. Mirrors
++ * backend `model_select`, which is the only place a role's active model
++ * ever changes -- selection is entirely manual, never automatic. Rejects
++ * (with a `ModelError` message) any model that wasn't discovered as
++ * compatible with `role`.
++ */
++export function modelSelect(role: EngineRole, modelIdentifier: string): Promise<ModelRegistryEntry> {
++  return ipcInvoke<ModelRegistryEntry>("model_select", { role, modelIdentifier });
++}
+diff --git a/app/src/views/ModelDashboardView.tsx b/app/src/views/ModelDashboardView.tsx
+index 266349d..e557d66 100644
+--- a/app/src/views/ModelDashboardView.tsx
++++ b/app/src/views/ModelDashboardView.tsx
+@@ -1,16 +1,22 @@
+ /**
+- * Model Dashboard (V1.0 Part 3): read-only view of the real
+- * `model_registry` table -- which Ollama models are discovered, which
+- * role(s) each is assigned to (§14.1 Engine roles), its loaded/available
+- * status, context window size, and VRAM requirement where known.
++ * Model Dashboard (V1.0 Part 3): shows every Ollama model discovered on
++ * this machine, grouped by which Engine role(s) (§14.1) each is
++ * compatible with, and lets the user MANUALLY select which single model
++ * backs each role.
+  *
+- * Backed by the real `model.list` IPC command (`AppFacade::model_registry()`,
+- * populated by `ModelDiscoveryService` from live Ollama discovery -- see
+- * `atlas-models::discovery`). No write/assign UI here: reassigning a role
+- * to a different model needs real conflict-resolution design (a role can
+- * only have one active selection) that's out of scope for this pass, so
+- * this view is intentionally read-only, per spec ("Read-only is
+- * acceptable").
++ * Selection is entirely manual and explicit:
++ * - Discovery (`ModelDiscoveryService::run`, backend) never auto-selects a
++ *   model for a role -- it only ever lists candidates and preserves a
++ *   selection the user already made.
++ * - Runtime engines never fall back to a different model on failure.
++ * - The ONLY way a role's active model changes is the user picking a
++ *   radio button here, which calls the `model_select` IPC command.
++ * - A role with no selection shows a clear "No model selected" state
++ *   instead of silently working with something the user didn't choose.
++ *
++ * Backed by `model.list` / `model.select` IPC commands
++ * (`AppFacade::model_registry()`, populated by `ModelDiscoveryService`
++ * from live Ollama discovery -- see `atlas-models::discovery`).
+  *
+  * `vram_requirement` is `None` for every entry `ModelDiscoveryService`
+  * currently writes (it's never populated during discovery) -- shown
+@@ -18,8 +24,8 @@
+  */
+ import { useEffect, useState } from "react";
+ 
+-import { modelList } from "@/ipc/model";
+-import type { ModelRegistryEntry, ModelStatus } from "@/ipc/types";
++import { modelList, modelSelect } from "@/ipc/model";
++import type { EngineRole, ModelRegistryEntry, ModelStatus } from "@/ipc/types";
+ import { EmptyState, ErrorState, LoadingState } from "@/components/states/StateViews";
+ 
+ const STATUS_LABEL: Record<ModelStatus, string> = {
+@@ -36,6 +42,23 @@ const STATUS_DOT: Record<ModelStatus, string> = {
+   Error: "bg-destructive",
+ };
+ 
++// Roles the Model Dashboard shows a selector for, in a stable, sensible
++// order (matches §14.1's Engine table order). A role with zero discovered
++// candidates is simply omitted from the grouped list below -- there is
++// nothing to select from yet.
++const ROLE_ORDER: EngineRole[] = [
++  "Tutor",
++  "Reasoning",
++  "Planner",
++  "Embedding",
++  "Retriever",
++  "Reranker",
++  "Vision",
++  "Ocr",
++  "Memory",
++  "Analytics",
++];
++
+ function formatContextLength(tokens: number): string {
+   if (tokens <= 0) return "Unknown";
+   if (tokens >= 1000) return `${(tokens / 1000).toLocaleString(undefined, { maximumFractionDigits: 1 })}K tokens`;
+@@ -52,6 +75,10 @@ export function ModelDashboardView() {
+   const [entries, setEntries] = useState<ModelRegistryEntry[] | null>(null);
+   const [error, setError] = useState<string | null>(null);
+   const [isLoading, setIsLoading] = useState(false);
++  // Per-role selection-in-flight state, so one role's pending selection
++  // doesn't disable the radio buttons for every other role.
++  const [pendingRole, setPendingRole] = useState<EngineRole | null>(null);
++  const [selectError, setSelectError] = useState<string | null>(null);
+ 
+   const load = () => {
+     setIsLoading(true);
+@@ -64,6 +91,23 @@ export function ModelDashboardView() {
+ 
+   useEffect(load, []);
+ 
++  const handleSelect = async (role: EngineRole, modelIdentifier: string) => {
++    setSelectError(null);
++    setPendingRole(role);
++    try {
++      await modelSelect(role, modelIdentifier);
++      // Re-fetch so the whole registry (including any other row that got
++      // unselected server-side) reflects the real, persisted state,
++      // rather than optimistically guessing it client-side.
++      const fresh = await modelList();
++      setEntries(fresh);
++    } catch (err) {
++      setSelectError(err instanceof Error ? err.message : String(err));
++    } finally {
++      setPendingRole(null);
++    }
++  };
++
+   // Group by role so the dashboard reads as "one row per Engine role",
+   // matching how §14.1 roles are actually consumed (`ModelProvider::current_model_for`),
+   // even though the underlying table is one row per (model, role) pair.
+@@ -73,6 +117,7 @@ export function ModelDashboardView() {
+     list.push(entry);
+     byRole.set(entry.engine_role, list);
+   }
++  const orderedRoles = ROLE_ORDER.filter((role) => byRole.has(role));
+ 
+   return (
+     <section aria-label="Model Dashboard" className="flex h-full flex-col gap-4 overflow-auto p-4">
+@@ -80,7 +125,8 @@ export function ModelDashboardView() {
+         <div>
+           <h1 className="text-lg font-semibold">Model Dashboard</h1>
+           <p className="text-sm text-muted-foreground">
+-            Ollama models discovered on this machine and the role(s) each is assigned to.
++            Choose which discovered Ollama model backs each Engine role. Atlas never picks or switches a model
++            automatically -- your selection here is what every request for that role uses.
+           </p>
+         </div>
+         <button
+@@ -93,6 +139,12 @@ export function ModelDashboardView() {
+         </button>
+       </div>
+ 
++      {selectError ? (
++        <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
++          Couldn't change model: {selectError}
++        </div>
++      ) : null}
++
+       {error ? (
+         <ErrorState message={error} onRetry={load} />
+       ) : entries === null ? (
+@@ -104,40 +156,66 @@ export function ModelDashboardView() {
+         />
+       ) : (
+         <div className="flex flex-col gap-4">
+-          {Array.from(byRole.entries()).map(([role, roleEntries]) => (
+-            <div key={role} className="rounded-lg border p-3">
+-              <h2 className="mb-2 text-sm font-semibold">{role}</h2>
+-              <div className="flex flex-col divide-y">
+-                {roleEntries.map((entry) => (
+-                  <div
+-                    key={`${entry.engine_role}-${entry.model_identifier}`}
+-                    className="flex flex-wrap items-center justify-between gap-2 py-2"
+-                  >
+-                    <div className="flex items-center gap-2">
+-                      <span className={`h-2 w-2 shrink-0 rounded-full ${STATUS_DOT[entry.status]}`} />
+-                      <div>
+-                        <p className="text-sm font-medium">
+-                          {entry.model_identifier}
+-                          {entry.is_selected_for_role ? (
+-                            <span className="ml-2 rounded bg-accent px-1.5 py-0.5 text-[10px] font-normal uppercase tracking-wide text-muted-foreground">
+-                              Active
+-                            </span>
+-                          ) : null}
+-                        </p>
+-                        <p className="text-xs text-muted-foreground">
+-                          {STATUS_LABEL[entry.status]} · version {entry.version}
+-                        </p>
+-                      </div>
+-                    </div>
+-                    <div className="flex gap-4 text-xs text-muted-foreground">
+-                      <span>Context: {formatContextLength(entry.context_length)}</span>
+-                      <span>VRAM: {formatVram(entry.vram_requirement)}</span>
+-                    </div>
+-                  </div>
+-                ))}
++          {orderedRoles.map((role) => {
++            const roleEntries = byRole.get(role) ?? [];
++            const hasSelection = roleEntries.some((e) => e.is_selected_for_role);
++            const groupName = `model-role-${role}`;
++            return (
++              <div key={role} className="rounded-lg border p-3">
++                <div className="mb-2 flex items-center justify-between">
++                  <h2 className="text-sm font-semibold">{role}</h2>
++                  {!hasSelection ? (
++                    <span className="rounded bg-destructive/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-destructive">
++                      No model selected
++                    </span>
++                  ) : null}
++                </div>
++                <div role="radiogroup" aria-label={`Select model for ${role}`} className="flex flex-col divide-y">
++                  {roleEntries.map((entry) => {
++                    const inputId = `${groupName}-${entry.model_identifier}`;
++                    const disabled = pendingRole === role || entry.status === "Unavailable";
++                    return (
++                      <label
++                        htmlFor={inputId}
++                        key={`${entry.engine_role}-${entry.model_identifier}`}
++                        className={`flex flex-wrap items-center justify-between gap-2 py-2 ${disabled ? "opacity-60" : "cursor-pointer"}`}
++                      >
++                        <div className="flex items-center gap-3">
++                          <input
++                            id={inputId}
++                            type="radio"
++                            name={groupName}
++                            checked={entry.is_selected_for_role}
++                            disabled={disabled}
++                            onChange={() => handleSelect(role, entry.model_identifier)}
++                            className="h-4 w-4"
++                          />
++                          <span className={`h-2 w-2 shrink-0 rounded-full ${STATUS_DOT[entry.status]}`} />
++                          <div>
++                            <p className="text-sm font-medium">
++                              {entry.model_identifier}
++                              {entry.is_selected_for_role ? (
++                                <span className="ml-2 rounded bg-accent px-1.5 py-0.5 text-[10px] font-normal uppercase tracking-wide text-muted-foreground">
++                                  Active
++                                </span>
++                              ) : null}
++                            </p>
++                            <p className="text-xs text-muted-foreground">
++                              {STATUS_LABEL[entry.status]} · version {entry.version}
++                            </p>
++                          </div>
++                        </div>
++                        <div className="flex gap-4 text-xs text-muted-foreground">
++                          <span>Context: {formatContextLength(entry.context_length)}</span>
++                          <span>VRAM: {formatVram(entry.vram_requirement)}</span>
++                        </div>
++                      </label>
++                    );
++                  })}
++                </div>
+               </div>
+-            </div>
+-          ))}
++            );
++          })}
+         </div>
+       )}
+     </section>
+diff --git a/app/src/views/__tests__/ModelDashboardView.test.tsx b/app/src/views/__tests__/ModelDashboardView.test.tsx
+index aff322e..55eb1fe 100644
+--- a/app/src/views/__tests__/ModelDashboardView.test.tsx
++++ b/app/src/views/__tests__/ModelDashboardView.test.tsx
+@@ -1,5 +1,5 @@
+ import { describe, expect, it, vi, beforeEach } from "vitest";
+-import { render, screen, waitFor } from "@testing-library/react";
++import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+ 
+ vi.mock("@tauri-apps/api/core", () => ({
+   invoke: vi.fn(),

@@ -207,18 +207,15 @@ impl ModelDiscoveryService {
 
         for (role, candidates) in &role_candidates {
             let role = *role;
-            // A selection only counts as "already selected" if it's for a
-            // model that's still actually installed -- see doc comment
-            // above. Stale rows were already corrected (unselected)
-            // above, so `existing` here never has a stale row marked
-            // selected.
-            let already_selected_for_role = existing.iter().any(|e| e.engine_role == role && e.is_selected_for_role);
-            let best_identifier = if already_selected_for_role {
-                None // an existing, still-valid (user or prior-run) selection wins; don't recompute one.
-            } else {
-                select_best_for_role(role, candidates.iter().copied()).map(|m| m.model_identifier.clone())
-            };
-
+            // Discovery NEVER auto-assigns a model to a role (manual
+            // selection only, per the Model Dashboard requirement: the
+            // user picks the model for every role themselves). This loop
+            // therefore only ever *preserves* an existing selection --
+            // it never computes a "best" candidate and marks it selected.
+            // `select_best_for_role` is retained purely as a ranking
+            // helper the Model Dashboard/UI can use to sort/annotate
+            // compatible candidates for the user to choose from; it must
+            // never be used here to set `is_selected_for_role`.
             for model in candidates {
                 let existing_entry = existing
                     .iter()
@@ -226,10 +223,11 @@ impl ModelDiscoveryService {
                     .cloned();
 
                 let is_selected_for_role = match &existing_entry {
-                    // Never move a selection an existing row already has,
-                    // even between runs of this same loop.
+                    // Only ever preserve a selection an existing row
+                    // already has (i.e. one the user made). Never invent
+                    // a new selection here.
                     Some(e) => e.is_selected_for_role,
-                    None => best_identifier.as_deref() == Some(model.model_identifier.as_str()),
+                    None => false,
                 };
 
                 let entry = ModelRegistryEntry {
@@ -407,7 +405,11 @@ mod tests {
     }
 
     #[test]
-    fn run_auto_selects_first_discovered_model_for_each_covered_role() {
+    fn run_discovers_models_without_auto_selecting_any_role() {
+        // Discovery populates the registry with every role a discovered
+        // model is compatible with, but selection is manual-only: no role
+        // should come out of run() marked `is_selected_for_role = true`
+        // unless a prior/user selection already existed for it.
         let (ollama, _handle) = mock_ollama_tags(serde_json::json!({ "models": [{ "name": "llama3.1" }] }));
         let registry: Arc<dyn ModelRegistryRepository> = Arc::new(InMemoryModelRegistry::new());
         let events: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
@@ -415,9 +417,16 @@ mod tests {
 
         let written = service.run().unwrap();
         assert!(!written.is_empty());
-        assert!(registry.find_for_role(EngineRole::Tutor).unwrap().is_some());
-        assert!(registry.find_for_role(EngineRole::Reasoning).unwrap().is_some());
-        assert!(registry.find_for_role(EngineRole::Planner).unwrap().is_some());
+        assert!(registry.find_for_role(EngineRole::Tutor).unwrap().is_none());
+        assert!(registry.find_for_role(EngineRole::Reasoning).unwrap().is_none());
+        assert!(registry.find_for_role(EngineRole::Planner).unwrap().is_none());
+        // The candidate is still visible in the registry for the Model
+        // Dashboard to offer, just not auto-selected.
+        assert!(registry
+            .list()
+            .unwrap()
+            .iter()
+            .any(|e| e.engine_role == EngineRole::Tutor && e.model_identifier == "llama3.1"));
     }
 
     #[test]
@@ -459,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn run_unselects_a_stale_selection_and_picks_a_real_replacement() {
+    fn run_unselects_a_stale_selection_and_does_not_auto_replace_it() {
         // Regression test for a real production failure: the registry had
         // `qwen3-embedding:latest` selected for `EngineRole::Embedding`,
         // but that model was never actually installed in this Ollama
@@ -468,7 +477,10 @@ mod tests {
         // ... not found, try pulling it first", and the old `run()` kept
         // the dead selection forever because it treated any existing
         // selection as untouchable, with no check that the model behind
-        // it still actually existed.
+        // it still actually existed. The fix unselects the dead row, but
+        // (per manual-selection-only) must NOT auto-pick a replacement --
+        // the user has to choose the new embedding model themselves in
+        // the Model Dashboard.
         let registry: Arc<dyn ModelRegistryRepository> = Arc::new(InMemoryModelRegistry::new());
         registry
             .upsert(ModelRegistryEntry {
@@ -498,8 +510,15 @@ mod tests {
         let service = ModelDiscoveryService::new(ollama, registry.clone(), events);
         service.run().unwrap();
 
-        let selected = registry.find_for_role(EngineRole::Embedding).unwrap().unwrap();
-        assert_eq!(selected.model_identifier, "nomic-embed-text");
+        // No auto-replacement: the role must come back unselected so the
+        // Model Dashboard surfaces a clear "select a model" prompt rather
+        // than silently substituting one.
+        assert!(registry.find_for_role(EngineRole::Embedding).unwrap().is_none());
+        assert!(registry
+            .list()
+            .unwrap()
+            .iter()
+            .any(|e| e.engine_role == EngineRole::Embedding && e.model_identifier == "nomic-embed-text"));
 
         // The stale row itself was corrected in place, not just ignored:
         // querying the registry directly (not via find_for_role, which
@@ -521,15 +540,15 @@ mod tests {
     }
 
     #[test]
-    fn run_selects_exactly_one_model_per_role_even_when_several_compete() {
-        // Regression test for the bug this fix closes: with more than one
-        // newly-discovered model sharing a role and no prior selection,
-        // `run()` used to mark *every one* of them `is_selected_for_role`
-        // in the same pass, and `find_for_role` would then return
-        // whichever one storage happened to return first -- arbitrary,
-        // not "best". Five real models compete here, matching a real
+    fn run_never_auto_selects_even_when_several_candidates_compete() {
+        // With more than one newly-discovered model sharing a role and no
+        // prior (user) selection, `run()` must leave the role unselected
+        // entirely -- manual selection only, no auto-pick of a "best"
+        // candidate. Five real models compete here, matching a real
         // `ollama list` output shape (mixed sizes, one with no reported
-        // parameter size at all, like a cloud-hosted model).
+        // parameter size at all, like a cloud-hosted model), all of which
+        // should simply be listed as candidates for the user to choose
+        // from in the Model Dashboard.
         let mut show_by_name = std::collections::HashMap::new();
         show_by_name.insert(
             "granite4.1",
@@ -574,19 +593,63 @@ mod tests {
 
         let written = service.run().unwrap();
 
-        // Exactly one written entry per role is selected, never zero and
-        // never more than one.
+        // Zero auto-selected entries per role -- manual selection only.
         for role in [EngineRole::Tutor, EngineRole::Reasoning, EngineRole::Planner] {
             let selected_count = written.iter().filter(|e| e.engine_role == role && e.is_selected_for_role).count();
-            assert_eq!(selected_count, 1, "role {role:?} should have exactly one selected model, got {selected_count}");
+            assert_eq!(selected_count, 0, "role {role:?} should have zero auto-selected models, got {selected_count}");
         }
+        assert!(registry.find_for_role(EngineRole::Tutor).unwrap().is_none());
 
-        // The largest reported model (gemma4:12b, 12B) wins over every
-        // 8B competitor and over the model with no reported size at all.
-        assert_eq!(
-            registry.find_for_role(EngineRole::Tutor).unwrap().unwrap().model_identifier,
-            "gemma4:12b"
-        );
+        // But `select_best_for_role` (used by the Model Dashboard to rank
+        // candidates for the user, never to auto-select) still correctly
+        // ranks the largest reported model highest.
+        let candidates: Vec<&DiscoveredModel> = discovered_models_for_test();
+        let best = select_best_for_role(EngineRole::Tutor, candidates.iter().copied()).unwrap();
+        assert_eq!(best.model_identifier, "gemma4:12b");
+    }
+
+    fn discovered_models_for_test() -> Vec<&'static DiscoveredModel> {
+        // Static candidates mirroring the mocked models above, for
+        // exercising `select_best_for_role` directly as a ranking helper.
+        use std::sync::OnceLock;
+        static MODELS: OnceLock<Vec<DiscoveredModel>> = OnceLock::new();
+        MODELS
+            .get_or_init(|| {
+                vec![
+                    DiscoveredModel {
+                        model_identifier: "granite4.1".to_string(),
+                        capabilities: vec![ModelCapability::TextGeneration],
+                        context_length: 8192,
+                        parameter_size: Some("8B".to_string()),
+                    },
+                    DiscoveredModel {
+                        model_identifier: "llama3.1".to_string(),
+                        capabilities: vec![ModelCapability::TextGeneration],
+                        context_length: 8192,
+                        parameter_size: Some("8B".to_string()),
+                    },
+                    DiscoveredModel {
+                        model_identifier: "gemma4:12b".to_string(),
+                        capabilities: vec![ModelCapability::TextGeneration],
+                        context_length: 8192,
+                        parameter_size: Some("12B".to_string()),
+                    },
+                    DiscoveredModel {
+                        model_identifier: "deepseek-r1".to_string(),
+                        capabilities: vec![ModelCapability::TextGeneration],
+                        context_length: 8192,
+                        parameter_size: Some("8B".to_string()),
+                    },
+                    DiscoveredModel {
+                        model_identifier: "minimax-m3".to_string(),
+                        capabilities: vec![ModelCapability::TextGeneration],
+                        context_length: 8192,
+                        parameter_size: None,
+                    },
+                ]
+            })
+            .iter()
+            .collect()
     }
 
     #[test]

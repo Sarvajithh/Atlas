@@ -45,6 +45,8 @@ export function App() {
   const activeWorkspaceId = useAppStore((s) => s.activeWorkspaceId);
   const isAssistantPanelOpen = useAppStore((s) => s.isAssistantPanelOpen);
   const setAssistantPanelOpen = useAppStore((s) => s.setAssistantPanelOpen);
+  const isWorkspaceSidebarOpen = useAppStore((s) => s.isWorkspaceSidebarOpen);
+  const setWorkspaceSidebarOpen = useAppStore((s) => s.setWorkspaceSidebarOpen);
   const isSplitViewOpen = useAppStore((s) => s.isSplitViewOpen);
   const setSplitViewOpen = useAppStore((s) => s.setSplitViewOpen);
   const setGlobalSearchOpen = useAppStore((s) => s.setGlobalSearchOpen);
@@ -121,16 +123,39 @@ export function App() {
         <TopNav />
         <div className="flex flex-1 overflow-hidden">
           <ActivityRail />
-          <ResizablePanel
-            id="global.sidebar"
-            defaultWidth={256}
-            minWidth={200}
-            maxWidth={480}
-            handleSide="end"
-            handleAriaLabel="Resize workspace sidebar"
-          >
-            <Sidebar />
-          </ResizablePanel>
+          {isWorkspaceSidebarOpen ? (
+            <ResizablePanel
+              id="global.sidebar"
+              defaultWidth={256}
+              minWidth={200}
+              maxWidth={480}
+              handleSide="end"
+              handleAriaLabel="Resize workspace sidebar"
+            >
+              <div className="relative flex h-full w-full">
+                <Sidebar />
+                <button
+                  type="button"
+                  onClick={() => setWorkspaceSidebarOpen(false)}
+                  aria-label="Collapse workspace sidebar"
+                  title="Collapse sidebar"
+                  className="absolute right-1 top-1 rounded px-1 text-xs text-muted-foreground hover:bg-accent"
+                >
+                  ⟨⟨
+                </button>
+              </div>
+            </ResizablePanel>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setWorkspaceSidebarOpen(true)}
+              aria-label="Expand workspace sidebar"
+              title="Show workspaces"
+              className="flex w-6 shrink-0 items-center justify-center border-r text-xs text-muted-foreground hover:bg-accent"
+            >
+              ⟩⟩
+            </button>
+          )}
           <div className="flex flex-1 flex-col overflow-hidden">
             <Tabs />
             <main className="flex-1 overflow-auto">

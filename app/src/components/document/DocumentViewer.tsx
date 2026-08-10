@@ -11,6 +11,7 @@ import { PdfViewer } from "@/components/document/viewers/PdfViewer";
 import { MarkdownViewer, extractHeadings, type HeadingOutlineItem } from "@/components/document/viewers/MarkdownViewer";
 import { ImageViewer } from "@/components/document/viewers/ImageViewer";
 import { TextViewer, UnsupportedPreview } from "@/components/document/viewers/TextViewer";
+import { ResizablePanel } from "@/components/layout/ResizablePanel";
 
 const ZOOM_STEPS = [0.5, 0.75, 1, 1.25, 1.5, 2, 3];
 
@@ -25,9 +26,15 @@ export function DocumentViewer({ tab }: { tab: DocumentTab }) {
   const [error, setError] = useState<string | null>(null);
   const [zoom, setZoom] = useState(1);
   const [searchQuery, setSearchQuery] = useState("");
-  const [outlineOpen, setOutlineOpen] = useState(true);
+  // Defaults closed: the outline/page-thumbnail rail is useful on demand
+  // (jump to a heading/page) but shouldn't cost permanent width by
+  // default -- the document itself is the primary workspace here. The
+  // "Outline" button in the toolbar still opens it on demand.
+  const [outlineOpen, setOutlineOpen] = useState(false);
   const [progress, setProgress] = useState(0);
   const [pageCount, setPageCount] = useState<number | null>(null);
+  const [pageJumpDraft, setPageJumpDraft] = useState("");
+  const [pageJumpError, setPageJumpError] = useState(false);
   const [selectedHeadingId, setSelectedHeadingId] = useState<string | null>(null);
   const pdfGoToPage = useRef<((page: number) => void) | null>(null);
 
@@ -134,6 +141,38 @@ export function DocumentViewer({ tab }: { tab: DocumentTab }) {
           <button type="button" onClick={() => setOutlineOpen(!outlineOpen)} className="rounded px-1.5 py-0.5 hover:bg-accent">
             Outline
           </button>
+          {content?.file_type === "pdf" && pageCount ? (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                const target = Number(pageJumpDraft);
+                if (Number.isInteger(target) && target >= 1 && target <= pageCount) {
+                  pdfGoToPage.current?.(target);
+                  setPageJumpError(false);
+                } else {
+                  setPageJumpError(true);
+                }
+              }}
+              className="flex items-center gap-1"
+              aria-label="Jump to page"
+            >
+              <span aria-hidden>Page</span>
+              <input
+                value={pageJumpDraft}
+                onChange={(e) => {
+                  setPageJumpDraft(e.target.value.replace(/[^0-9]/g, ""));
+                  setPageJumpError(false);
+                }}
+                inputMode="numeric"
+                aria-label={`Go to page (1-${pageCount})`}
+                placeholder="#"
+                className={`w-12 rounded-md border bg-background px-1.5 py-0.5 text-center ${pageJumpError ? "border-destructive text-destructive" : ""}`}
+              />
+              <span aria-hidden className="text-muted-foreground">
+                / {pageCount}
+              </span>
+            </form>
+          ) : null}
           <input
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
@@ -173,14 +212,23 @@ export function DocumentViewer({ tab }: { tab: DocumentTab }) {
 
       <div className="flex flex-1 overflow-hidden">
         {outlineOpen ? (
-          <aside aria-label="Document Outline" className="w-52 shrink-0 overflow-auto border-r">
-            <DocumentOutline
-              headings={headings}
-              pageCount={content?.file_type === "pdf" ? pageCount : null}
-              onSelectHeading={setSelectedHeadingId}
-              onSelectPage={(page) => pdfGoToPage.current?.(page)}
-            />
-          </aside>
+          <ResizablePanel
+            id="documentViewer.outline"
+            defaultWidth={208}
+            minWidth={160}
+            maxWidth={420}
+            handleSide="end"
+            handleAriaLabel="Resize document outline"
+          >
+            <aside aria-label="Document Outline" className="h-full w-full overflow-auto border-r">
+              <DocumentOutline
+                headings={headings}
+                pageCount={content?.file_type === "pdf" ? pageCount : null}
+                onSelectHeading={setSelectedHeadingId}
+                onSelectPage={(page) => pdfGoToPage.current?.(page)}
+              />
+            </aside>
+          </ResizablePanel>
         ) : null}
 
         <div className="flex-1 overflow-hidden">

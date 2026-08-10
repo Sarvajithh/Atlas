@@ -8,45 +8,55 @@
   shadcn/ui components resolve correctly.
 */
 @layer base {
+  /*
+    Dark-blue palette, derived from the app icon's own navy
+    (hsl(221, 94%, 7%), sampled directly from the icon artwork) so the
+    in-app theme actually matches the icon rather than being an unrelated
+    neutral gray. Hue 221 (the icon's navy) is used across
+    background/card/secondary/muted/accent/border for a coherent blue
+    tint at every layer, with hue 217 (a slightly brighter blue, close to
+    the icon's glow highlight) reserved for --primary/--ring so
+    interactive accents read as distinct from the base surfaces.
+  */
   :root {
-    --background: 0 0% 100%;
-    --foreground: 240 10% 3.9%;
+    --background: 210 40% 98%;
+    --foreground: 222 47% 8%;
     --card: 0 0% 100%;
-    --card-foreground: 240 10% 3.9%;
-    --primary: 240 5.9% 10%;
-    --primary-foreground: 0 0% 98%;
-    --secondary: 240 4.8% 95.9%;
-    --secondary-foreground: 240 5.9% 10%;
-    --muted: 240 4.8% 95.9%;
-    --muted-foreground: 240 3.8% 46.1%;
-    --accent: 240 4.8% 95.9%;
-    --accent-foreground: 240 5.9% 10%;
-    --destructive: 0 84.2% 60.2%;
-    --destructive-foreground: 0 0% 98%;
-    --border: 240 5.9% 90%;
-    --input: 240 5.9% 90%;
-    --ring: 240 5.9% 10%;
+    --card-foreground: 222 47% 8%;
+    --primary: 217 91% 45%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 210 30% 94%;
+    --secondary-foreground: 222 47% 8%;
+    --muted: 210 30% 94%;
+    --muted-foreground: 215 16% 40%;
+    --accent: 210 30% 94%;
+    --accent-foreground: 222 47% 8%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 214 20% 88%;
+    --input: 214 20% 88%;
+    --ring: 217 91% 45%;
     --radius: 0.5rem;
   }
 
   .dark {
-    --background: 240 10% 3.9%;
-    --foreground: 0 0% 98%;
-    --card: 240 10% 3.9%;
-    --card-foreground: 0 0% 98%;
-    --primary: 0 0% 98%;
-    --primary-foreground: 240 5.9% 10%;
-    --secondary: 240 3.7% 15.9%;
-    --secondary-foreground: 0 0% 98%;
-    --muted: 240 3.7% 15.9%;
-    --muted-foreground: 240 5% 64.9%;
-    --accent: 240 3.7% 15.9%;
-    --accent-foreground: 0 0% 98%;
-    --destructive: 0 62.8% 30.6%;
-    --destructive-foreground: 0 0% 98%;
-    --border: 240 3.7% 15.9%;
-    --input: 240 3.7% 15.9%;
-    --ring: 240 4.9% 83.9%;
+    --background: 221 47% 6%;
+    --foreground: 210 40% 98%;
+    --card: 221 39% 9%;
+    --card-foreground: 210 40% 98%;
+    --primary: 217 91% 60%;
+    --primary-foreground: 222 47% 6%;
+    --secondary: 221 30% 14%;
+    --secondary-foreground: 210 40% 98%;
+    --muted: 221 30% 14%;
+    --muted-foreground: 217 20% 65%;
+    --accent: 221 35% 16%;
+    --accent-foreground: 210 40% 98%;
+    --destructive: 0 63% 40%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 221 30% 16%;
+    --input: 221 30% 16%;
+    --ring: 217 91% 60%;
   }
 }
 

@@ -61,6 +61,7 @@ export interface AppState {
   activeWorkspaceId: number | null;
   activeDocumentId: number | null;
   isAssistantPanelOpen: boolean;
+  isWorkspaceSidebarOpen: boolean;
   isSplitViewOpen: boolean;
   isGlobalSearchOpen: boolean;
   currentView: AppView;
@@ -74,6 +75,7 @@ export interface AppState {
   setActiveWorkspaceId: (id: number | null) => void;
   setActiveDocumentId: (id: number | null) => void;
   setAssistantPanelOpen: (open: boolean) => void;
+  setWorkspaceSidebarOpen: (open: boolean) => void;
   setSplitViewOpen: (open: boolean) => void;
   setGlobalSearchOpen: (open: boolean) => void;
   setCurrentView: (view: AppView) => void;
@@ -95,6 +97,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   activeWorkspaceId: null,
   activeDocumentId: null,
   isAssistantPanelOpen: true,
+  isWorkspaceSidebarOpen: true,
   isSplitViewOpen: false,
   isGlobalSearchOpen: false,
   currentView: "dashboard",
@@ -108,6 +111,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   setActiveWorkspaceId: (id) => set({ activeWorkspaceId: id }),
   setActiveDocumentId: (id) => set({ activeDocumentId: id }),
   setAssistantPanelOpen: (open) => set({ isAssistantPanelOpen: open }),
+  setWorkspaceSidebarOpen: (open) => set({ isWorkspaceSidebarOpen: open }),
   setSplitViewOpen: (open) => set({ isSplitViewOpen: open }),
   setGlobalSearchOpen: (open) => set({ isGlobalSearchOpen: open }),
   setCurrentView: (view) => set({ currentView: view }),

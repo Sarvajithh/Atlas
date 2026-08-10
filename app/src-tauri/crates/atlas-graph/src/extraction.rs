@@ -121,6 +121,66 @@ fn strip_code_fence(raw: &str) -> &str {
     trimmed
 }
 
+/// Extracts the JSON object embedded in `raw`, tolerating anything a
+/// local model puts around it despite being told to respond with ONLY
+/// the JSON object -- most commonly a reasoning preamble (e.g. a
+/// `<think>...</think>` block some reasoning-tuned models emit
+/// unconditionally) or a trailing sentence. Real production failure mode
+/// traced live (same root cause as `atlas_core::facade`'s quiz/flashcard
+/// parsing): `strip_code_fence` alone only handles a response that is
+/// *either* a bare JSON object *or* wrapped in a single fence with
+/// nothing else around it, so one stray sentence before the `{` made
+/// every extraction fail -- which is why the Concept Graph came back
+/// empty even for well-indexed workspaces.
+///
+/// Falls back to locating the first top-level `{...}` object by
+/// brace-depth counting (ignoring braces inside string literals) when
+/// the fenced/trimmed text isn't valid JSON on its own.
+fn extract_json_object(raw: &str) -> &str {
+    let fenced = strip_code_fence(raw);
+    if serde_json::from_str::<serde_json::Value>(fenced).is_ok() {
+        return fenced;
+    }
+
+    let bytes = fenced.as_bytes();
+    let mut depth: i32 = 0;
+    let mut start: Option<usize> = None;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s) = start {
+                        return &fenced[s..=i];
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fenced
+}
+
 /// Orchestrates extraction + storage. Construction happens during
 /// indexing (§20's own doc comment: "Graph construction/updates happen
 /// during indexing, not on every view render"), never on read.
@@ -161,7 +221,7 @@ impl ConceptExtractor {
 
         let prompt = build_extraction_prompt(source_label, text);
         let raw = self.model.extract(&prompt)?;
-        let cleaned = strip_code_fence(&raw);
+        let cleaned = extract_json_object(&raw);
 
         let parsed: ExtractedGraph = serde_json::from_str(cleaned).map_err(|e| {
             AppError::model(format!(
@@ -281,6 +341,24 @@ mod tests {
     fn strips_a_markdown_code_fence_if_present() {
         let extractor = extractor(
             "```json\n{\"concepts\":[{\"label\":\"X\",\"description\":null}],\"relations\":[]}\n```",
+        );
+        let outcome = extractor
+            .extract_and_store(WorkspaceId(1), DocumentId(1), "notes.md", "content about X")
+            .unwrap();
+        assert_eq!(outcome.nodes_created, 1);
+    }
+
+    #[test]
+    fn tolerates_a_reasoning_preamble_before_the_json() {
+        // Regression test for a real production failure: the Concept
+        // Graph came back empty for every workspace because local
+        // reasoning-tuned models routinely prepend commentary (or a
+        // `<think>...</think>` block) before the JSON despite the prompt
+        // saying ONLY the JSON object, and `strip_code_fence` alone
+        // failed on 100% of these -- even though a well-formed object was
+        // right there in the response.
+        let extractor = extractor(
+            "<think>identifying key concepts</think>\nSure, here you go:\n{\"concepts\":[{\"label\":\"X\",\"description\":null}],\"relations\":[]}\nLet me know if you need more!",
         );
         let outcome = extractor
             .extract_and_store(WorkspaceId(1), DocumentId(1), "notes.md", "content about X")

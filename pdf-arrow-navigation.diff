@@ -1,0 +1,105 @@
+diff --git a/app/src/components/document/viewers/PdfViewer.tsx b/app/src/components/document/viewers/PdfViewer.tsx
+index 116696b..ce47836 100644
+--- a/app/src/components/document/viewers/PdfViewer.tsx
++++ b/app/src/components/document/viewers/PdfViewer.tsx
+@@ -36,10 +36,13 @@ export function PdfViewer({
+   pageRef?: MutableRefObject<((page: number) => void) | null>;
+ }) {
+   const containerRef = useRef<HTMLDivElement>(null);
++  const scrollRef = useRef<HTMLDivElement>(null);
+   const [error, setError] = useState<string | null>(null);
+   const [loading, setLoading] = useState(true);
+   const docRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
+   const loadingTaskRef = useRef<pdfjsLib.PDFDocumentLoadingTask | null>(null);
++  const pageCountRef = useRef(0);
++  const goToPageRef = useRef<(page: number) => void>(() => {});
+ 
+   useEffect(() => {
+     let cancelled = false;
+@@ -52,6 +55,7 @@ export function PdfViewer({
+       .then(async (pdf) => {
+         if (cancelled) return;
+         docRef.current = pdf;
++        pageCountRef.current = pdf.numPages;
+         onPageCount?.(pdf.numPages);
+ 
+         // PDF outline entries reference internal "dest" targets, not page
+@@ -91,10 +95,7 @@ export function PdfViewer({
+     }
+ 
+     if (pageRef) {
+-      pageRef.current = (page: number) => {
+-        const canvas = containerRef.current?.querySelector(`canvas[data-page="${page}"]`);
+-        canvas?.scrollIntoView({ behavior: "smooth", block: "start" });
+-      };
++      pageRef.current = goToPage;
+     }
+ 
+     return () => {
+@@ -104,10 +105,65 @@ export function PdfViewer({
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+   }, [base64, zoom]);
+ 
++  function goToPage(page: number) {
++    const clamped = Math.min(Math.max(page, 1), pageCountRef.current || page);
++    const canvas = containerRef.current?.querySelector(`canvas[data-page="${clamped}"]`);
++    canvas?.scrollIntoView({ behavior: "smooth", block: "start" });
++  }
++  goToPageRef.current = goToPage;
++
++  // Determines which page is "current" for arrow-key navigation by
++  // finding the canvas closest to (but not past) the top of the visible
++  // scroll area -- consistent with how the outline's page list already
++  // scrolls to a page, just read in reverse.
++  function currentPageFromScroll(): number {
++    const scrollEl = scrollRef.current;
++    const container = containerRef.current;
++    if (!scrollEl || !container) return 1;
++    const canvases = Array.from(container.querySelectorAll<HTMLCanvasElement>("canvas[data-page]"));
++    const scrollTop = scrollEl.scrollTop;
++    let current = 1;
++    for (const canvas of canvases) {
++      if (canvas.offsetTop <= scrollTop + 8) {
++        current = Number(canvas.dataset.page) || current;
++      } else {
++        break;
++      }
++    }
++    return current;
++  }
++
++  useEffect(() => {
++    function isEditableTarget(target: EventTarget | null): boolean {
++      if (!(target instanceof HTMLElement)) return false;
++      const tag = target.tagName;
++      return tag === "INPUT" || tag === "TEXTAREA" || target.isContentEditable;
++    }
++
++    function handleKeyDown(event: KeyboardEvent) {
++      // Only steal Left/Right when this PDF is actually the thing on
++      // screen and the user isn't typing somewhere else (e.g. the
++      // Assistant chat box or a search field) -- arrow keys are common
++      // text-editing/cursor-movement keys and must not be hijacked there.
++      if (isEditableTarget(document.activeElement)) return;
++      if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
++      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
++      if (!scrollRef.current || pageCountRef.current === 0) return;
++
++      event.preventDefault();
++      const current = currentPageFromScroll();
++      const next = event.key === "ArrowRight" ? current + 1 : current - 1;
++      goToPageRef.current(next);
++    }
++
++    window.addEventListener("keydown", handleKeyDown);
++    return () => window.removeEventListener("keydown", handleKeyDown);
++  }, []);
++
+   if (error) return <ErrorState message={error} />;
+ 
+   return (
+-    <div className="relative h-full overflow-auto bg-muted/30 p-4">
++    <div ref={scrollRef} className="relative h-full overflow-auto bg-muted/30 p-4">
+       {loading ? <LoadingState label="Rendering PDF…" /> : null}
+       <div ref={containerRef} />
+       {searchQuery ? (

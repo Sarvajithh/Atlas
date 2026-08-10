@@ -1,5 +1,11 @@
 import { useEffect, useMemo, useRef } from "react";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
+import "katex/dist/katex.min.css";
+
+import { normalizeLatexDelimiters } from "@/lib/latex";
 
 export interface HeadingOutlineItem {
   id: string;
@@ -77,7 +83,13 @@ export function MarkdownViewer({
   }, [onProgress]);
 
   const highlighted = useMemo(() => {
-    if (!searchQuery.trim()) return content;
+    // Normalize `\( \)`/`\[ \]` LaTeX delimiters to `$`/`$$` before
+    // anything else touches the text (including search highlighting
+    // below), since remark-math only recognizes the dollar-sign
+    // convention -- see `normalizeLatexDelimiters` for why this is
+    // needed even though the model is separately instructed to use `$`.
+    const normalized = normalizeLatexDelimiters(content);
+    if (!searchQuery.trim()) return normalized;
     // Simple case-insensitive wrap in markdown emphasis for search-within-
     // document (§8.2.8). This is a basic implementation: it can produce
     // slightly malformed markdown if a match falls inside an existing
@@ -86,7 +98,7 @@ export function MarkdownViewer({
     // parsing (walking react-markdown's AST/rendered text nodes), which is
     // a larger change than this pass covers.
     const escaped = searchQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return content.replace(new RegExp(`(${escaped})`, "gi"), "**$1**");
+    return normalized.replace(new RegExp(`(${escaped})`, "gi"), "**$1**");
   }, [content, searchQuery]);
 
   return (
@@ -97,6 +109,8 @@ export function MarkdownViewer({
     >
       <article className="prose prose-sm mx-auto max-w-3xl dark:prose-invert">
         <ReactMarkdown
+          remarkPlugins={[remarkGfm, remarkMath]}
+          rehypePlugins={[rehypeKatex]}
           components={{
             h1: (props) => <h1 id={slugify(String(props.children))} {...props} />,
             h2: (props) => <h2 id={slugify(String(props.children))} {...props} />,

@@ -210,8 +210,11 @@ mod tests {
     fn select_for_role_switches_selection_between_two_candidates() {
         let registry = InMemoryModelRegistry::new();
         let mut a = sample_entry(EngineRole::Tutor, true);
+        a.id = ModelRegistryId(1);
         a.model_identifier = "model-a".to_string();
+            
         let mut b = sample_entry(EngineRole::Tutor, false);
+        b.id = ModelRegistryId(2);
         b.model_identifier = "model-b".to_string();
         registry.upsert(a).unwrap();
         registry.upsert(b).unwrap();

@@ -40,6 +40,21 @@ const SYSTEM_PROMPT_SETTING_KEY: &str = "assistant.system_prompt_template";
 /// general knowledge to fill gaps, never simply repeat retrieved passages,
 /// and cite inline with `[n]` markers matching `context.citations`'
 /// ordering (§44.1).
+/// Appended to every SYSTEM prompt (default and Research Mode variants
+/// alike). Real production bug this closes: nothing anywhere in this
+/// module told the model to use LaTeX delimiters for math, so models
+/// simply wrote plain text ("x^2", unicode symbols, etc.) with no `$`/`$$`
+/// around it -- the frontend's KaTeX renderer (`remark-math`/
+/// `rehype-katex`, wired in both the Assistant chat panel and the
+/// in-document Markdown viewer) had nothing to render, which looked
+/// indistinguishable from "LaTeX rendering is broken" even though the
+/// renderer itself worked correctly the whole time. Explicit inline
+/// (`$...$`) vs display (`$$...$$`) guidance, since models are otherwise
+/// inconsistent about which one to reach for.
+const MATH_FORMATTING_INSTRUCTION: &str = "Formatting: write ALL mathematical notation -- equations, formulas, variables, symbols -- using LaTeX delimiters, since the answer is rendered with a math renderer that requires them. \
+Use single dollar signs for inline math within a sentence, e.g. $x^2 + y^2 = z^2$, and double dollar signs on their own line for standalone/display equations, e.g. $$\\int_0^1 x^2\\,dx = \\frac{1}{3}$$. \
+Never write mathematical notation as plain unformatted text (e.g. \"x^2\" or \"integral of x\") when LaTeX would express it -- always wrap it in $ or $$.";
+
 const DEFAULT_SYSTEM_PROMPT: &str = "You are Atlas, an expert AI tutor.\n\
 Treat the retrieved workspace context below as authoritative course material and your primary source.\n\
 However, you are NOT limited to it: whenever the workspace context does not fully answer the question, \
@@ -140,7 +155,7 @@ impl PromptBuilder {
         };
 
         let content = format!(
-            "SYSTEM\n\n{system}\n\n\
+            "SYSTEM\n\n{system}\n\n{math_instruction}\n\n\
              ---\n\n\
              WORKSPACE CONTEXT\n\n{context_block}\n\n\
              ---\n\n\
@@ -148,6 +163,7 @@ impl PromptBuilder {
              ---\n\n\
              ANSWER\n\nBegin naturally.",
             system = self.system_prompt(),
+            math_instruction = MATH_FORMATTING_INSTRUCTION,
         );
 
         atlas_utils::log_info!("[PromptBuilder] exited, prompt size = {} chars", content.len());
@@ -195,13 +211,14 @@ impl PromptBuilder {
         };
 
         let content = format!(
-            "SYSTEM\n\n{system}\n\n\
+            "SYSTEM\n\n{system}\n\n{math_instruction}\n\n\
              ---\n\n\
              RETRIEVED SOURCES\n\n{context_block}\n\n\
              ---\n\n\
              RESEARCH QUESTION\n\n{query}\n\n\
              ---\n\n\
-             ANSWER\n\nBegin naturally."
+             ANSWER\n\nBegin naturally.",
+            math_instruction = MATH_FORMATTING_INSTRUCTION,
         );
 
         ResolvedPrompt::text(content)
@@ -259,6 +276,32 @@ mod tests {
         let prompt = builder.build("q", context(&["c"]));
         assert!(prompt.content.contains("SYSTEM"));
         assert!(prompt.content.to_lowercase().contains("tutor"));
+    }
+
+    #[test]
+    fn build_instructs_the_model_to_use_latex_delimiters_for_math() {
+        // Regression test for a real production bug: nothing in the
+        // prompt ever told the model to wrap math in $/$$ delimiters, so
+        // it wrote plain unformatted text instead -- indistinguishable
+        // from "the KaTeX renderer is broken" even though the renderer
+        // (already wired in both the Assistant panel and the Markdown
+        // document viewer) worked correctly the whole time.
+        let builder = PromptBuilder::new(Arc::new(LayeredSettingsProvider::new()));
+        let prompt = builder.build("q", context(&["c"]));
+        assert!(prompt.content.contains("LaTeX"));
+        assert!(prompt.content.contains("$x^2"));
+    }
+
+    #[test]
+    fn build_research_also_instructs_the_model_to_use_latex_delimiters() {
+        let builder = PromptBuilder::new(Arc::new(LayeredSettingsProvider::new()));
+        let prompt = builder.build_research(
+            "q",
+            context(&["c"]),
+            ResearchPromptMode::LiteratureReview,
+            &std::collections::HashMap::new(),
+        );
+        assert!(prompt.content.contains("LaTeX"));
     }
 
     #[test]

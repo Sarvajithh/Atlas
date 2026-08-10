@@ -1,0 +1,219 @@
+diff --git a/app/src-tauri/crates/atlas-models/src/prompt_builder.rs b/app/src-tauri/crates/atlas-models/src/prompt_builder.rs
+index 48db430..83f4d0d 100644
+--- a/app/src-tauri/crates/atlas-models/src/prompt_builder.rs
++++ b/app/src-tauri/crates/atlas-models/src/prompt_builder.rs
+@@ -40,6 +40,21 @@ const SYSTEM_PROMPT_SETTING_KEY: &str = "assistant.system_prompt_template";
+ /// general knowledge to fill gaps, never simply repeat retrieved passages,
+ /// and cite inline with `[n]` markers matching `context.citations`'
+ /// ordering (§44.1).
++/// Appended to every SYSTEM prompt (default and Research Mode variants
++/// alike). Real production bug this closes: nothing anywhere in this
++/// module told the model to use LaTeX delimiters for math, so models
++/// simply wrote plain text ("x^2", unicode symbols, etc.) with no `$`/`$$`
++/// around it -- the frontend's KaTeX renderer (`remark-math`/
++/// `rehype-katex`, wired in both the Assistant chat panel and the
++/// in-document Markdown viewer) had nothing to render, which looked
++/// indistinguishable from "LaTeX rendering is broken" even though the
++/// renderer itself worked correctly the whole time. Explicit inline
++/// (`$...$`) vs display (`$$...$$`) guidance, since models are otherwise
++/// inconsistent about which one to reach for.
++const MATH_FORMATTING_INSTRUCTION: &str = "Formatting: write ALL mathematical notation -- equations, formulas, variables, symbols -- using LaTeX delimiters, since the answer is rendered with a math renderer that requires them. \
++Use single dollar signs for inline math within a sentence, e.g. $x^2 + y^2 = z^2$, and double dollar signs on their own line for standalone/display equations, e.g. $$\\int_0^1 x^2\\,dx = \\frac{1}{3}$$. \
++Never write mathematical notation as plain unformatted text (e.g. \"x^2\" or \"integral of x\") when LaTeX would express it -- always wrap it in $ or $$.";
++
+ const DEFAULT_SYSTEM_PROMPT: &str = "You are Atlas, an expert AI tutor.\n\
+ Treat the retrieved workspace context below as authoritative course material and your primary source.\n\
+ However, you are NOT limited to it: whenever the workspace context does not fully answer the question, \
+@@ -140,7 +155,7 @@ impl PromptBuilder {
+         };
+ 
+         let content = format!(
+-            "SYSTEM\n\n{system}\n\n\
++            "SYSTEM\n\n{system}\n\n{math_instruction}\n\n\
+              ---\n\n\
+              WORKSPACE CONTEXT\n\n{context_block}\n\n\
+              ---\n\n\
+@@ -148,6 +163,7 @@ impl PromptBuilder {
+              ---\n\n\
+              ANSWER\n\nBegin naturally.",
+             system = self.system_prompt(),
++            math_instruction = MATH_FORMATTING_INSTRUCTION,
+         );
+ 
+         atlas_utils::log_info!("[PromptBuilder] exited, prompt size = {} chars", content.len());
+@@ -195,13 +211,14 @@ impl PromptBuilder {
+         };
+ 
+         let content = format!(
+-            "SYSTEM\n\n{system}\n\n\
++            "SYSTEM\n\n{system}\n\n{math_instruction}\n\n\
+              ---\n\n\
+              RETRIEVED SOURCES\n\n{context_block}\n\n\
+              ---\n\n\
+              RESEARCH QUESTION\n\n{query}\n\n\
+              ---\n\n\
+-             ANSWER\n\nBegin naturally."
++             ANSWER\n\nBegin naturally.",
++            math_instruction = MATH_FORMATTING_INSTRUCTION,
+         );
+ 
+         ResolvedPrompt::text(content)
+@@ -261,6 +278,32 @@ mod tests {
+         assert!(prompt.content.to_lowercase().contains("tutor"));
+     }
+ 
++    #[test]
++    fn build_instructs_the_model_to_use_latex_delimiters_for_math() {
++        // Regression test for a real production bug: nothing in the
++        // prompt ever told the model to wrap math in $/$$ delimiters, so
++        // it wrote plain unformatted text instead -- indistinguishable
++        // from "the KaTeX renderer is broken" even though the renderer
++        // (already wired in both the Assistant panel and the Markdown
++        // document viewer) worked correctly the whole time.
++        let builder = PromptBuilder::new(Arc::new(LayeredSettingsProvider::new()));
++        let prompt = builder.build("q", context(&["c"]));
++        assert!(prompt.content.contains("LaTeX"));
++        assert!(prompt.content.contains("$x^2"));
++    }
++
++    #[test]
++    fn build_research_also_instructs_the_model_to_use_latex_delimiters() {
++        let builder = PromptBuilder::new(Arc::new(LayeredSettingsProvider::new()));
++        let prompt = builder.build_research(
++            "q",
++            context(&["c"]),
++            ResearchPromptMode::LiteratureReview,
++            &std::collections::HashMap::new(),
++        );
++        assert!(prompt.content.contains("LaTeX"));
++    }
++
+     #[test]
+     fn build_of_empty_context_still_includes_query_and_says_so() {
+         let builder = PromptBuilder::new(Arc::new(LayeredSettingsProvider::new()));
+diff --git a/app/src/App.tsx b/app/src/App.tsx
+index 96dd270..7422319 100644
+--- a/app/src/App.tsx
++++ b/app/src/App.tsx
+@@ -45,6 +45,8 @@ export function App() {
+   const activeWorkspaceId = useAppStore((s) => s.activeWorkspaceId);
+   const isAssistantPanelOpen = useAppStore((s) => s.isAssistantPanelOpen);
+   const setAssistantPanelOpen = useAppStore((s) => s.setAssistantPanelOpen);
++  const isWorkspaceSidebarOpen = useAppStore((s) => s.isWorkspaceSidebarOpen);
++  const setWorkspaceSidebarOpen = useAppStore((s) => s.setWorkspaceSidebarOpen);
+   const isSplitViewOpen = useAppStore((s) => s.isSplitViewOpen);
+   const setSplitViewOpen = useAppStore((s) => s.setSplitViewOpen);
+   const setGlobalSearchOpen = useAppStore((s) => s.setGlobalSearchOpen);
+@@ -121,16 +123,39 @@ export function App() {
+         <TopNav />
+         <div className="flex flex-1 overflow-hidden">
+           <ActivityRail />
+-          <ResizablePanel
+-            id="global.sidebar"
+-            defaultWidth={256}
+-            minWidth={200}
+-            maxWidth={480}
+-            handleSide="end"
+-            handleAriaLabel="Resize workspace sidebar"
+-          >
+-            <Sidebar />
+-          </ResizablePanel>
++          {isWorkspaceSidebarOpen ? (
++            <ResizablePanel
++              id="global.sidebar"
++              defaultWidth={256}
++              minWidth={200}
++              maxWidth={480}
++              handleSide="end"
++              handleAriaLabel="Resize workspace sidebar"
++            >
++              <div className="relative flex h-full w-full">
++                <Sidebar />
++                <button
++                  type="button"
++                  onClick={() => setWorkspaceSidebarOpen(false)}
++                  aria-label="Collapse workspace sidebar"
++                  title="Collapse sidebar"
++                  className="absolute right-1 top-1 rounded px-1 text-xs text-muted-foreground hover:bg-accent"
++                >
++                  ⟨⟨
++                </button>
++              </div>
++            </ResizablePanel>
++          ) : (
++            <button
++              type="button"
++              onClick={() => setWorkspaceSidebarOpen(true)}
++              aria-label="Expand workspace sidebar"
++              title="Show workspaces"
++              className="flex w-6 shrink-0 items-center justify-center border-r text-xs text-muted-foreground hover:bg-accent"
++            >
++              ⟩⟩
++            </button>
++          )}
+           <div className="flex flex-1 flex-col overflow-hidden">
+             <Tabs />
+             <main className="flex-1 overflow-auto">
+@@ -144,7 +169,7 @@ export function App() {
+               id="global.assistantPanel"
+               defaultWidth={384}
+               minWidth={280}
+-              maxWidth={720}
++              maxWidth={960}
+               handleSide="start"
+               handleAriaLabel="Resize assistant panel"
+             >
+diff --git a/app/src/panels/AssistantPanel.tsx b/app/src/panels/AssistantPanel.tsx
+index 97465f7..d3f1048 100644
+--- a/app/src/panels/AssistantPanel.tsx
++++ b/app/src/panels/AssistantPanel.tsx
+@@ -16,6 +16,7 @@ import { documentGet } from "@/ipc/document";
+ import type { ChatMessage, ChatSession, Citation } from "@/ipc/types";
+ import { useAppStore } from "@/state/store";
+ import { useDocumentStore } from "@/state/documents";
++import { useLayoutStore } from "@/components/layout/layoutStore";
+ 
+ /**
+  * Assistant Panel (§8.1, Part 1 of the AI Assistant vertical slice):
+@@ -76,6 +77,25 @@ export function AssistantPanel() {
+   const [loadError, setLoadError] = useState<string | null>(null);
+   const [selectedText, setSelectedText] = useState<string | null>(null);
+   const [showSessions, setShowSessions] = useState(false);
++  // Expand/collapse the chat panel width, on top of ordinary drag-resize.
++  // "Expand" jumps straight to a large, comfortable reading width (rather
++  // than requiring a manual drag every time); "Collapse" restores exactly
++  // whatever width the user had before expanding (their drag position or
++  // the panel's own default), not a second hardcoded value.
++  const assistantPanelWidth = useLayoutStore((s) => s.widths["global.assistantPanel"]);
++  const setAssistantPanelWidth = useLayoutStore((s) => s.setWidth);
++  const widthBeforeExpand = useRef<number | null>(null);
++  const ASSISTANT_PANEL_EXPANDED_WIDTH = 880;
++  const isAssistantPanelExpanded = (assistantPanelWidth ?? 0) >= ASSISTANT_PANEL_EXPANDED_WIDTH;
++  function toggleAssistantPanelExpanded() {
++    if (isAssistantPanelExpanded) {
++      setAssistantPanelWidth("global.assistantPanel", widthBeforeExpand.current ?? 384);
++      widthBeforeExpand.current = null;
++    } else {
++      widthBeforeExpand.current = assistantPanelWidth ?? 384;
++      setAssistantPanelWidth("global.assistantPanel", ASSISTANT_PANEL_EXPANDED_WIDTH);
++    }
++  }
+ 
+   const stopRef = useRef<{ stopListening: () => void; requestId: string } | null>(null);
+   const lastUserMessageRef = useRef<string | null>(null);
+@@ -308,6 +328,15 @@ export function AssistantPanel() {
+           ) : null}
+         </div>
+         <div className="flex items-center gap-1">
++          <button
++            type="button"
++            onClick={toggleAssistantPanelExpanded}
++            aria-pressed={isAssistantPanelExpanded}
++            title={isAssistantPanelExpanded ? "Collapse chat back to its previous width" : "Expand chat for a bigger reading/typing area"}
++            className="rounded px-2 py-1 text-xs hover:bg-accent"
++          >
++            {isAssistantPanelExpanded ? "⤡ Collapse" : "⤢ Expand"}
++          </button>
+           <button type="button" onClick={() => setShowSessions((v) => !v)} className="rounded px-2 py-1 text-xs hover:bg-accent" aria-expanded={showSessions}>
+             History
+           </button>

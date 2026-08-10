@@ -1,0 +1,190 @@
+diff --git a/app/src-tauri/crates/atlas-indexer/src/pipeline.rs b/app/src-tauri/crates/atlas-indexer/src/pipeline.rs
+index de1ae1b..bf27fd5 100644
+--- a/app/src-tauri/crates/atlas-indexer/src/pipeline.rs
++++ b/app/src-tauri/crates/atlas-indexer/src/pipeline.rs
+@@ -17,6 +17,15 @@
+ //! document's `last_indexed_hash`, indexing is skipped entirely -- this is
+ //! what makes re-scans of an unchanged workspace cheap and what makes the
+ //! Folder Watcher's `FileUpdated` events safe to fire generously.
++//!
++//! Crash/failure safety on re-index: embedding a document's chunks is
++//! validated (via a single `embed_batch` call) BEFORE the document's
++//! previous chunk/vector set is deleted. If embedding fails -- no model
++//! currently assigned to `EngineRole::Embedding`, the assigned model
++//! having been removed, Ollama unreachable, etc. -- the previously
++//! indexed content is left completely untouched and the document is
++//! marked `Failed` (§45.1 Recoverable) for a later retry, rather than
++//! being deleted and left permanently un-indexed.
+ 
+ use std::sync::Arc;
+ 
+@@ -301,37 +310,66 @@ impl IndexingPipeline {
+ 
+         let chunks = chunk_document(document_id, &parsed, self.chunking_config);
+ 
+-        // Incremental re-indexing (§22): the old chunk set for this
+-        // document is fully superseded by the new parse -- clear then
+-        // rewrite, keeping the AI Cache consistent with the current file
+-        // content rather than accumulating stale chunks from a previous
+-        // version.
++        // Embed everything BEFORE touching the existing chunk/vector set
++        // (real production bug, traced live: `delete_for_document` used
++        // to run unconditionally first, so any embedding failure --
++        // overwhelmingly "no model currently assigned to
++        // EngineRole::Embedding" or the assigned model having been
++        // removed/unavailable -- deleted every previously-indexed
++        // chunk/vector for this document and then aborted, permanently
++        // un-indexing it until some *later* re-index happened to run
++        // with a working embedding model again, which for an unchanged
++        // file might be never. Embedding is now validated up front, in
++        // one batch call, against the *new* parse; if it fails, nothing
++        // about the document's existing, previously-successful index is
++        // touched at all -- the failure is recorded (§45.1 Recoverable)
++        // and the old content stays fully searchable until a retry
++        // succeeds.
++        let embeddable: Vec<(usize, String)> = chunks
++            .iter()
++            .enumerate()
++            .filter(|(_, c)| !c.text_content.trim().is_empty())
++            .map(|(i, c)| (i, c.text_content.clone()))
++            .collect();
++        let texts: Vec<String> = embeddable.iter().map(|(_, t)| t.clone()).collect();
++        let embedded_vectors = self.embedder.embed_batch(&texts)?;
++        if embedded_vectors.len() != embeddable.len() {
++            return Err(AppError::model(format!(
++                "embedding engine returned {} vectors for {} inputs -- refusing to index with a mismatched result rather than guess which text each vector belongs to",
++                embedded_vectors.len(),
++                embeddable.len()
++            )));
++        }
++        let mut vectors_by_chunk_index: std::collections::HashMap<usize, crate::embedding::Embedding> =
++            embeddable.iter().map(|(i, _)| *i).zip(embedded_vectors).collect();
++
++        // Only now, with embedding already known to have succeeded for
++        // this parse, is it safe to supersede the old chunk set (§22:
++        // incremental re-indexing) -- clear then rewrite.
+         self.chunks.delete_for_document(document_id)?;
+ 
+         let mut count = 0usize;
+-        for chunk in chunks {
++        for (chunk_index, chunk) in chunks.into_iter().enumerate() {
+             let inserted = self.chunks.insert(chunk)?;
+-            self.embed_and_store(workspace_id, inserted.document_id, inserted.id, &inserted.text_content)?;
++            match vectors_by_chunk_index.remove(&chunk_index) {
++                Some(vector) => self.store_vector(workspace_id, inserted.id, vector)?,
++                None => atlas_utils::log_info!(
++                    "[IndexingPipeline] embed_and_store skipped chunk_id={} (empty text)",
++                    inserted.id.0
++                ),
++            }
+             count += 1;
+         }
+ 
+         Ok((count, parsed.metadata.authored_at))
+     }
+ 
+-    fn embed_and_store(
+-        &self,
+-        workspace_id: WorkspaceId,
+-        _document_id: DocumentId,
+-        chunk_id: ChunkId,
+-        text: &str,
+-    ) -> Result<(), AppError> {
+-        // TEMPORARY TRACE LOGGING (remove once the pipeline is confirmed working).
+-        if text.trim().is_empty() {
+-            atlas_utils::log_info!("[IndexingPipeline] embed_and_store skipped chunk_id={} (empty text)", chunk_id.0);
+-            return Ok(());
+-        }
+-        let vector = self.embedder.embed(text)?;
+-        atlas_utils::log_info!("[IndexingPipeline] embedded chunk_id={} ({} chars -> {} dims)", chunk_id.0, text.len(), vector.len());
++    /// Persists a vector already produced by `embed_batch` (see
++    /// `run_pipeline`'s up-front embedding step) for `chunk_id`. Storage
++    /// only -- embedding itself already happened and already succeeded by
++    /// the time this is called.
++    fn store_vector(&self, workspace_id: WorkspaceId, chunk_id: ChunkId, vector: crate::embedding::Embedding) -> Result<(), AppError> {
++        atlas_utils::log_info!("[IndexingPipeline] embedded chunk_id={} ({} dims)", chunk_id.0, vector.len());
+         // BUG FIX (was hardcoded WorkspaceId(0), traced live: chat's
+         // Retriever queried the real workspace id and got
+         // "vector_search returned 0 raw hits" every time, because every
+@@ -546,6 +584,81 @@ mod tests {
+         let _ = std::fs::remove_file(&path);
+     }
+ 
++    #[test]
++    fn embedding_failure_on_reindex_does_not_delete_the_previous_successful_index() {
++        // Regression test for a real production bug: `run_pipeline` used
++        // to call `chunks.delete_for_document` unconditionally before
++        // embedding the new parse, so an embedding failure on re-index
++        // (most commonly "no model currently assigned to
++        // EngineRole::Embedding", or the assigned model becoming
++        // unavailable) deleted every previously-indexed chunk/vector for
++        // the document and then aborted -- permanently un-indexing it
++        // until some later re-index happened to run with a working
++        // embedding model again.
++        struct FailingEmbeddingEngine;
++        impl crate::embedding::EmbeddingEngine for FailingEmbeddingEngine {
++            fn dimensions(&self) -> usize {
++                1
++            }
++            fn embed(&self, _text: &str) -> Result<crate::embedding::Embedding, AppError> {
++                Err(AppError::model("no model currently assigned to EngineRole::Embedding"))
++            }
++        }
++
++        let documents = Arc::new(InMemoryDocumentRepository::new());
++        let chunks = Arc::new(InMemoryChunkRepository::new());
++        let vector_store = Arc::new(InMemoryVectorStore::new());
++        let embeddings = Arc::new(InMemoryEmbeddingRepository::new());
++
++        let working_pipeline = IndexingPipeline::new(
++            documents.clone(),
++            chunks.clone(),
++            Arc::new(default_parser_selector()),
++            Arc::new(LayeredSettingsProvider::new()),
++            Arc::new(InMemoryEventBus::new()),
++            Arc::new(NoopOcrEngine),
++            Arc::new(HashEmbeddingEngine::default()),
++            embeddings.clone(),
++            vector_store.clone(),
++        );
++
++        let path = temp_file("md-embed-fail", "# Title\n\nOriginal content here.");
++        working_pipeline
++            .index_document(WorkspaceId(1), "embed-fail.md", path.to_str().unwrap())
++            .unwrap();
++        let docs = working_pipeline.documents().list_for_workspace(WorkspaceId(1)).unwrap();
++        let chunk_count_before = working_pipeline.chunks().list_for_document(docs[0].id).unwrap().len();
++        assert!(chunk_count_before > 0);
++
++        // Now re-index changed content through a pipeline whose embedder
++        // always fails -- simulating the embedding model having been
++        // removed/unassigned since the first successful index.
++        let failing_pipeline = IndexingPipeline::new(
++            documents,
++            chunks,
++            Arc::new(default_parser_selector()),
++            Arc::new(LayeredSettingsProvider::new()),
++            Arc::new(InMemoryEventBus::new()),
++            Arc::new(NoopOcrEngine),
++            Arc::new(FailingEmbeddingEngine),
++            embeddings,
++            vector_store,
++        );
++        std::fs::write(&path, "# Title\n\nCompletely different content now.").unwrap();
++        let err = failing_pipeline
++            .index_document(WorkspaceId(1), "embed-fail.md", path.to_str().unwrap())
++            .unwrap_err();
++        assert_eq!(err.category, atlas_utils::ErrorCategory::ModelError);
++
++        // The previously-indexed chunks must still be there, untouched --
++        // not deleted just because the re-index attempt failed.
++        let chunks_after = failing_pipeline.chunks().list_for_document(docs[0].id).unwrap();
++        assert_eq!(chunks_after.len(), chunk_count_before);
++        assert!(chunks_after.iter().any(|c| c.text_content.contains("Original")));
++
++        let _ = std::fs::remove_file(&path);
++    }
++
+     #[test]
+     fn missing_file_is_a_recoverable_indexing_error() {
+         let pipeline = pipeline();

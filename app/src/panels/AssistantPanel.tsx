@@ -16,6 +16,8 @@ import { documentGet } from "@/ipc/document";
 import type { ChatMessage, ChatSession, Citation } from "@/ipc/types";
 import { useAppStore } from "@/state/store";
 import { useDocumentStore } from "@/state/documents";
+import { useLayoutStore } from "@/components/layout/layoutStore";
+import { normalizeLatexDelimiters } from "@/lib/latex";
 
 /**
  * Assistant Panel (§8.1, Part 1 of the AI Assistant vertical slice):
@@ -76,6 +78,25 @@ export function AssistantPanel() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [selectedText, setSelectedText] = useState<string | null>(null);
   const [showSessions, setShowSessions] = useState(false);
+  // Expand/collapse the chat panel width, on top of ordinary drag-resize.
+  // "Expand" jumps straight to a large, comfortable reading width (rather
+  // than requiring a manual drag every time); "Collapse" restores exactly
+  // whatever width the user had before expanding (their drag position or
+  // the panel's own default), not a second hardcoded value.
+  const assistantPanelWidth = useLayoutStore((s) => s.widths["global.assistantPanel"]);
+  const setAssistantPanelWidth = useLayoutStore((s) => s.setWidth);
+  const widthBeforeExpand = useRef<number | null>(null);
+  const ASSISTANT_PANEL_EXPANDED_WIDTH = 880;
+  const isAssistantPanelExpanded = (assistantPanelWidth ?? 0) >= ASSISTANT_PANEL_EXPANDED_WIDTH;
+  function toggleAssistantPanelExpanded() {
+    if (isAssistantPanelExpanded) {
+      setAssistantPanelWidth("global.assistantPanel", widthBeforeExpand.current ?? 384);
+      widthBeforeExpand.current = null;
+    } else {
+      widthBeforeExpand.current = assistantPanelWidth ?? 384;
+      setAssistantPanelWidth("global.assistantPanel", ASSISTANT_PANEL_EXPANDED_WIDTH);
+    }
+  }
 
   const stopRef = useRef<{ stopListening: () => void; requestId: string } | null>(null);
   const lastUserMessageRef = useRef<string | null>(null);
@@ -308,6 +329,15 @@ export function AssistantPanel() {
           ) : null}
         </div>
         <div className="flex items-center gap-1">
+          <button
+            type="button"
+            onClick={toggleAssistantPanelExpanded}
+            aria-pressed={isAssistantPanelExpanded}
+            title={isAssistantPanelExpanded ? "Collapse chat back to its previous width" : "Expand chat for a bigger reading/typing area"}
+            className="rounded px-2 py-1 text-xs hover:bg-accent"
+          >
+            {isAssistantPanelExpanded ? "⤡ Collapse" : "⤢ Expand"}
+          </button>
           <button type="button" onClick={() => setShowSessions((v) => !v)} className="rounded px-2 py-1 text-xs hover:bg-accent" aria-expanded={showSessions}>
             History
           </button>
@@ -361,7 +391,7 @@ export function AssistantPanel() {
                   ) : (
                     <div className="assistant-markdown text-sm">
                       <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>
-                        {m.content}
+                        {normalizeLatexDelimiters(m.content)}
                       </ReactMarkdown>
                     </div>
                   )}

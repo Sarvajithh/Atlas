@@ -175,6 +175,72 @@ fn strip_code_fence(raw: &str) -> &str {
     trimmed
 }
 
+/// Extracts the JSON object embedded in `raw`, tolerating anything a local
+/// model puts around it despite being told to respond with "ONLY a single
+/// JSON object" -- most commonly a reasoning preamble (e.g. a `<think>...
+/// </think>` block some reasoning-tuned models emit unconditionally) or a
+/// trailing explanatory sentence. Real production failure mode traced
+/// live: `strip_code_fence` alone only handles a response that is *either*
+/// a bare JSON object *or* wrapped in a single ```` ```/```json ```` fence
+/// with nothing else around it -- one stray sentence before the `{` (very
+/// common from models like granite/deepseek-family reasoning models) made
+/// `serde_json::from_str` fail on the whole string every time, even though
+/// a perfectly well-formed JSON object was right there in the response.
+///
+/// Strategy: first try `strip_code_fence` as before (cheap, exact for the
+/// common well-behaved case); if that still doesn't parse, fall back to
+/// locating the first top-level `{...}` object by brace-depth counting
+/// (so nested objects/arrays and braces inside string literals don't
+/// confuse it) and returning that slice instead.
+fn extract_json_object(raw: &str) -> &str {
+    let fenced = strip_code_fence(raw);
+    if serde_json::from_str::<serde_json::Value>(fenced).is_ok() {
+        return fenced;
+    }
+
+    let bytes = fenced.as_bytes();
+    let mut depth: i32 = 0;
+    let mut start: Option<usize> = None;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s) = start {
+                        return &fenced[s..=i];
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // No balanced top-level object found at all; return the fenced text
+    // unchanged so the caller's `serde_json::from_str` still produces a
+    // real parse error (with the actual raw content) rather than this
+    // function silently swallowing the failure.
+    fenced
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct RawQuizResponse {
     #[serde(default)]
@@ -1307,7 +1373,7 @@ impl AppFacade {
             .scheduler
             .execute(&self.engine_pool, &self.retriever, workspace_id, &Intent::Quiz, &instruction, 8, None)?;
 
-        let cleaned = strip_code_fence(&output.content);
+        let cleaned = extract_json_object(&output.content);
         let parsed: RawQuizResponse = serde_json::from_str(cleaned).map_err(|e| {
             AppError::model(format!("quiz model returned unparseable JSON: {e} (raw: {cleaned:.200})"))
         })?;
@@ -1350,7 +1416,7 @@ impl AppFacade {
             None,
         )?;
 
-        let cleaned = strip_code_fence(&output.content);
+        let cleaned = extract_json_object(&output.content);
         let parsed: RawFlashcardsResponse = serde_json::from_str(cleaned).map_err(|e| {
             AppError::model(format!("flashcards model returned unparseable JSON: {e} (raw: {cleaned:.200})"))
         })?;
@@ -1723,7 +1789,13 @@ mod tests {
         // instance -- this is what populates `EngineRole::Embedding` in
         // the Model Registry that `OllamaEmbeddingEngine` reads from.
         facade.run_model_discovery().unwrap();
-
+        facade
+            .model_registry()
+            .select_for_role(
+                EngineRole::Embedding,
+                "mock-embedding",
+            )
+            .unwrap();
         let root = temp_dir("knowledge");
         std::fs::write(
             root.join("notes.md"),
@@ -1823,6 +1895,35 @@ mod tests {
         let cleaned = strip_code_fence(raw);
         let parsed: RawQuizResponse = serde_json::from_str(cleaned).unwrap();
         assert!(parsed.questions.is_empty());
+    }
+
+    #[test]
+    fn extract_json_object_tolerates_a_reasoning_preamble_before_the_json() {
+        // Regression test for a real production failure: local
+        // reasoning-tuned models (granite/deepseek-family especially)
+        // routinely prepend commentary or a `<think>...</think>` block
+        // before the JSON despite being told to respond with ONLY the
+        // JSON object, and the old `strip_code_fence`-only parsing failed
+        // on 100% of these responses even though a perfectly well-formed
+        // object was right there.
+        let raw = "<think>Let me consider what to ask about rotation matrices.</think>\nHere is the quiz:\n{\"questions\": [{\"question\": \"Q\", \"options\": [\"a\",\"b\",\"c\",\"d\"], \"correct_index\": 0, \"explanation\": \"e\"}]}\nHope that helps!";
+        let cleaned = extract_json_object(raw);
+        let parsed: RawQuizResponse = serde_json::from_str(cleaned).unwrap();
+        assert_eq!(parsed.questions.len(), 1);
+    }
+
+    #[test]
+    fn extract_json_object_still_handles_a_bare_or_fenced_json_object() {
+        assert!(serde_json::from_str::<serde_json::Value>(extract_json_object("{\"a\": 1}")).is_ok());
+        assert!(serde_json::from_str::<serde_json::Value>(extract_json_object("```json\n{\"a\": 1}\n```")).is_ok());
+    }
+
+    #[test]
+    fn extract_json_object_is_not_confused_by_braces_inside_string_values() {
+        let raw = "sure, here you go: {\"question\": \"what does {x} mean?\", \"note\": \"nested } brace\"}";
+        let cleaned = extract_json_object(raw);
+        let parsed: serde_json::Value = serde_json::from_str(cleaned).unwrap();
+        assert_eq!(parsed["question"], "what does {x} mean?");
     }
 
     #[test]

@@ -1,0 +1,761 @@
+diff --git a/app/src-tauri/crates/atlas-core/src/facade.rs b/app/src-tauri/crates/atlas-core/src/facade.rs
+index ec66a5e..18bf89e 100644
+--- a/app/src-tauri/crates/atlas-core/src/facade.rs
++++ b/app/src-tauri/crates/atlas-core/src/facade.rs
+@@ -175,6 +175,72 @@ fn strip_code_fence(raw: &str) -> &str {
+     trimmed
+ }
+ 
++/// Extracts the JSON object embedded in `raw`, tolerating anything a local
++/// model puts around it despite being told to respond with "ONLY a single
++/// JSON object" -- most commonly a reasoning preamble (e.g. a `<think>...
++/// </think>` block some reasoning-tuned models emit unconditionally) or a
++/// trailing explanatory sentence. Real production failure mode traced
++/// live: `strip_code_fence` alone only handles a response that is *either*
++/// a bare JSON object *or* wrapped in a single ```` ```/```json ```` fence
++/// with nothing else around it -- one stray sentence before the `{` (very
++/// common from models like granite/deepseek-family reasoning models) made
++/// `serde_json::from_str` fail on the whole string every time, even though
++/// a perfectly well-formed JSON object was right there in the response.
++///
++/// Strategy: first try `strip_code_fence` as before (cheap, exact for the
++/// common well-behaved case); if that still doesn't parse, fall back to
++/// locating the first top-level `{...}` object by brace-depth counting
++/// (so nested objects/arrays and braces inside string literals don't
++/// confuse it) and returning that slice instead.
++fn extract_json_object(raw: &str) -> &str {
++    let fenced = strip_code_fence(raw);
++    if serde_json::from_str::<serde_json::Value>(fenced).is_ok() {
++        return fenced;
++    }
++
++    let bytes = fenced.as_bytes();
++    let mut depth: i32 = 0;
++    let mut start: Option<usize> = None;
++    let mut in_string = false;
++    let mut escaped = false;
++    for (i, &b) in bytes.iter().enumerate() {
++        if in_string {
++            if escaped {
++                escaped = false;
++            } else if b == b'\\' {
++                escaped = true;
++            } else if b == b'"' {
++                in_string = false;
++            }
++            continue;
++        }
++        match b {
++            b'"' => in_string = true,
++            b'{' => {
++                if depth == 0 {
++                    start = Some(i);
++                }
++                depth += 1;
++            }
++            b'}' => {
++                depth -= 1;
++                if depth == 0 {
++                    if let Some(s) = start {
++                        return &fenced[s..=i];
++                    }
++                }
++            }
++            _ => {}
++        }
++    }
++
++    // No balanced top-level object found at all; return the fenced text
++    // unchanged so the caller's `serde_json::from_str` still produces a
++    // real parse error (with the actual raw content) rather than this
++    // function silently swallowing the failure.
++    fenced
++}
++
+ #[derive(Debug, serde::Deserialize)]
+ struct RawQuizResponse {
+     #[serde(default)]
+@@ -1307,7 +1373,7 @@ impl AppFacade {
+             .scheduler
+             .execute(&self.engine_pool, &self.retriever, workspace_id, &Intent::Quiz, &instruction, 8, None)?;
+ 
+-        let cleaned = strip_code_fence(&output.content);
++        let cleaned = extract_json_object(&output.content);
+         let parsed: RawQuizResponse = serde_json::from_str(cleaned).map_err(|e| {
+             AppError::model(format!("quiz model returned unparseable JSON: {e} (raw: {cleaned:.200})"))
+         })?;
+@@ -1350,7 +1416,7 @@ impl AppFacade {
+             None,
+         )?;
+ 
+-        let cleaned = strip_code_fence(&output.content);
++        let cleaned = extract_json_object(&output.content);
+         let parsed: RawFlashcardsResponse = serde_json::from_str(cleaned).map_err(|e| {
+             AppError::model(format!("flashcards model returned unparseable JSON: {e} (raw: {cleaned:.200})"))
+         })?;
+@@ -1825,6 +1891,35 @@ mod tests {
+         assert!(parsed.questions.is_empty());
+     }
+ 
++    #[test]
++    fn extract_json_object_tolerates_a_reasoning_preamble_before_the_json() {
++        // Regression test for a real production failure: local
++        // reasoning-tuned models (granite/deepseek-family especially)
++        // routinely prepend commentary or a `<think>...</think>` block
++        // before the JSON despite being told to respond with ONLY the
++        // JSON object, and the old `strip_code_fence`-only parsing failed
++        // on 100% of these responses even though a perfectly well-formed
++        // object was right there.
++        let raw = "<think>Let me consider what to ask about rotation matrices.</think>\nHere is the quiz:\n{\"questions\": [{\"question\": \"Q\", \"options\": [\"a\",\"b\",\"c\",\"d\"], \"correct_index\": 0, \"explanation\": \"e\"}]}\nHope that helps!";
++        let cleaned = extract_json_object(raw);
++        let parsed: RawQuizResponse = serde_json::from_str(cleaned).unwrap();
++        assert_eq!(parsed.questions.len(), 1);
++    }
++
++    #[test]
++    fn extract_json_object_still_handles_a_bare_or_fenced_json_object() {
++        assert!(serde_json::from_str::<serde_json::Value>(extract_json_object("{\"a\": 1}")).is_ok());
++        assert!(serde_json::from_str::<serde_json::Value>(extract_json_object("```json\n{\"a\": 1}\n```")).is_ok());
++    }
++
++    #[test]
++    fn extract_json_object_is_not_confused_by_braces_inside_string_values() {
++        let raw = "sure, here you go: {\"question\": \"what does {x} mean?\", \"note\": \"nested } brace\"}";
++        let cleaned = extract_json_object(raw);
++        let parsed: serde_json::Value = serde_json::from_str(cleaned).unwrap();
++        assert_eq!(parsed["question"], "what does {x} mean?");
++    }
++
+     #[test]
+     fn submit_quiz_grades_correctly_and_counts_unanswered_as_incorrect() {
+         let facade = AppFacade::new(SqliteConnection::open(":memory:"));
+diff --git a/app/src-tauri/crates/atlas-graph/src/extraction.rs b/app/src-tauri/crates/atlas-graph/src/extraction.rs
+index 03a8b27..99e4a97 100644
+--- a/app/src-tauri/crates/atlas-graph/src/extraction.rs
++++ b/app/src-tauri/crates/atlas-graph/src/extraction.rs
+@@ -121,6 +121,66 @@ fn strip_code_fence(raw: &str) -> &str {
+     trimmed
+ }
+ 
++/// Extracts the JSON object embedded in `raw`, tolerating anything a
++/// local model puts around it despite being told to respond with ONLY
++/// the JSON object -- most commonly a reasoning preamble (e.g. a
++/// `<think>...</think>` block some reasoning-tuned models emit
++/// unconditionally) or a trailing sentence. Real production failure mode
++/// traced live (same root cause as `atlas_core::facade`'s quiz/flashcard
++/// parsing): `strip_code_fence` alone only handles a response that is
++/// *either* a bare JSON object *or* wrapped in a single fence with
++/// nothing else around it, so one stray sentence before the `{` made
++/// every extraction fail -- which is why the Concept Graph came back
++/// empty even for well-indexed workspaces.
++///
++/// Falls back to locating the first top-level `{...}` object by
++/// brace-depth counting (ignoring braces inside string literals) when
++/// the fenced/trimmed text isn't valid JSON on its own.
++fn extract_json_object(raw: &str) -> &str {
++    let fenced = strip_code_fence(raw);
++    if serde_json::from_str::<serde_json::Value>(fenced).is_ok() {
++        return fenced;
++    }
++
++    let bytes = fenced.as_bytes();
++    let mut depth: i32 = 0;
++    let mut start: Option<usize> = None;
++    let mut in_string = false;
++    let mut escaped = false;
++    for (i, &b) in bytes.iter().enumerate() {
++        if in_string {
++            if escaped {
++                escaped = false;
++            } else if b == b'\\' {
++                escaped = true;
++            } else if b == b'"' {
++                in_string = false;
++            }
++            continue;
++        }
++        match b {
++            b'"' => in_string = true,
++            b'{' => {
++                if depth == 0 {
++                    start = Some(i);
++                }
++                depth += 1;
++            }
++            b'}' => {
++                depth -= 1;
++                if depth == 0 {
++                    if let Some(s) = start {
++                        return &fenced[s..=i];
++                    }
++                }
++            }
++            _ => {}
++        }
++    }
++
++    fenced
++}
++
+ /// Orchestrates extraction + storage. Construction happens during
+ /// indexing (§20's own doc comment: "Graph construction/updates happen
+ /// during indexing, not on every view render"), never on read.
+@@ -161,7 +221,7 @@ impl ConceptExtractor {
+ 
+         let prompt = build_extraction_prompt(source_label, text);
+         let raw = self.model.extract(&prompt)?;
+-        let cleaned = strip_code_fence(&raw);
++        let cleaned = extract_json_object(&raw);
+ 
+         let parsed: ExtractedGraph = serde_json::from_str(cleaned).map_err(|e| {
+             AppError::model(format!(
+@@ -288,6 +348,24 @@ mod tests {
+         assert_eq!(outcome.nodes_created, 1);
+     }
+ 
++    #[test]
++    fn tolerates_a_reasoning_preamble_before_the_json() {
++        // Regression test for a real production failure: the Concept
++        // Graph came back empty for every workspace because local
++        // reasoning-tuned models routinely prepend commentary (or a
++        // `<think>...</think>` block) before the JSON despite the prompt
++        // saying ONLY the JSON object, and `strip_code_fence` alone
++        // failed on 100% of these -- even though a well-formed object was
++        // right there in the response.
++        let extractor = extractor(
++            "<think>identifying key concepts</think>\nSure, here you go:\n{\"concepts\":[{\"label\":\"X\",\"description\":null}],\"relations\":[]}\nLet me know if you need more!",
++        );
++        let outcome = extractor
++            .extract_and_store(WorkspaceId(1), DocumentId(1), "notes.md", "content about X")
++            .unwrap();
++        assert_eq!(outcome.nodes_created, 1);
++    }
++
+     #[test]
+     fn reuses_an_existing_node_by_case_insensitive_label_instead_of_duplicating() {
+         let repository = Arc::new(InMemoryGraphRepository::new());
+diff --git a/app/src/App.tsx b/app/src/App.tsx
+index 96dd270..3ef18a8 100644
+--- a/app/src/App.tsx
++++ b/app/src/App.tsx
+@@ -45,6 +45,8 @@ export function App() {
+   const activeWorkspaceId = useAppStore((s) => s.activeWorkspaceId);
+   const isAssistantPanelOpen = useAppStore((s) => s.isAssistantPanelOpen);
+   const setAssistantPanelOpen = useAppStore((s) => s.setAssistantPanelOpen);
++  const isWorkspaceSidebarOpen = useAppStore((s) => s.isWorkspaceSidebarOpen);
++  const setWorkspaceSidebarOpen = useAppStore((s) => s.setWorkspaceSidebarOpen);
+   const isSplitViewOpen = useAppStore((s) => s.isSplitViewOpen);
+   const setSplitViewOpen = useAppStore((s) => s.setSplitViewOpen);
+   const setGlobalSearchOpen = useAppStore((s) => s.setGlobalSearchOpen);
+@@ -121,16 +123,39 @@ export function App() {
+         <TopNav />
+         <div className="flex flex-1 overflow-hidden">
+           <ActivityRail />
+-          <ResizablePanel
+-            id="global.sidebar"
+-            defaultWidth={256}
+-            minWidth={200}
+-            maxWidth={480}
+-            handleSide="end"
+-            handleAriaLabel="Resize workspace sidebar"
+-          >
+-            <Sidebar />
+-          </ResizablePanel>
++          {isWorkspaceSidebarOpen ? (
++            <ResizablePanel
++              id="global.sidebar"
++              defaultWidth={256}
++              minWidth={200}
++              maxWidth={480}
++              handleSide="end"
++              handleAriaLabel="Resize workspace sidebar"
++            >
++              <div className="relative flex h-full w-full">
++                <Sidebar />
++                <button
++                  type="button"
++                  onClick={() => setWorkspaceSidebarOpen(false)}
++                  aria-label="Collapse workspace sidebar"
++                  title="Collapse sidebar"
++                  className="absolute right-1 top-1 rounded px-1 text-xs text-muted-foreground hover:bg-accent"
++                >
++                  ⟨⟨
++                </button>
++              </div>
++            </ResizablePanel>
++          ) : (
++            <button
++              type="button"
++              onClick={() => setWorkspaceSidebarOpen(true)}
++              aria-label="Expand workspace sidebar"
++              title="Show workspaces"
++              className="flex w-6 shrink-0 items-center justify-center border-r text-xs text-muted-foreground hover:bg-accent"
++            >
++              ⟩⟩
++            </button>
++          )}
+           <div className="flex flex-1 flex-col overflow-hidden">
+             <Tabs />
+             <main className="flex-1 overflow-auto">
+diff --git a/app/src/components/document/DocumentViewer.tsx b/app/src/components/document/DocumentViewer.tsx
+index 7184804..e12fec1 100644
+--- a/app/src/components/document/DocumentViewer.tsx
++++ b/app/src/components/document/DocumentViewer.tsx
+@@ -11,6 +11,7 @@ import { PdfViewer } from "@/components/document/viewers/PdfViewer";
+ import { MarkdownViewer, extractHeadings, type HeadingOutlineItem } from "@/components/document/viewers/MarkdownViewer";
+ import { ImageViewer } from "@/components/document/viewers/ImageViewer";
+ import { TextViewer, UnsupportedPreview } from "@/components/document/viewers/TextViewer";
++import { ResizablePanel } from "@/components/layout/ResizablePanel";
+ 
+ const ZOOM_STEPS = [0.5, 0.75, 1, 1.25, 1.5, 2, 3];
+ 
+@@ -25,7 +26,11 @@ export function DocumentViewer({ tab }: { tab: DocumentTab }) {
+   const [error, setError] = useState<string | null>(null);
+   const [zoom, setZoom] = useState(1);
+   const [searchQuery, setSearchQuery] = useState("");
+-  const [outlineOpen, setOutlineOpen] = useState(true);
++  // Defaults closed: the outline/page-thumbnail rail is useful on demand
++  // (jump to a heading/page) but shouldn't cost permanent width by
++  // default -- the document itself is the primary workspace here. The
++  // "Outline" button in the toolbar still opens it on demand.
++  const [outlineOpen, setOutlineOpen] = useState(false);
+   const [progress, setProgress] = useState(0);
+   const [pageCount, setPageCount] = useState<number | null>(null);
+   const [selectedHeadingId, setSelectedHeadingId] = useState<string | null>(null);
+@@ -173,14 +178,23 @@ export function DocumentViewer({ tab }: { tab: DocumentTab }) {
+ 
+       <div className="flex flex-1 overflow-hidden">
+         {outlineOpen ? (
+-          <aside aria-label="Document Outline" className="w-52 shrink-0 overflow-auto border-r">
+-            <DocumentOutline
+-              headings={headings}
+-              pageCount={content?.file_type === "pdf" ? pageCount : null}
+-              onSelectHeading={setSelectedHeadingId}
+-              onSelectPage={(page) => pdfGoToPage.current?.(page)}
+-            />
+-          </aside>
++          <ResizablePanel
++            id="documentViewer.outline"
++            defaultWidth={208}
++            minWidth={160}
++            maxWidth={420}
++            handleSide="end"
++            handleAriaLabel="Resize document outline"
++          >
++            <aside aria-label="Document Outline" className="h-full w-full overflow-auto border-r">
++              <DocumentOutline
++                headings={headings}
++                pageCount={content?.file_type === "pdf" ? pageCount : null}
++                onSelectHeading={setSelectedHeadingId}
++                onSelectPage={(page) => pdfGoToPage.current?.(page)}
++              />
++            </aside>
++          </ResizablePanel>
+         ) : null}
+ 
+         <div className="flex-1 overflow-hidden">
+diff --git a/app/src/components/document/viewers/MarkdownViewer.tsx b/app/src/components/document/viewers/MarkdownViewer.tsx
+index a128fd8..992e8a4 100644
+--- a/app/src/components/document/viewers/MarkdownViewer.tsx
++++ b/app/src/components/document/viewers/MarkdownViewer.tsx
+@@ -1,5 +1,9 @@
+ import { useEffect, useMemo, useRef } from "react";
+ import ReactMarkdown from "react-markdown";
++import remarkGfm from "remark-gfm";
++import remarkMath from "remark-math";
++import rehypeKatex from "rehype-katex";
++import "katex/dist/katex.min.css";
+ 
+ export interface HeadingOutlineItem {
+   id: string;
+@@ -97,6 +101,8 @@ export function MarkdownViewer({
+     >
+       <article className="prose prose-sm mx-auto max-w-3xl dark:prose-invert">
+         <ReactMarkdown
++          remarkPlugins={[remarkGfm, remarkMath]}
++          rehypePlugins={[rehypeKatex]}
+           components={{
+             h1: (props) => <h1 id={slugify(String(props.children))} {...props} />,
+             h2: (props) => <h2 id={slugify(String(props.children))} {...props} />,
+diff --git a/app/src/state/store.ts b/app/src/state/store.ts
+index 8db2972..8dc6e9e 100644
+--- a/app/src/state/store.ts
++++ b/app/src/state/store.ts
+@@ -61,6 +61,7 @@ export interface AppState {
+   activeWorkspaceId: number | null;
+   activeDocumentId: number | null;
+   isAssistantPanelOpen: boolean;
++  isWorkspaceSidebarOpen: boolean;
+   isSplitViewOpen: boolean;
+   isGlobalSearchOpen: boolean;
+   currentView: AppView;
+@@ -74,6 +75,7 @@ export interface AppState {
+   setActiveWorkspaceId: (id: number | null) => void;
+   setActiveDocumentId: (id: number | null) => void;
+   setAssistantPanelOpen: (open: boolean) => void;
++  setWorkspaceSidebarOpen: (open: boolean) => void;
+   setSplitViewOpen: (open: boolean) => void;
+   setGlobalSearchOpen: (open: boolean) => void;
+   setCurrentView: (view: AppView) => void;
+@@ -95,6 +97,7 @@ export const useAppStore = create<AppState>((set, get) => ({
+   activeWorkspaceId: null,
+   activeDocumentId: null,
+   isAssistantPanelOpen: true,
++  isWorkspaceSidebarOpen: true,
+   isSplitViewOpen: false,
+   isGlobalSearchOpen: false,
+   currentView: "dashboard",
+@@ -108,6 +111,7 @@ export const useAppStore = create<AppState>((set, get) => ({
+   setActiveWorkspaceId: (id) => set({ activeWorkspaceId: id }),
+   setActiveDocumentId: (id) => set({ activeDocumentId: id }),
+   setAssistantPanelOpen: (open) => set({ isAssistantPanelOpen: open }),
++  setWorkspaceSidebarOpen: (open) => set({ isWorkspaceSidebarOpen: open }),
+   setSplitViewOpen: (open) => set({ isSplitViewOpen: open }),
+   setGlobalSearchOpen: (open) => set({ isGlobalSearchOpen: open }),
+   setCurrentView: (view) => set({ currentView: view }),
+diff --git a/app/src/views/WorkspaceDetail.tsx b/app/src/views/WorkspaceDetail.tsx
+index 2c6e809..4c8e684 100644
+--- a/app/src/views/WorkspaceDetail.tsx
++++ b/app/src/views/WorkspaceDetail.tsx
+@@ -9,6 +9,7 @@ import { DocumentExplorer } from "@/components/document/DocumentExplorer";
+ import { DocumentTabs } from "@/components/document/DocumentTabs";
+ import { DocumentViewer } from "@/components/document/DocumentViewer";
+ import { IndexingStatusBar } from "@/components/workspace/IndexingStatusBar";
++import { ResizablePanel } from "@/components/layout/ResizablePanel";
+ 
+ /**
+  * Workspace Manager + Workspace Explorer + Document Experience (§8.2.1/
+@@ -29,6 +30,14 @@ export function WorkspaceDetail({ workspaceId }: { workspaceId: number }) {
+   const [nameDraft, setNameDraft] = useState(workspace?.display_name ?? "");
+   const [busy, setBusy] = useState(false);
+   const [confirmUnlink, setConfirmUnlink] = useState(false);
++  const [explorerOpen, setExplorerOpen] = useState(true);
++  // The workspace header (rename/archive/unlink, path, indexing status) is
++  // pure chrome once you're actually reading a document -- it used to sit
++  // permanently above the reader at full height, eating vertical space
++  // document content needed. It now auto-compacts into a slim breadcrumb
++  // bar the moment a document tab is open, and can still be expanded back
++  // (e.g. to rebuild the index) via the chevron.
++  const [headerExpanded, setHeaderExpanded] = useState(true);
+ 
+   const openDocument = useDocumentStore((s) => s.openDocument);
+   const openTabs = useDocumentStore((s) => s.openTabs);
+@@ -41,6 +50,10 @@ export function WorkspaceDetail({ workspaceId }: { workspaceId: number }) {
+   const activeDocTab = openTabs.find((t) => t.tabId === activeDocTabId);
+ 
+   function handleOpenDocument(doc: DocumentRecord) {
++    // Auto-compact the header the moment a document is opened, so reading
++    // starts with maximum vertical space; the chevron can still expand it
++    // back (e.g. to rename/archive/rebuild the index) at any time.
++    setHeaderExpanded(false);
+     openDocument(workspaceId, doc);
+   }
+ 
+@@ -59,99 +72,163 @@ export function WorkspaceDetail({ workspaceId }: { workspaceId: number }) {
+ 
+   return (
+     <section aria-label={`Workspace: ${workspace.display_name}`} className="flex h-full flex-col overflow-hidden">
+-      <div className="flex shrink-0 items-start justify-between border-b p-4">
+-        <div>
+-          {isRenaming ? (
+-            <div className="flex items-center gap-2">
+-              <input
+-                autoFocus
+-                value={nameDraft}
+-                onChange={(e) => setNameDraft(e.target.value)}
+-                className="rounded-md border bg-background px-2 py-1 text-lg font-semibold"
+-              />
++      {headerExpanded ? (
++        <div className="flex shrink-0 items-start justify-between border-b p-4">
++          <div>
++            {isRenaming ? (
++              <div className="flex items-center gap-2">
++                <input
++                  autoFocus
++                  value={nameDraft}
++                  onChange={(e) => setNameDraft(e.target.value)}
++                  className="rounded-md border bg-background px-2 py-1 text-lg font-semibold"
++                />
++                <button
++                  type="button"
++                  disabled={busy || nameDraft.trim().length === 0}
++                  onClick={() =>
++                    runAction(
++                      () => workspaceRename(workspace.id, nameDraft.trim()),
++                      (w) => {
++                        upsertWorkspace(w);
++                        setIsRenaming(false);
++                      },
++                      "Workspace renamed",
++                    )
++                  }
++                  className="rounded-md bg-primary px-2 py-1 text-xs text-primary-foreground"
++                >
++                  Save
++                </button>
++                <button type="button" onClick={() => setIsRenaming(false)} className="text-xs text-muted-foreground">
++                  Cancel
++                </button>
++              </div>
++            ) : (
++              <h1 className="text-xl font-semibold">{workspace.display_name}</h1>
++            )}
++            <p className="mt-1 text-xs text-muted-foreground">{workspace.root_path}</p>
++            <p className="mt-1 text-xs text-muted-foreground">
++              Status: {workspace.status}
++              {workspace.last_indexed_at ? ` · Last indexed ${workspace.last_indexed_at}` : ""}
++            </p>
++            <div className="mt-2">
++              <IndexingStatusBar workspaceId={workspaceId} />
++            </div>
++          </div>
++
++          <div className="flex shrink-0 items-start gap-2">
++            {!isRenaming ? (
+               <button
+                 type="button"
+-                disabled={busy || nameDraft.trim().length === 0}
++                disabled={busy}
++                onClick={() => setIsRenaming(true)}
++                className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
++              >
++                Rename
++              </button>
++            ) : null}
++            {workspace.status === "Archived" ? (
++              <button
++                type="button"
++                disabled={busy}
+                 onClick={() =>
+-                  runAction(
+-                    () => workspaceRename(workspace.id, nameDraft.trim()),
+-                    (w) => {
+-                      upsertWorkspace(w);
+-                      setIsRenaming(false);
+-                    },
+-                    "Workspace renamed",
+-                  )
++                  runAction(() => workspaceRestore(workspace.id), upsertWorkspace, "Workspace restored")
+                 }
+-                className="rounded-md bg-primary px-2 py-1 text-xs text-primary-foreground"
++                className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+               >
+-                Save
++                Restore
+               </button>
+-              <button type="button" onClick={() => setIsRenaming(false)} className="text-xs text-muted-foreground">
+-                Cancel
++            ) : (
++              <button
++                type="button"
++                disabled={busy}
++                onClick={() =>
++                  runAction(() => workspaceArchive(workspace.id), upsertWorkspace, "Workspace archived")
++                }
++                className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
++              >
++                Archive
+               </button>
+-            </div>
+-          ) : (
+-            <h1 className="text-xl font-semibold">{workspace.display_name}</h1>
+-          )}
+-          <p className="mt-1 text-xs text-muted-foreground">{workspace.root_path}</p>
+-          <p className="mt-1 text-xs text-muted-foreground">
+-            Status: {workspace.status}
+-            {workspace.last_indexed_at ? ` · Last indexed ${workspace.last_indexed_at}` : ""}
+-          </p>
+-          <div className="mt-2">
+-            <IndexingStatusBar workspaceId={workspaceId} />
+-          </div>
+-        </div>
+-
+-        <div className="flex shrink-0 gap-2">
+-          {!isRenaming ? (
++            )}
+             <button
+               type="button"
+               disabled={busy}
+-              onClick={() => setIsRenaming(true)}
+-              className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
++              onClick={() => setConfirmUnlink(true)}
++              className="rounded-md border border-destructive/50 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10"
+             >
+-              Rename
++              Unlink
+             </button>
+-          ) : null}
+-          {workspace.status === "Archived" ? (
+-            <button
+-              type="button"
+-              disabled={busy}
+-              onClick={() =>
+-                runAction(() => workspaceRestore(workspace.id), upsertWorkspace, "Workspace restored")
+-              }
+-              className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+-            >
+-              Restore
+-            </button>
+-          ) : (
+-            <button
+-              type="button"
+-              disabled={busy}
+-              onClick={() =>
+-                runAction(() => workspaceArchive(workspace.id), upsertWorkspace, "Workspace archived")
+-              }
+-              className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+-            >
+-              Archive
+-            </button>
+-          )}
++            {activeDocTab ? (
++              <button
++                type="button"
++                onClick={() => setHeaderExpanded(false)}
++                aria-label="Collapse workspace details"
++                title="Collapse"
++                className="rounded-md border px-2 py-1.5 text-sm hover:bg-accent"
++              >
++                ⌃
++              </button>
++            ) : null}
++          </div>
++        </div>
++      ) : (
++        <div className="flex h-9 shrink-0 items-center justify-between border-b px-3 text-sm">
++          <div className="flex min-w-0 items-center gap-2">
++            <span className="truncate font-medium">{workspace.display_name}</span>
++            <span className="text-xs text-muted-foreground">Status: {workspace.status}</span>
++          </div>
+           <button
+             type="button"
+-            disabled={busy}
+-            onClick={() => setConfirmUnlink(true)}
+-            className="rounded-md border border-destructive/50 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10"
++            onClick={() => setHeaderExpanded(true)}
++            aria-label="Expand workspace details"
++            title="Expand (rename, archive, rebuild index)"
++            className="rounded-md border px-2 py-0.5 text-xs hover:bg-accent"
+           >
+-            Unlink
++            ⌄ Details
+           </button>
+         </div>
+-      </div>
++      )}
+ 
+       <div className="flex flex-1 overflow-hidden">
+-        <aside aria-label="Document Explorer" className="w-64 shrink-0 overflow-hidden border-r">
+-          <DocumentExplorer workspaceId={workspaceId} onOpenDocument={handleOpenDocument} />
+-        </aside>
++        {explorerOpen ? (
++          <ResizablePanel
++            id="workspaceDetail.explorer"
++            defaultWidth={220}
++            minWidth={180}
++            maxWidth={480}
++            handleSide="end"
++            handleAriaLabel="Resize document explorer"
++          >
++            <aside aria-label="Document Explorer" className="flex h-full w-full flex-col overflow-hidden border-r">
++              <div className="flex shrink-0 items-center justify-between border-b px-2 py-1">
++                <span className="text-xs font-medium text-muted-foreground">Files</span>
++                <button
++                  type="button"
++                  onClick={() => setExplorerOpen(false)}
++                  aria-label="Collapse file explorer"
++                  title="Collapse"
++                  className="rounded px-1 text-xs hover:bg-accent"
++                >
++                  ⟨⟨
++                </button>
++              </div>
++              <div className="min-h-0 flex-1 overflow-hidden">
++                <DocumentExplorer workspaceId={workspaceId} onOpenDocument={handleOpenDocument} />
++              </div>
++            </aside>
++          </ResizablePanel>
++        ) : (
++          <button
++            type="button"
++            onClick={() => setExplorerOpen(true)}
++            aria-label="Expand file explorer"
++            title="Show files"
++            className="flex w-6 shrink-0 items-center justify-center border-r text-xs text-muted-foreground hover:bg-accent"
++          >
++            ⟩⟩
++          </button>
++        )}
+ 
+         <div className="flex flex-1 flex-col overflow-hidden">
+           <DocumentTabs />
+diff --git a/app/src/components/document/viewers/__tests__/MarkdownViewer.test.tsx b/app/src/components/document/viewers/__tests__/MarkdownViewer.test.tsx
+new file mode 100644
+index 0000000..8431240
+--- /dev/null
++++ b/app/src/components/document/viewers/__tests__/MarkdownViewer.test.tsx
+@@ -0,0 +1,64 @@
++import { describe, expect, it } from "vitest";
++import { render } from "@testing-library/react";
++
++import { extractHeadings, MarkdownViewer } from "@/components/document/viewers/MarkdownViewer";
++
++describe("extractHeadings", () => {
++  it("extracts headings with correct depth", () => {
++    const markdown = "# Title\n\nSome text.\n\n## Section One\n\n### Subsection\n\n## Section Two";
++    const headings = extractHeadings(markdown);
++    expect(headings.map((h) => [h.depth, h.text])).toEqual([
++      [1, "Title"],
++      [2, "Section One"],
++      [3, "Subsection"],
++      [2, "Section Two"],
++    ]);
++  });
++
++  it("slugifies heading text into stable ids", () => {
++    const headings = extractHeadings("# Hello World!");
++    expect(headings[0].id).toBe("hello-world");
++  });
++
++  it("disambiguates duplicate heading text with a numeric suffix", () => {
++    const headings = extractHeadings("# Intro\n\n# Intro");
++    expect(headings[0].id).toBe("intro");
++    expect(headings[1].id).toBe("intro-1");
++  });
++
++  it("returns an empty list for markdown with no headings", () => {
++    expect(extractHeadings("Just a paragraph, no headings here.")).toEqual([]);
++  });
++
++  it("ignores '#' that isn't a heading (no following space)", () => {
++    expect(extractHeadings("#nothashheading")).toEqual([]);
++  });
++});
++
++describe("MarkdownViewer LaTeX rendering", () => {
++  // Regression coverage: the document content renderer used to have no
++  // math plugins at all (remark-math/rehype-katex were only wired into
++  // the chat panel, not here), so inline/display math in a document's
++  // own markdown rendered as literal `$...$` text instead of formatted
++  // mathematics.
++  it("renders inline math ($...$) as KaTeX output, not literal dollar text", () => {
++    const { container } = render(
++      <MarkdownViewer content="Einstein's equation: $E=mc^2$ is famous." zoom={1} searchQuery="" />,
++    );
++    expect(container.querySelector(".katex")).not.toBeNull();
++    expect(container.textContent).not.toContain("$E=mc^2$");
++  });
++
++  it("renders display math ($$...$$) as KaTeX output, not literal text", () => {
++    const { container } = render(
++      <MarkdownViewer
++        content={"Area under the curve:\n\n$$\\int_0^1 x^2\\,dx = \\frac{1}{3}$$\n\nDone."}
++        zoom={1}
++        searchQuery=""
++      />,
++    );
++    expect(container.querySelector(".katex")).not.toBeNull();
++    expect(container.textContent).not.toContain("$$");
++    expect(container.querySelector("annotation")?.textContent).toContain("\\int_0^1");
++  });
++});

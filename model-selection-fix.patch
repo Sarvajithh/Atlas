@@ -1,0 +1,50 @@
+diff --git a/app/src-tauri/crates/app-tauri/src/main.rs b/app/src-tauri/crates/app-tauri/src/main.rs
+index 2f6b851..15b722c 100644
+--- a/app/src-tauri/crates/app-tauri/src/main.rs
++++ b/app/src-tauri/crates/app-tauri/src/main.rs
+@@ -12,13 +12,39 @@ use atlas_core::AppFacade;
+ use tauri::Manager;
+ 
+ fn main() {
+-    // §41: Startup Sequence. Database path is a placeholder here; the real
+-    // app-data-directory resolution is a future milestone (§23 Settings ->
+-    // storage locations).
+-    let facade = startup("atlas.sqlite3");
+-
+     tauri::Builder::default()
+-        .manage(facade)
++        .setup(|app| {
++            // §41: Startup Sequence, step 3 "Open Database". The database
++            // must live in a stable, per-user, per-OS application data
++            // directory (resolved via Tauri's `path()` API) rather than a
++            // path relative to the process's current working directory --
++            // a relative path silently pointed at a *different* (often
++            // empty) SQLite file depending on how the app happened to be
++            // launched (double-clicked bundle vs `tauri dev` vs a shortcut
++            // with a different CWD), which meant every model selection
++            // (§37, Model Dashboard) and other persisted state could look
++            // like it "reset" on the next launch even though nothing was
++            // actually lost -- the app was just reading a fresh, unrelated
++            // database file. Resolving a real app-data directory up front
++            // and creating it if it doesn't exist yet ensures the same
++            // database file is opened on every launch.
++            let app_data_dir = app
++                .path()
++                .app_data_dir()
++                .expect("failed to resolve the app data directory");
++            std::fs::create_dir_all(&app_data_dir)
++                .expect("failed to create the app data directory");
++            let database_path = app_data_dir.join("atlas.sqlite3");
++            atlas_utils::log_info!("[Startup] opening database at {}", database_path.display());
++
++            let facade = startup(
++                database_path
++                    .to_str()
++                    .expect("app data directory path was not valid UTF-8"),
++            );
++            app.manage(facade);
++            Ok(())
++        })
+         .invoke_handler(tauri::generate_handler![
+             commands::workspace::workspace_list,
+             commands::workspace::workspace_get,
